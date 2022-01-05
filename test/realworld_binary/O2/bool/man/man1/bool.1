@@ -1,0 +1,131 @@
+.TH BOOL 1 \*(Dt "GNU Project"
+.SH NAME
+bool \- print context matching a boolean expression
+.SH SYNOPSIS
+.B bool
+.RI [ options ]
+.I EXPRESSION
+.RI [ FILE .\|.\|.]
+.SH DESCRIPTION
+.PP
+.B Bool
+searches the named input
+.IR FILE s
+(or standard input if the file name
+.B \-
+is given) for the context of each pattern in the given
+.IR EXPRESSION .
+If the input is HTML formatted, it is parsed and queried in a single pass.
+.PP
+By default,
+.B bool
+prints the first occurrence of each pattern in its context if the
+.IR EXPRESSION
+is true.  This consists of up to 60 characters preceding and following
+the pattern, until a beginning or end of paragraph is reached.
+.SH OPTIONS
+.TP
+.BR \-b ", " \-\^\-byte-offset
+Print the byte offset where the match occurred before each line of output.
+.TP
+.BI \-C " NUM" "\fR,\fP \-\^\-context=" NUM
+Print
+.I NUM
+characters (default 60) of output context for each pattern.
+.TP
+.BR \-c ", " \-\^\-count
+Suppress normal output; instead print a count of matching patterns for
+each input file.
+.TP
+.BI \-D " NUM" "\fR,\fP \-\^\-distance=" NUM
+Find patterns separated by
+.I NUM
+words (default 10) when using the NEAR operator.
+.TP
+.BR \-F ", " \-\^\-fixed-string
+Interpret
+.I EXPRESSION
+as a fixed string instead of a boolean expression.
+.TP
+.BR \-H ", " \-\^\-with-filename
+Print the filename for each match.
+.TP
+.BR \-h ", " \-\^\-no-filename
+Suppress the prefixing of filenames on output when multiple files are
+searched.
+.TP
+.BR \-\^\-help
+Output a brief help message.
+.TP
+.BR \-i ", " \-\^\-ignore-case
+Ignore case distinctions in both the
+.I EXPRESSION
+and the input files.
+.TP
+.BR \-L ", " \-\^\-files-without-match
+Suppress normal output; instead print the name of each input file from
+which no output would normally have been printed.
+.TP
+.BR \-l ", " \-\^\-files-with-matches
+Suppress normal output; instead print the name of each input file from
+which output would normally have been printed.
+.TP
+.BR \-n ", " \-\^\-line-number
+Prefix each line of output with the line number within its input file.
+.TP
+.BI \-O " NUM" "\fR,\fP \-\^\-occurrences=" NUM
+Print
+.I NUM
+lines (default 1) of context for each pattern.  No output is printed if
+the boolean expression evaluates to false.
+.TP
+.BR \-P ", " \-\^\-with-pattern
+Print the pattern for each match.
+.TP
+.BR \-p ", " \-\^\-no-pattern
+Suppress the prefixing of patterns on output.
+.TP
+.BR \-q ", " \-\^\-quiet ", " \-\^\-silent
+Quiet;  suppress  normal output.  Also see the -s or --no-messages
+option below.
+.TP
+.BR \-s ", " \-\^\-no-messages
+Suppress error messages about nonexistent or unreadable files.
+.TP
+.BR \-V ", " \-\^\-version
+Print the version number of
+.B bool
+to standard error.  This version number should be included in all bug
+reports (see below).
+.SH BOOLEAN EXPRESSION
+.PP
+A boolean expression is composed of operands separated by operators.
+The precedence of operators is evaluated from left to right.
+.PP
+Operands can be another boolean expression isolated between parentheses or
+a pattern.  The latter is expressed as a sequence of characters delimited
+by spaces or enclosed in quotes.  Some characters can be escaped using
+the backslash ('\\'), other characters can be specified as SGML entities.
+.PP
+An operand must return a truth value.  For a parenthesized expression,
+each operator within the expression is evaluated as described below.
+For a pattern, the operand is true if there are one or more occurrences of
+the sequence of characters in the input.  Otherwise, the operand is false.
+.PP
+Operators are symbols denoting the logic to be performed.  The AND
+operator returns true if the operands on either side of the symbol are
+true, otherwise the expression is considered false.  The OR operator
+returns true if either operand is true.  The NOT operator returns true
+if the left operand is true and the right operand is false.
+.PP
+The NEAR operator, though not boolean, returns true if the operands on
+either side of the operator are within a specified number of words from
+each other.  For example, the words "boolean" and "either" are separated
+by 6 words in the previous sentence.  If the distance specified on the
+command-line is 10, the expression is true.
+.SH DIAGNOSTICS
+Normally, exit status is 0 if matches were found, and 1 if no matches
+were found.  Exit status is 2 if there were syntax errors in the
+expression or other system errors.
+.SH AUTHOR
+Marc Tardif <intmktg@cam.org>

@@ -1,0 +1,5 @@
+#!/bin/sh
+
+librarydir=/home/ucas/Runnable/test/realworld_binary/O0/enscript/share/enscript
+
+enscript -E -p- --quiet --language=overstrike $* 2>&1 | less

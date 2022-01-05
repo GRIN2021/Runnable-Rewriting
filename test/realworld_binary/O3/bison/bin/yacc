@@ -1,0 +1,2 @@
+#! /bin/sh
+exec /home/ucas/Runnable/test/realworld_binary/O3/bison/bin/bison -y "$@"

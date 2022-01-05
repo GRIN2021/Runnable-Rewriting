@@ -1,0 +1,1822 @@
+.TH BAR 1 "4 November 2003"
+.SH NAME
+bar \- show information about a data transfer
+.SH SYNOPSIS
+.RS 0
+.TP 4
+.B bar
+[
+.I I/O-options
+]
+[
+.I display-options
+]
+[
+.I color-options
+]
+.br
+[
+.I input-file
+]
+[
+.I output-file
+]
+.br
+[
+.B -h
+|
+.B --help
+]
+[
+.B -v
+|
+.B --version
+]
+.RE
+
+.SH DESCRIPTION
+.PP
+Bar is a simple tool to process a stream of data and print a display for the
+user on stderr showing (a) the amount of data passed, (b) the throughput of
+the data transfer, and, if the total size of the data stream is known, (c)
+estimated time remaining, percent complete, and a progress bar.
+
+.PP
+Bar was originally written for the purpose of estimating the amount of time
+needed to transfer large amounts (many, many gigabytes) of data across a
+network.  (Usually in an SSH/tar pipe.)
+
+.SH I/O COMMAND LINE OPTIONS
+
+.B -if
+.I input-file
+.br
+.B --in-file
+.I input-file
+.br
+.RS 2
+.PP
+Read input from
+.I input-file.
+Default: stdin
+.RE
+
+.B -of
+.I output-file
+.br
+.B --out-file
+.I output-file
+.br
+.RS 2
+.PP
+Write output to
+.I output-file.  If the output file is a directory, then bar will attempt to
+create a file in the output directory with the same name as the input file,
+and attempt to copy the input file mode as well as it's data.
+Default: stdout
+.RE
+.PP
+Please notice that if no 
+.B -if, --in-file, -of,
+or
+.B --out-file
+options are specified on the command line, and an unknown command line option
+is encountered, then bar will assume that the first unknown command line
+option is a path to an input file, and the second (if found) is a path to an
+output file.
+
+.B -s
+.I size
+.br
+.B --size
+.I size
+.br
+.RS 2
+.PP
+Expect an input stream of
+.I size
+bytes.
+.PP
+When reading a regular file or a link to a regular file, bar will extract the
+file size on it's own.  However, this flag is useful for reading from a
+character- or block-special device file, or from a pipe.
+.I size
+may be followed by 'k', 'm', 'g', 't', 'p', or 'e' for kilobytes, megabytes,
+gigabytes, terabytes, petabytes, or exabytes, respectively (see also the -k
+option below).  Alternatively, 
+.I size
+may also be specified in terms of 'b' for blocks (see the 
+.B -bl
+option below).
+See examples below.
+.RE
+
+.B -c
+.I size
+.br
+.B --completed
+.I size
+.br
+.RS 2
+.PP
+Instruct bar that
+.I size
+bytes of the data stream have already been copied, and that this is a
+continuation of a previous data stream.  Note that use of this option will
+throw off throughput and ETA calculations at first, but they should settle
+down as the transfer continues.
+
+.B -bs
+.I buffer-size
+.br
+.B --buffer-size
+.I buffer-size
+.br
+.RS 2
+.PP
+Allocate an I/O buffer of
+.I buffer-size
+bytes.  The same modifiers may apply here ('k', 'm', 'g', 't', 'p', 'e' 
+and 'b') as for the
+.B -s
+flag above.  Changing the buffer size can improve throughput, depending on
+your application of bar.  For fast I/O operations, say from a ramdisk for
+instance, it might be worth your while to experiment with a large buffer
+(circa 1MB for instance).  But for slow I/O operations, like from a tape
+drive, you could merely be wasting your memory.  Default: 52488 (512KB)
+.RE
+
+.B -th
+.I rate
+.br
+.B --throttle
+.I rate
+.br
+.RS 2
+.PP
+Restrict I/O throughput to 
+.I rate
+bytes per second.  The same modifiers apply here ('k', 'm', 'g', 't', 'p', 'e'
+and 'b') as for the 
+.B -s
+flag above.
+.RE
+
+.B -i
+.I seconds
+.br
+.B --interval
+.I seconds
+.br
+.RS 2
+.PP
+Update the display every
+.I seconds
+seconds.  Default: 1 second
+.RE
+
+.B -t
+.I microseconds
+.br
+.B --timeout
+.I microseconds
+.br
+.RS 2
+.PP
+The number of microseconds to wait for a change in I/O state before
+.I select()
+times out.  Default: 250000 (1/4 second)
+.RE
+
+.B -k
+1000|1024
+.br
+.B --kilo
+1000|1024
+.br
+.RS 2
+.PP
+Use either 1000 or 1024 as the definition of a kilobyte.  Default: 1024
+.RE
+
+.B -bl
+.I size
+.br
+.B --block-size
+.I size
+.br
+.RS 2
+.PP
+When reading sizes from the command line that are specified in terms of
+blocks, assume a single block is 
+.I size
+bytes.
+.I Size
+may be followed by 'k', 'm', 'g', 't', 'p', or 'e' for kilobytes, megabytes,
+gigabytes, terabytes, petabytes, or exabytes, respectively.  Block size must
+be set before specifying any sizes in terms of blocks or the default value
+will be used instead.  Specifying
+.I size
+in terms of 'b' for blocks is not allowed for this option.  Default: 512
+.RE
+
+.SH DISPLAY COMMAND LINE OPTIONS
+
+.B -sw
+.I width
+.br
+.B --screen-width
+.I width
+.br
+.RS 2
+.PP
+Assume a screen width of 
+.I width
+characters.
+
+Bar will attempt to retrieve the width of the terminal it is running on, and
+will adjust that width if the terminal is resized.  If bar cannot determine
+the terminal width, then bar will assume a default width of 79 characters.
+Use the
+.B --screen-width
+command line option to override this behavior and specify a fixed width for
+bar to use.  (When this option is used, bar will ignore terminal resized
+signals and continue to use the value provided by the user.)
+.RE
+
+.B -sw-1
+|
+.B --screen-width-minus-one
+.br
+.B -sw-0
+|
+.B --screen-width-minus-zero
+.RS 2
+.PP
+Instruct bar to use either the entire column width reported by termio, or one
+less than reported by termio.  I.e. If termio reports that you are running bar
+in a terminal that's 80 characters wide, using the command line option
+.B --screen-width-minus-one
+instructs bar to only use 79 characters to print the display.  If you're using
+a terminal or shell that wraps the line whenever bar prints the last character
+then this should alleviate that problem.  Default is to use the full
+terminal's width.
+.RE
+
+.B -sh
+.I height
+.br
+.B --screen-height
+.I height
+.br
+.RS 2
+.PP
+Assume a screen height of 
+.I height
+characters.
+
+Bar will attempt to retrieve the height of the terminal it is running on, and
+will adjust that height if the terminal is resized.  If bar cannot determine
+the terminal height, then bar will assume a default height of 23 characters.
+Use the
+.B --screen-height
+command line option to override this behavior and specify a fixed height for
+bar to use.  (When this option is used, bar will ignore terminal resized
+signals and continue to use the value provided by the user.)
+.PP
+Please note that this option is only useful when used in conjunction with the
+.B --info-file
+command line option.  Otherwise bar has no need to know the screen height in
+order to perform it's function.
+.RE
+
+.B -sh-1
+|
+.B --screen-height-minus-one
+.br
+.B -sh-0
+|
+.B --screen-height-minus-zero
+.RS 2
+.PP
+Instruct bar to use either the entire row height reported by termio, or one
+less than reported by termio.  I.e. If termio reports that you are running bar
+in a terminal that's 24 rows characters high, using the command line option
+.B --screen-height-minus-one
+instructs bar to only use 23 rows to print the display.  If you're using
+a terminal or shell that wraps the line whenever bar prints the last character
+then this should alleviate that problem.  Default is to use the full
+terminal's height.
+.PP
+Please note that this option is only useful when used in conjunction with the
+.B --info-file
+command line option.  Otherwise bar has no need to know the screen height in
+order to perform it's function.
+.RE
+
+.B -ti
+.I string
+|
+.B --title
+.I string
+.br
+.RS 2
+Set the title to 
+.IR string .
+.RE
+
+.B -dti
+|
+.B -nti
+.br
+.B --display-title
+|
+.B --no-title
+.br
+.RS 2
+Turn on/off the title display.  Even if on, if no title string is set then no
+title will be displayed.  Default is on.
+.RE
+
+.B -dtw
+|
+.B --display-twiddle
+.br
+.B -ntw
+|
+.B --no-twiddle
+.br
+.RS 2
+.PP
+Turn on/off the twiddle in the display.
+.RE
+
+.B -dc
+|
+.B --display-count
+.br
+.B -nc
+|
+.B --no-count
+.br
+.RS 2
+.PP
+Turn on/off the data count in the display.  Default is on.
+.RE
+
+.B -dcb
+|
+.B -ncb
+.br
+.B --display-count-bits
+|
+.B --no-count-bits
+.br
+.RS 2
+Display the data count at bits instead of as bytes.  Default is off.
+.PP
+By default bar will display the data count as bytes using the notation of "B".
+Using this option, bar will display the throughput as bits using the notation
+of "b".
+.RE
+
+.B -dth
+|
+.B --display-throughput
+.br
+.B -nth
+|
+.B --no-throughput
+.br
+.RS 2
+.PP
+Turn on/off the data throughput in the display.  Default is on.
+.RE
+
+.B -dthb
+|
+.B -nthb
+.br
+.B --display-throughput-bits
+|
+.B --no-throughput-bits
+.br
+.RS 2
+Display throughput as bits/second instead of as bytes/second.  Default is off.
+.PP
+By default bar will display the throughput as bytes/second using the notation
+of "B/s".  Using this option, bar will display the throughput as bits/second
+using the notation of "b/s".
+.RE
+
+.B -dt
+|
+.B --display-time
+.br
+.B -nt
+|
+.B --no-time
+.br
+.RS 2
+.PP
+Turn on/off the time elapsed or eta in the display.  Default is on.
+.RE
+
+.B -de
+|
+.B --display-elapsed-only
+.br
+.B -ne
+|
+.B --no-elapsed-only
+.RS 2
+.PP 
+Force bar to display the elapsed time instead of the eta.  Default is off.
+.RE
+
+.B -dp
+|
+.B --display-percent
+.br
+.B -np
+|
+.B --no-percent
+.br
+.RS 2
+.PP
+Turn on/off percent complete in the display.  Default is on.
+.RE
+
+.B -db
+|
+.B --display-bar
+.br
+.B -nb
+|
+.B --no-bar
+.br
+.RS 2
+.PP
+Turn on/off the progress bar in the display.  Default is on.
+.RE
+
+.B -ds
+|
+.B --display-summary
+.br
+.B -ns
+|
+.B --no-summary
+.br
+.RS 2
+.PP
+Turn on/off the summary information displayed when the operation is complete.
+Default is on.
+.RE
+
+.B -da
+|
+.B --display-all
+.br
+.B -dn
+|
+.B --display-none
+.br
+.RS 2
+.PP
+Turn on/off all displays.  -dn is equivalent to -ntw -nc -nth -nt -np -nb.
+(Using -dn followed by -db would be equivalent to -ntw -nc -nth -nt -np.)
+-da is equivalent to -dtw -dc -dth -dt -dp -db.
+.RE
+
+.B -inf
+.I infofile
+|
+.B --info-file
+.I infofile
+.br
+.RS 2
+.PP
+Display the information contained in
+.I infofile
+while copying data.  The file
+.I infofile
+is a regular text file containing tidbits of information broken up into
+sections.  Each section is separated by a line containing the string "@@@" by
+itself, with no other characters on the line, either preceeding or following.
+.PP
+When bar begins, it will count the number of sections within the file.  Bar
+will then begin by displaying the first section of information to the display
+before it draws the status line.  Then, periodically, each of the successive
+sections will be displayed as the progress indicator fills up.
+.PP
+The progress of the data transfer is the trigger for each successive display.
+For instance, if your information file has exactly four sections to it, then
+the first section will be printed as bar begins, the second section after the
+data transfer hits 25%, the third at 50%, and the fourth at 75%.
+.PP
+If bar is configured to use ANSI control codes, then the screen will be
+cleared before printing a section from the information file.  Otherwise, the
+contents of the current screen are scolled up and off the screen.
+.RE
+
+.B -dnum
+|
+.B --display-numeric
+.br
+.RS 2
+.PP
+Do not render the usual display, but instead display an integer representing
+the percent of the transfer that is complete, one integer per line.  This
+output is suitable for piping to other programs such as 
+.B dialog(1)
+or
+.BR zenity(1) .
+This implies that the total transfer size must be known by bar, either by
+finding the size of an input file directly or by using the
+.B --size
+command line option.
+
+.B -dw
+|
+.B --display-wait
+.br
+.RS 2
+Wait for the first byte of data to come through before displaying anything.
+.RE
+
+
+.SH COLOR COMMAND LINE OPTIONS
+
+.PP
+For the following color-specific command line options, the following keywords
+are recognized as valid color names: normal, black, red, green, yellow, blue,
+magenta, cyan, and white
+
+.B -dan
+|
+.B --display-ansi
+.br
+.B -nan
+|
+.B --no-ansi
+.br
+.RS 2
+.PP
+Turn on/off the use of ansi color codes in the display.
+.RE
+
+.B -spbg
+.I color
+|
+.B --space-background
+.I color
+.br
+.RS 2
+.PP
+Use
+.I color
+as the background color for spacing between display objects.  Default: normal
+.RE
+
+.B -twfg
+.I color
+|
+.B --twiddle-foreground
+.I color
+.br
+.B -twbg
+.I color
+|
+.B --twiddle-background
+.I color
+.br
+.RS 2
+.PP
+Use
+.I color
+as the twiddle color in the display.  Default: normal
+.RE
+
+.B -twb
+|
+.B --twiddle-bold
+.br
+.B -twn
+|
+.B --twiddle-normal
+.br
+.RS 2
+.PP
+Turn on/off the use of bold font when displaying the twiddle.  Default off
+.RE
+
+.B -tifg
+.I color
+|
+.B --title-foreground
+.I color
+.br
+.B -tibg
+.I color
+|
+.B --title-background
+.I color
+.br
+.RS 2
+.PP
+Use
+.I color
+as the title color in the display.  Default: normal
+.RE
+
+.B -tib
+|
+.B --title-bold
+.br
+.B -tin
+|
+.B --title-normal
+.br
+.RS 2
+.PP
+Turn on/off the use of bold font when displaying the title.  Default off
+.RE
+
+.B -cfg
+.I color
+|
+.B --count-foreground
+.I color
+.br
+.B -cbg
+.I color
+|
+.B --count-background
+.I color
+.br
+.RS 2
+.PP
+Use
+.I color
+as the data count color in the display.  Default: normal
+.RE
+
+.B -cb
+|
+.B --count-bold
+.br
+.B -cn
+|
+.B --count-normal
+.br
+.RS 2
+.PP
+Turn on/off the use of bold font when displaying the data count.  Default off
+.RE
+
+.B -thlfg
+.I color
+|
+.B --throughput-label-foreground
+.I color
+.br
+.B -thlbg
+.I color
+|
+.B --throughput-label-background
+.I color
+.br
+.RS 2
+.PP
+Use
+.I color
+as the throughput label color in the display.  Default: normal
+.RE
+
+.B -thlb
+|
+.B --throughput-label-bold
+.br
+.B -thln
+|
+.B --throughput-label-normal
+.br
+.RS 2
+.PP
+Turn on/off the use of bold font when displaying the throughput label.
+Default off
+.RE
+
+.B -thfg
+.I color
+|
+.B --throughput-foreground
+.I color
+.br
+.B -thbg
+.I color
+|
+.B --throughput-background
+.I color
+.br
+.RS 2
+.PP
+Use
+.I color
+as the throughput color in the display.  Default: normal
+.RE
+
+.B -thb
+|
+.B --throughput-bold
+.br
+.B -thn
+|
+.B --throughput-normal
+.br
+.RS 2
+.PP
+Turn on/off the use of bold font when displaying the throughput.
+Default off
+.RE
+
+.B -tlfg
+.I color
+|
+.B --time-label-foreground
+.I color
+.br
+.B -tlbg
+.I color
+|
+.B --time-label-background
+.I color
+.br
+.RS 2
+.PP
+Use
+.I color
+as the time label color in the display.  Default: normal
+.RE
+
+.B -tlb
+|
+.B --time-label-bold
+.br
+.B -tln
+|
+.B --time-label-normal
+.br
+.RS 2
+.PP
+Turn on/off the use of bold font when displaying the time label.
+Default off
+.RE
+
+.B -tfg
+.I color
+|
+.B --time-foreground
+.I color
+.br
+.B -tbg
+.I color
+|
+.B --time-background
+.I color
+.br
+.RS 2
+.PP
+Use
+.I color
+as the time color in the display.  Default: normal
+.RE
+
+.B -tb
+|
+.B --time-bold
+.br
+.B -tn
+|
+.B --time-normal
+.br
+.RS 2
+.PP
+Turn on/off the use of bold font when displaying the time.
+Default off
+.RE
+
+.B -pfg
+.I color
+|
+.B --percent-foreground
+.I color
+.br
+.B -pbg
+.I color
+|
+.B --percent-background
+.I color
+.br
+.RS 2
+.PP
+Use
+.I color
+as the percent color in the display.  Default: normal
+.RE
+
+.B -pb
+|
+.B --percent-bold
+.br
+.B -pn
+|
+.B --percent-normal
+.br
+.RS 2
+.PP
+Turn on/off the use of bold font when displaying the percent.
+Default off
+.RE
+
+.B -bbfg
+.I color
+|
+.B --bar-brace-foreground
+.I color
+.br
+.B -bbbg
+.I color
+|
+.B --bar-brace-background
+.I color
+.br
+.RS 2
+.PP
+Use
+.I color
+as the brace color around the progress bar in the display.  Default: normal
+.RE
+
+.B -bbb
+|
+.B --bar-brace-bold
+.br
+.B -bbn
+|
+.B --bar-brace-normal
+.br
+.RS 2
+.PP
+Turn on/off the use of bold font when displaying the bar braces.
+Default off
+.RE
+
+.B -bfg
+.I color
+|
+.B --bar-foreground
+.I color
+.br
+.B -bbg
+.I color
+|
+.B --bar-background
+.I color
+.br
+.RS 2
+.PP
+Use
+.I color
+as the color of the progress bar in the display.  Default: normal
+.RE
+
+.B -bb
+|
+.B --bar-bold
+.br
+.B -bn
+|
+.B --bar-normal
+.br
+.RS 2
+.PP
+Turn on/off the use of bold font when displaying the progress bar.
+Default off
+.RE
+
+.B -bobc
+|
+.B --bar-openbrace-char
+.I char
+.br
+.RS 2
+.PP Use
+.I char
+as the open brace character on the progress bar.
+.RE
+
+.B -bcbc
+|
+.B --bar-closebrace-char
+.I char
+.br
+.RS 2
+.PP Use
+.I char
+as the close brace character on the progress bar.
+.RE
+
+.B -bcc
+|
+.B --bar-complete-char
+.I char
+.br
+.RS 2
+.PP Use
+.I char
+as the completed character on the progress bar.
+.RE
+
+.B -bic
+|
+.B --bar-incomplete-char
+.I char
+.br
+.RS 2
+.PP Use
+.I char
+as the incomplete character on the progress bar.
+.RE
+
+.B -h
+|
+.B --help
+.br
+.RS 2
+.PP
+Display this text and exit.
+.RE
+
+.B -v
+|
+.B --version
+.br
+.RS 2
+.PP
+Display the program version and exit.
+.RE
+
+.SH RESOURCE FILE OPTIONS
+
+.PP
+Some command line options may be specified in a resource file.  Bar will
+search for a resource file by the name of
+.B /etc/clpbarrc
+and, if found, bar will use the values within by default.  Next bar will
+search for
+.B ~/.barrc
+and, if found, bar will use these values to override any values set within
+.BR /etc/clpbarrc .
+Last, bar will search for a file in the current working directory named
+.BR ./.barrc .
+If this file exists, it's values will override the values found in
+.B ~/.barrc
+or
+.BR /etc/clpbarrc .
+Values in all files may be overridden by command line flags.  Lines that
+begin with a # are ignored.
+
+.PP
+For resource options requiring a
+.I boolean
+value, the following values are recognized: on and off, yes and no, (and the
+single-character abbreviations y and n), true and false, (and the
+single-character abbreviations t and f), 0 and 1.
+
+.PP
+For resource options requiring a
+.I color
+value, the same keywords are recognized as for the color-specific command line
+options above: normal, black, red, green, yellow, blue, magenta, cyan, and
+white
+
+.BR buffer-size :
+.I buffer-size
+.RS 2
+.PP
+Allocate an I/O buffer of
+.I buffer-size
+bytes.  See the
+.B --buffer-size
+command line option above.
+.RE
+
+.BR throttle :
+.I rate
+.RS 2
+.PP
+Restrict I/O throughput to 
+.I rate
+bytes per second.  See the
+.B --throttle
+command line option above.
+.RE
+
+.BR interval :
+.I seconds
+.RS 2
+.PP
+Update the display every
+.I seconds
+seconds.  See the
+.B --interval
+command line option above.
+.RE
+
+.BR timeout :
+.I microseconds
+.RS 2
+.PP
+The number of microseconds to wait for a change in I/O state before
+.I select()
+times out.  See the 
+.B --timeout
+command line option above.
+.RE
+
+.BR kilobyte :
+1000|1024
+.RS 2
+.PP
+Use either 1000 or 1024 as the definition of a kilobyte.  See the
+.B --kilo
+command line option above.
+.RE
+
+.BR block-size :
+.I size
+.RS 2
+When parsing sizes specified in terms of blocks, assume a single block is 
+.I size
+bytes.  See the
+.B --block-size
+command line option above.
+.RE
+
+.BR screen-width :
+.I width
+.RS 2
+.PP
+Override termio and assume that the screen is 
+.I width
+characters wide.  See the 
+.B --screen-width
+command line option above.
+.RE
+
+.BR screen-width-minus-one :
+.I boolean
+.br
+.RS 2
+.PP
+Instruct bar to restrict the number of columns reported by termio by one.  See
+the
+.B --screen-width-minus-one
+command line option above.
+.RE
+
+.BR display-twiddle :
+.I boolean
+.br
+.RS 2
+.PP
+Instruct bar to turn on/off the twirling twiddle character in the display.
+See the 
+.B --display-twiddle
+command line option above.
+.RE
+
+.BR display-title :
+.I boolean
+.br
+.RS 2
+.PP
+Instruct bar to turn on/off the title in the display.  See the
+.B --display-title 
+command line option above.
+.RE
+
+.BR display-count :
+boolean
+.br
+.RS 2
+.PP
+Instruct bar to turn on/off the data count in the display.  See the
+.B --display-count
+command line option above.
+.RE
+
+.BR display-count-bits :
+.I boolean
+.br
+.RS 2
+.PP
+Display the data count as bits instead of as bytes.  See the
+.B --display-count-bits
+command line option above.
+.RE
+
+.BR display-throughput :
+.I boolean
+.br
+.RS 2
+.PP
+Instruct bar to turn on/off the data throughput in the display.  See the
+.B --display-throughput
+command line option above.
+.RE
+
+.BR display-throughput-bits :
+boolean
+.br
+.RS 2
+.PP
+Display throughput as bits/sec instead of as bytes/sec.  See the
+.B --display-throughput-bits
+command line option above.
+.RE
+
+.BR display-time :
+.I boolean
+.br
+.RS 2
+.PP
+Instruct bar to turn on/off the time in the display.  See the
+.B --display-time
+command line option above.
+.RE
+
+.BR display-elapsed-only :
+.I boolean
+.br
+.RS 2
+.PP
+Force bar to display the elapsed time instead of the eta.  See the
+.B --display-elapsed-only
+command line option above.
+.RE
+
+.BR display-percent :
+.I boolean
+.br
+.RS 2
+.PP
+Instruct bar to turn on/off the percent complete in the display.  See the
+.B --display-percent
+command line option above.
+.RE
+
+.BR display-bar :
+.I boolean
+.br
+.RS 2
+.PP
+Instruct bar to turn on/off the progress bar in the display.  See the
+.B --display-bar
+command line option above.
+.RE
+
+.BR display-summary :
+.I boolean
+.br
+.RS 2
+.PP
+Instruct bar to turn on/off the summary information displayed when operation
+is complete.  See the 
+.B --display-summary
+command line option above.
+.RE
+
+.BR info-file :
+.I infofile
+.br
+.RS 2
+Display the information contained in
+.I infofile
+while copying data.  The file
+.I infofile
+is a regular text file containing tidbits of information broken up into
+sections.  Each section is separated by a line containing the string "@@@" by
+itself, with no other characters on the line, either preceeding or following.
+.PP
+When bar begins, it will count the number of sections within the file.  Bar
+will then begin by displaying the first section of information to the display
+before it draws the status line.  Then, periodically, each of the successive
+sections will be displayed as the progress indicator fills up.
+.PP
+The progress of the data transfer is the trigger for each successive display.
+For instance, if your information file has exactly four sections to it, then
+the first section will be printed as bar begins, the second section after the
+data transfer hits 25%, the third at 50%, and the fourth at 75%.
+.PP
+If bar is configured to use ANSI control codes, then the screen will be
+cleared before printing a section from the information file.  Otherwise, the
+contents of the current screen are scolled up and off the screen.
+.RE
+
+.BR display-numeric :
+.I boolean
+.br
+.RS 2
+Do not render the usual display, but instead display an integer representing
+the percent of the transfer that is complete, one integer per line.  This
+output is suitable for piping to other programs such as 
+.B dialog(1)
+or
+.BR zenity(1) .
+This implies that the total transfer size must be known by bar, either by
+finding the size of an input file directly or by using the
+.B --size
+command line option.
+.RE
+
+.BR display-wait :
+.I boolean
+.br
+.RS 2
+Wait for the first byte of data to come through before displaying anything.
+.RE
+
+.BR display-ansi :
+.I boolean
+.br
+.RS 2
+.PP
+Instruct bar to turn on/off the use of ansi color codes in the display.  See
+the
+.B --display-ansi
+command line option above.
+.RE
+
+.BR space-background :
+.I color
+.br
+.RS 2
+.PP
+Use
+.I color
+as the background color for spacing between display objects.  See the
+.B --space-background
+command line option above.
+.RE
+
+.BR twiddle-foreground :
+.I color
+.br
+.BR twiddle-background :
+.I color
+.br
+.BR twiddle-bold :
+.I boolean
+.br
+.RS 2
+.PP
+Use the specified colors for the foreground and background of the twiddle,
+and use a bold font.  See the
+.BR --twiddle-foreground ,
+.BR --twiddle-background ,
+and
+.B --twiddle-bold
+command line options above.
+.RE
+
+.BR title :
+.I string
+.br
+.RS 2
+.PP
+Set the title string for the display.  See the
+.B --title
+command line option above.
+.RE
+
+.BR title-foreground :
+.I color
+.br
+.BR title-background :
+.I color
+.br
+.BR title-bold :
+.I boolean
+.br
+.RS 2
+.PP
+Use the specified colors for the foreground and background of the title,
+and use a bold font.  See the
+.BR --title-foreground ,
+.BR --title-background ,
+and
+.B --title-bold
+command line options above.
+.RE
+
+.BR count-foreground :
+.I color
+.br
+.BR count-background :
+.I color
+.br
+.BR count-bold :
+.I boolean
+.br
+.RS 2
+.PP
+Use the specified colors for the foreground and background of the data count,
+and use a bold font.  See the
+.BR --count-foreground ,
+.BR --count-background ,
+and
+.B --count-bold
+command line options above.
+.RE
+
+.BR throughput-label-foreground :
+.I color
+.br
+.BR throughput-label-background :
+.I color
+.br
+.BR throughput-label-bold :
+.I boolean
+.br
+.RS 2
+.PP
+Use the specified colors for the foreground and background of the throughput
+label, and use a bold font.  See the
+.BR --throughput-label-foreground ,
+.BR --throughput-label-background ,
+and
+.B --throughput-label-bold
+command line options above.
+.RE
+
+.BR throughput-foreground :
+.I color
+.br
+.BR throughput-background :
+.I color
+.br
+.BR throughput-bold :
+.I boolean
+.br
+.RS 2
+.PP
+Use the specified colors for the foreground and background of the throughput,
+and use a bold font.  See the
+.BR --throughput-foreground ,
+.BR --throughput-background ,
+and
+.B --throughput-bold
+command line options above.
+.RE
+
+.BR time-label-foreground :
+.I color
+.br
+.BR time-label-background :
+.I color
+.br
+.BR time-label-bold :
+.I boolean
+.br
+.RS 2
+.PP
+Use the specified colors for the foreground and background of the time
+label, and use a bold font.  See the
+.BR --time-label-foreground ,
+.BR --time-label-background ,
+and
+.B --time-label-bold
+command line options above.
+.RE
+
+.BR time-foreground :
+.I color
+.br
+.BR time-background :
+.I color
+.br
+.BR time-bold :
+.I boolean
+.br
+.RS 2
+.PP
+Use the specified colors for the foreground and background of the time,
+and use a bold font.  See the
+.BR --time-foreground ,
+.BR --time-background ,
+and
+.B --time-bold
+command line options above.
+.RE
+
+.BR percent-foreground :
+.I color
+.br
+.BR percent-background :
+.I color
+.br
+.BR percent-bold :
+.I boolean
+.br
+.RS 2
+.PP
+Use the specified colors for the foreground and background of the percent,
+and use a bold font.  See the
+.BR --percent-foreground ,
+.BR --percent-background ,
+and
+.B --percent-bold
+command line options above.
+.RE
+
+.BR bar-brace-foreground :
+.I color
+.br
+.BR bar-brace-background :
+.I color
+.br
+.BR bar-brace-bold :
+.I boolean
+.br
+.RS 2
+.PP
+Use the specified colors for the foreground and background of the brace
+surrounding the progress bar, and use a bold font.  See the
+.BR --bar-brace-foreground ,
+.BR --bar-brace-background ,
+and
+.B --bar-brace-bold
+command line options above.
+.RE
+
+.BR bar-foreground :
+.I color
+.br
+.BR bar-background :
+.I color
+.br
+.BR bar-bold :
+.I boolean
+.br
+.RS 2
+Use the specified colors for the foreground and background of the progress
+bar, and use a bold font.  See the
+.BR --bar-foreground ,
+.BR --bar-background ,
+and
+.B --bar-bold
+command line options above.
+.RE
+
+.BR bar-openbrace-char :
+.I char
+.br
+.BR bar-closebrace-char :
+.I char
+.br
+.BR bar-complete-char :
+.I char
+.br
+.BR bar-incomplete-char :
+.br
+.RS 2
+Use the specified custom characters
+.I char
+for the opening brace, closing brace, completed, and incomplete characters
+when rendering the progress bar.
+.RE
+
+.SH EXAMPLES
+
+.PP
+Example 1: Using bar to copy a 2.4gb file from a device (in this case a tape
+drive) to a file, using a 64k buffer.
+
+.RS 2
+.PP
+prompt% bar --in-file /dev/rmt/1cbn --out-file \\
+.br
+tape-restore.tar --size 2.4g --buffer-size 64k
+.RE
+  
+.PP
+Example 2: Using bar to copy a 37tb file across the network using SSH.
+
+.RS 2
+.PP
+prompt% ssh remote 'dd if=file' | bar --size 37t > file
+.RE
+
+.PP
+Example 3: Using bar inside a tar-pipe command:
+
+.RS 2
+.PP
+Normal tar-pipe command might be:
+
+.RS 2
+.PP
+prompt% (cd /some/dir/somewhere && tar -cf - *) \\
+.br
+| (cd /some/other/dir && tar -xBpf -)
+.RE
+
+.PP
+3a: Using bar within the tar-pipe:
+
+.RS 2
+.PP
+prompt% (cd /some/dir/somewhere && tar -cf - *) \\
+.br
+| bar \\
+.br
+| (cd /some/other/dir && tar -xBpf -)
+.RE
+
+.PP
+3b: Using bar with the --size option in a tar-pipe:
+
+.RS 2
+.PP
+prompt% du -sk /some/dir/somewhere
+.br
+6281954 /some/dir/somewhere
+.br
+.PP
+prompt% (cd /some/dir/somewhere && tar -cf - *) \\
+.br
+| bar --size 6281954k \\
+.br
+| (cd /some/other/dir && tar -xBpf -)
+.RE
+.RE
+
+.PP
+Example 4: Using bar on a regular file.  (Note that the
+.B --size
+option is not needed here, as bar will retrieve the file size itself.)
+
+.RS 2
+.PP
+prompt% bar --in-file ./file | ssh remote 'cd /some/dir && dd of=file'
+.RE
+  
+.PP
+Example 5: Generating a 512k file of random data.
+
+.RS 2
+.PP
+prompt% dd if=/dev/random bs=1024 count=512 \\
+.br
+| bar -s 512k -of ./random
+.RE
+
+.PP
+Example 6: An example .barrc file.
+.RS 2
+#
+.br
+# This is an example of what a ~/.barrc file 
+.br
+# might look like.  Note that lines beginning
+.br
+# with a # are ignored.
+.br
+#
+.br
+display-twiddle: no
+.br
+display-ansi: yes
+.br
+# space-background: black
+.br
+twiddle-foreground: green
+.br
+# twiddle-background: normal
+.br
+# twiddle-bold: no
+.br
+count-foreground: green
+.br
+# count-background: magenta
+.br
+count-bold: yes
+.br
+throughput-label-foreground: normal
+.br
+# throughput-label-background: red
+.br
+throughput-label-bold: no
+.br
+throughput-foreground: green
+.br
+# throughput-background: black
+.br
+throughput-bold: yes
+.br
+time-label-foreground: normal
+.br
+# time-label-background: red
+.br
+time-label-bold: no
+.br
+time-foreground: green
+.br
+# time-background: black
+.br
+time-bold: yes
+.br
+percent-foreground: green
+.br
+# percent-background: green
+.br
+percent-bold: yes
+.br
+bar-brace-foreground: red
+.br
+# bar-brace-background: blue
+.br
+bar-brace-bold: no
+.br
+bar-foreground: yellow
+.br
+# bar-background: blue
+.br
+bar-bold: yes
+.RE
+
+.SH NOTES
+
+.RS 0
+.TP 2
+-
+The
+.B --size
+option is only used by bar in calculating information about the data
+transfer.  Bar will not cease copying data once it has reached the number of
+bytes specified with the 
+.B --size
+option, but instead bar will continue to copy
+data until and end of input is reached.  If this behavior is undesirable then
+bar may be used in conjunction with dd, where the count option is used with dd
+to specify when to cut off the input stream.  (See examples above.)
+.RE
+
+.RS 0
+.TP 2
+-
+When using other commands such as 
+.B du -k
+to calculate the expected size of a
+data transfer stream, the value returned may not be exactly the number of
+bytes counted by bar in the actual data transfer.  Common causes for this
+discrepancy could be attributed to round-off error or the use of 1000 bytes as
+a kilobyte rather than 1024.  (If the later is the case, then using the 
+.B -k
+1000 option to bar will help.)  When such discrepancies occur, bar may report
+that the data stream contained only 98% or as much as 101% of it's expected
+size.  (If you have doubts, you should definitely verify your data using
+md5sum, diff, or cmp.)
+.RE
+
+.RS 0
+.TP 2
+-
+When the value of a calculation exceeds the size alloted for the display, the
+value +99... will be substituted in it's place.  The complete value will be
+displayed in a summary statement after bar has reached the end of input.
+.RE
+
+.RS 0
+.TP 2
+-
+Bar assumes a linear relationship between the speed of the data transfer and
+the amount of time remaining.  Specifically the calculation is based on the
+following:
+
+elapsed time / eta = bytes written / total size
+
+However, it has been the author's experience that the throughput speed will
+change, particularly at the beginning of the transfer, and this will affect the
+estimated time remaining.  The author does not believe this is a bug, but a
+side-effect of this method of calculation.
+.RE
+
+.RS 0
+.TP 2
+-
+Bar assumes that there are 8 bits in both a byte and a char.
+.RE
+
+.SH BUGS
+
+.TP 2
+-
+Bar uses the
+.I open()
+and
+.I fstat()
+functions to open and retrieve the size of regular files when using either the
+.B --in-file
+or
+.B --out-file
+command line options.  Some OS's do not support Large Files (file sizes up to
+(2**63)-1 bytes) natively.  Some OS's support Large Files but require
+_FILE_OFFSET_BITS or _LARGE_FILES to be defined properly at compile time.
+Other OS's support neither, but still allow programs to open files in excess
+of (2**32)-1 through an O_LARGEFILE option that can be passed to the
+.I open()
+function.
+
+When trying to open files greater than 2gb on an OS without Large File
+support, bar will exit with the message: "File too large".  When trying to
+write more than 2gb of data to a file, bar will write 2**32-1 bytes and then
+the OS may terminate bar with a message similar to: "File size limit
+exceeded".
+
+When trying to open files greater than 2gb on an OS without Large File
+support, but with the O_LARGEFILE option that can be passed to 
+.IR open() ,
+bar will receive an error when trying to retrieve the file's size, but bar
+will be able to open the file anyway.  Under these circumstances, bar will
+print a "File too large" error message, but will then proceed to transfer the
+data.  Since bar will not be able to retrieve the file's size on it's own, the
+.B --size
+command line option must be used after the
+.B --in-file
+option to tell bar the file size manually.  On such OS's, bar should be able
+to write more than 2gb of data to a file without any problems.
+
+For OS's that support files greater than 2gb, either natively or through the
+Large File extension definitions mentioned above, bar should work as expected.
+
+.TP 2
+-
+The author has noticed that when running bar over an SSH connection, sometimes
+window resize events are not captured until after the display has gone through
+one or two more updates, which can cause the line to wrap.
+
+.TP 2
+-
+The author has noticed that on some systems the use of aligned memory
+allocation, through either memalign() or posix_memalign(), causes bar to
+commit a segmentation fault the first time read() or readv() is called and
+passed a pointer to the aligned memory as it's input buffer.  Attempts were
+made to try to isolate systems in which this bug bites through tests in
+configure, but all tests devised passed with flying colors.  Therefore aligned
+memory allocation is turned off by default, and may only be enabled by passing
+--enable-use-memalign to configure when building the executable.
+
+.TP 2
+-
+On some 64-bit systems it has been found that the CC compiler will, by
+default, compile bar in 32-bit mode.  This has been known to cause math errors
+which result in segmentation faults and infinite loops.  Although multiple
+configure tests have been added to the compilation phase to try to properly
+detect such compilers and compensate for such bugs, without access to such
+systems for debugging purposes there may be other bugs waiting to rear their
+ugly heads.
+
+.PP
+Report all bugs to the author.
+
+.PP
+Bar was developed on a Sun workstation running Solaris 8.  To the best of the
+author's knowledge bar should compile and run on other platforms without much
+trouble.  Should other OS's require modifications to the code, the author
+welcomes all patch submissions, but requests that you include the file
+.I config.log
+and the output of 
+.I "gcc -dumpspecs"
+(or a listing of predefined variables, if not using gcc).
+
+.SH DISTRIBUTION
+.PP
+The latest version of bar can always be found at:
+.RS 2
+http://www.freshmeat.net/projects/commandlineprogressbar
+.br
+http://sourceforge.net/projects/clpbar/
+.RE
+
+.SH AUTHOR
+.PP
+Bar was written by Michael Peek.  See DISTRIBUTION above for contact
+information.
+.PP
+Occasionally, the author fancies that he knows what he's doing.  It is at
+these times more than ever that his coworkers should cower in fear...
+
