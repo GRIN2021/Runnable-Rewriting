@@ -25,7 +25,7 @@ apt-get install --no-install-recommends --yes \
   python3-setuptools \
   sed \
   texinfo \
-  valrunnabled \
+  valgrind \
   zlib1g-dev \
   libmpc-dev
 
