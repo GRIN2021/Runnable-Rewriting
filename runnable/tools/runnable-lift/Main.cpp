@@ -38,6 +38,7 @@ extern "C" {
 // Local includes
 #include "BinaryFile.h"
 #include "CodeGenerator.h"
+#include "ParallelOptions.h"
 #include "PTCInterface.h"
 
 PTCInterface ptc = {}; ///< The interface with the PTC library.
@@ -77,6 +78,26 @@ opt<string> InputPath(Positional, Required, desc("<input path>"));
 opt<string> OutputPath(Positional, Required, desc("<output path>"));
 
 opt<string> ExecutableArgs("exe-args", value_desc("arguments"), cat(MainCategory));
+
+opt<bool> DynamicParallel("dynamic-parallel",
+                          desc("enable dynamic branch-driven parallel lift"),
+                          cat(MainCategory),
+                          init(false));
+opt<unsigned> ParallelWorkers("parallel-workers",
+                              desc("maximum number of worker subprocesses"),
+                              cat(MainCategory),
+                              init(1));
+opt<bool> ParallelWorkerMode("parallel-worker-mode",
+                             desc("internal worker subprocess mode"),
+                             cat(MainCategory),
+                             init(false));
+opt<unsigned long long> ParallelSeedPC("parallel-seed-pc",
+                                       desc("worker seed PC"),
+                                       cat(MainCategory),
+                                       init(0));
+opt<string> ParallelFragmentDir("parallel-fragment-dir",
+                                desc("fragment output directory"),
+                                cat(MainCategory));
 
 } // namespace
 
@@ -203,12 +224,21 @@ int main(int argc, const char *argv[]) {
   // Translate everything
   Architecture TargetArchitecture;
   llvm::LLVMContext RevambGlobalContext;
+  ParallelOptions Options;
+  Options.DynamicParallel = DynamicParallel;
+  Options.WorkerMode = ParallelWorkerMode;
+  Options.WorkerCount = ParallelWorkers;
+  Options.SeedPC = ParallelSeedPC;
+  Options.FragmentDir = ParallelFragmentDir;
+  Options.InputPath = InputPath;
+  Options.ExecutableArgs = ExecutableArgs;
   CodeGenerator Generator(TheBinary,
                           TargetArchitecture,
                           RevambGlobalContext,
                           std::string(OutputPath),
                           LibHelpersPath,
-                          EarlyLinkedPath);
+                          EarlyLinkedPath,
+                          Options);
 
   Generator.translate(EntryPointAddress);
   Generator.serialize();

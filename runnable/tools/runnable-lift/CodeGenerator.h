@@ -8,7 +8,9 @@
 // Standard includes
 #include <cstdint>
 #include <memory>
+#include <set>
 #include <string>
+#include <vector>
 
 // LLVM includes
 #include "llvm/ADT/ArrayRef.h"
@@ -18,6 +20,7 @@
 
 // Local includes
 #include "BinaryFile.h"
+#include "ParallelOptions.h"
 
 // Forward declarations
 namespace llvm {
@@ -38,6 +41,14 @@ class ObjectFile;
 
 class DebugHelper;
 
+struct ParallelWorkerState {
+  int Pid = -1;
+  uint64_t SeedPC = 0;
+  std::string OutputPath;
+  int ExitCode = -1;
+  bool Finished = false;
+};
+
 /// Translator from binary code to LLVM IR.
 class CodeGenerator {
 public:
@@ -54,7 +65,8 @@ public:
                 llvm::LLVMContext &TheContext,
                 std::string Output,
                 std::string Helpers,
-                std::string EarlyLinked);
+                std::string EarlyLinked,
+                const ParallelOptions &Options);
 
   ~CodeGenerator();
 
@@ -97,6 +109,12 @@ private:
   /// \param Name name of the imported function
   llvm::Function *importHelperFunctionDeclaration(llvm::StringRef Name);
 
+  void switchToWorkerOutput(uint64_t SeedPC);
+  bool trySpawnBranchWorker(uint64_t SeedPC,
+                            std::vector<std::tuple<uint64_t, llvm::BasicBlock *, uint64_t>> &BranchTargets);
+  void waitForForkWorkers();
+  void mergeForkWorkerFragments();
+
 private:
   Architecture TargetArchitecture;
   llvm::LLVMContext &Context;
@@ -112,6 +130,13 @@ private:
   unsigned DbgMDKind;
 
   std::string FunctionListPath;
+  ParallelOptions ParallelConfig;
+  std::vector<ParallelWorkerState> ParallelWorkers;
+  std::set<uint64_t> ParallelSpawnedSeeds;
+  uint64_t ParallelFrontierCandidates = 0;
+  uint64_t ParallelWorkersSpawned = 0;
+  uint64_t ParallelWorkersSucceeded = 0;
+  uint64_t ParallelWorkersFailed = 0;
 };
 
 #endif // CODEGENERATOR_H

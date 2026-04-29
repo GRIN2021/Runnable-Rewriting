@@ -248,6 +248,7 @@ public:
 
   std::vector<uint64_t> IllegalStaticAddrs;
   bool isIllegalStaticAddr(uint64_t pc);
+  bool isOutOfAddrRange(uint64_t pc);
 
   void TestSuspectDataRegion(std::string path);
   StaticAddrsMap SuspectDataRegion;

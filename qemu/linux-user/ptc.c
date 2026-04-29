@@ -309,6 +309,8 @@ int ptc_load(void *handle, PTCInterface *output, const char *ptc_filename,
   result.disassemble = &ptc_disassemble;
   result.do_syscall2 = &ptc_do_syscall2;
   result.storeCPUState = &ptc_storeCPUState;
+  result.dropCPUState = &ptc_dropCPUState;
+  result.queueDepth = &ptc_queueDepth;
   result.getBranchCPUeip = &ptc_getBranchCPUeip;
   result.deletCPULINEState = &ptc_deletCPULINEState;
   result.recoverStack = &ptc_recoverStack;
@@ -1442,6 +1444,22 @@ uint32_t ptc_storeCPUState(void) {
 
   insertArchCPUStateQueueLine(*new_env,pdata,pstack);
   return 1;
+}
+
+uint32_t ptc_dropCPUState(void){
+  BranchState datatmp;
+
+  if(isEmpty())
+    return 0;
+
+  datatmp = deletArchCPUStateQueueLine();
+  free(datatmp.elf_data);
+  free(datatmp.elf_stack);
+  return 1;
+}
+
+uint32_t ptc_queueDepth(void){
+  return numsArchCPUStateQueueLine();
 }
 
 void ptc_recoverStack(void){

@@ -257,6 +257,8 @@ EXPORTED(uint64_t, ptc_run_library, (size_t flag));
 EXPORTED(void, ptc_data_start, (uint64_t start, uint64_t entry));
 EXPORTED(unsigned long, ptc_do_syscall2, (void));
 EXPORTED(uint32_t, ptc_storeCPUState, (void));
+EXPORTED(uint32_t, ptc_dropCPUState, (void));
+EXPORTED(uint32_t, ptc_queueDepth, (void));
 EXPORTED(void, ptc_getBranchCPUeip,(void));
 EXPORTED(uint32_t, ptc_deletCPULINEState,(void));
 EXPORTED(void,ptc_recoverStack,(void));
@@ -290,6 +292,8 @@ typedef struct {
 
   ptc_do_syscall2_ptr_t do_syscall2;
   ptc_storeCPUState_ptr_t storeCPUState;
+  ptc_dropCPUState_ptr_t dropCPUState;
+  ptc_queueDepth_ptr_t queueDepth;
   ptc_getBranchCPUeip_ptr_t getBranchCPUeip;
   ptc_deletCPULINEState_ptr_t deletCPULINEState;
   ptc_recoverStack_ptr_t recoverStack;

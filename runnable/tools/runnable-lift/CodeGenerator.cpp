@@ -14,6 +14,8 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <sys/wait.h>
+#include <unistd.h>
 #include <utility>
 #include <vector>
 
@@ -63,6 +65,37 @@ using namespace llvm;
 
 using std::make_pair;
 using std::string;
+
+namespace {
+
+static std::string hexValue(uint64_t Value) {
+  std::ostringstream Stream;
+  Stream << std::hex << Value;
+  return Stream.str();
+}
+
+static std::string findRepoRootFromCwd() {
+  char Buffer[4096];
+  if (getcwd(Buffer, sizeof(Buffer)) == nullptr)
+    return "";
+  std::string Current(Buffer);
+  while (!Current.empty()) {
+    std::string Probe = Current + "/scripts/merge_dynamic_runnable_fragments.py";
+    if (access(Probe.c_str(), F_OK) == 0)
+      return Current;
+    size_t Slash = Current.find_last_of('/');
+    if (Slash == std::string::npos)
+      break;
+    if (Slash == 0) {
+      Current = "/";
+      break;
+    }
+    Current = Current.substr(0, Slash);
+  }
+  return "";
+}
+
+} // namespace
 
 // Register all the arguments
 
@@ -179,13 +212,15 @@ CodeGenerator::CodeGenerator(BinaryFile &Binary,
                              llvm::LLVMContext &TheContext,
                              std::string Output,
                              std::string Helpers,
-                             std::string EarlyLinked) :
+                             std::string EarlyLinked,
+                             const ParallelOptions &Options) :
   TargetArchitecture(Target),
   Context(TheContext),
   TheModule((new Module("top", Context))),
   OutputPath(Output),
   Debug(new DebugHelper(Output, TheModule.get(), DebugInfo, DebugPath)),
-  Binary(Binary) {
+  Binary(Binary),
+  ParallelConfig(Options) {
   OriginalInstrMDKind = Context.getMDKindID("oi");
   PTCInstrMDKind = Context.getMDKindID("pi");
 
@@ -1015,14 +1050,14 @@ void CodeGenerator::translate(uint64_t VirtualAddress) {
     } 
     }////?end if(!JumpTargets.haveBB)
 
-    if(EntryFlag and JumpTargets.haveBB){
+	    if(EntryFlag and JumpTargets.haveBB){
       JumpTargets.handleSuspectDataRegion(SuspectEntryAddr,VirtualAddress);
       SuspectEntryAddr = 0;
       EntryFlag = false;
     }
 
-    // Obtain a new program counter to translate
-    std::tie(VirtualAddress, Entry) = JumpTargets.peek();
+	    // Obtain a new program counter to translate
+	    std::tie(VirtualAddress, Entry) = JumpTargets.peek();
 
     if(*ptc.isCall and BlockBRs){
       if(!JumpTargets.isDataSegmAddr(ptc.regs[R_ESP])){
@@ -1036,7 +1071,7 @@ void CodeGenerator::translate(uint64_t VirtualAddress) {
       *ptc.isCall = 0;
     }
 
-    if(!EntryFlag){
+	    if(!EntryFlag){
       if(*ptc.exception_syscall == 0x100){
         if(ExeInit){
           if(ptc.regs[R_EAX]==20){
@@ -1078,9 +1113,12 @@ void CodeGenerator::translate(uint64_t VirtualAddress) {
         if(it == JumpTargets.CallBranches.end())
           DynamicVirtualAddress = 0;
       }
+      if(!JumpTargets.haveBB && DynamicVirtualAddress != 0
+         && JumpTargets.isOutOfAddrRange(DynamicVirtualAddress))
+        DynamicVirtualAddress = 0;
     }
 
-    if(traverseFLAG){
+	    if(traverseFLAG){
     //handle invalid address
     if(!JumpTargets.isExecutableAddress(DynamicVirtualAddress) 
        and !JumpTargets.haveBB)
@@ -1092,22 +1130,31 @@ void CodeGenerator::translate(uint64_t VirtualAddress) {
    
     }
     
-    // Some branch destination addr is 0 
-    if((JumpTargets.haveBB || DynamicVirtualAddress == 0 ) and
-		    !JumpTargets.BranchTargets.empty())
-    {
-      BlockBRs = nullptr;
-      // if occure a translated BB, traversing next branch
-      std::tie(jtVirtualAddress, srcBB, srcAddr) = JumpTargets.BranchTargets.front();
-      errs()<<"--------------------\n";
-      JumpTargets.BranchTargets.erase(JumpTargets.BranchTargets.begin());
-      ptc.deletCPULINEState();
-      DynamicVirtualAddress = jtVirtualAddress;
-      BaseData.clear();
-    }
+	    // Some branch destination addr is 0 
+		    if((JumpTargets.haveBB || DynamicVirtualAddress == 0 ) and
+				    !JumpTargets.BranchTargets.empty())
+	    {
+	      BlockBRs = nullptr;
+	      // if occure a translated BB, traversing next branch
+	      std::tie(jtVirtualAddress, srcBB, srcAddr) = JumpTargets.BranchTargets.front();
+	      errs()<<"--------------------\n";
+              if (trySpawnBranchWorker(jtVirtualAddress, JumpTargets.BranchTargets)) {
+                JumpTargets.haveBB = 0;
+                DynamicVirtualAddress = 0;
+                BaseData.clear();
+              } else if (ParallelConfig.WorkerMode) {
+                DynamicVirtualAddress = jtVirtualAddress;
+                BaseData.clear();
+              } else {
+	        JumpTargets.BranchTargets.erase(JumpTargets.BranchTargets.begin());
+	        ptc.deletCPULINEState();
+	        DynamicVirtualAddress = jtVirtualAddress;
+	        BaseData.clear();
+              }
+	    }
 
-    if(DynamicVirtualAddress){
-      auto tmpBB = JumpTargets.registerJT(DynamicVirtualAddress,JTReason::GlobalData);
+	    if(DynamicVirtualAddress){
+	      auto tmpBB = JumpTargets.registerJT(DynamicVirtualAddress,JTReason::GlobalData);
       //JumpTargets.isContainIndirectInst(DynamicVirtualAddress,tmpVA,tmpBB);
       if(JumpTargets.haveBB){
         // If have translated BB, give Entry an arbitrary value
@@ -1122,14 +1169,14 @@ void CodeGenerator::translate(uint64_t VirtualAddress) {
         srcBB = nullptr;
 	JumpTargets.haveBB = 0;
       }
-      if(BlockBRs != nullptr and !EntryFlag){  
-        auto branchLabeledcontent = Translator.branchcontent(); 
-        JumpTargets.harvestbranchBasicBlock(VirtualAddress,
+	      if(BlockBRs != nullptr and !EntryFlag){  
+	        auto branchLabeledcontent = Translator.branchcontent(); 
+	        JumpTargets.harvestbranchBasicBlock(VirtualAddress,
 			           tmpVA,
                                    BlockBRs,
-                                   Translator.branchsize(), 
-                                   branchLabeledcontent);
-      }
+	                                   Translator.branchsize(), 
+	                                   branchLabeledcontent);
+	      }
       std::cerr<<std::hex<<VirtualAddress<<" \n";
     }
 
@@ -1154,8 +1201,9 @@ void CodeGenerator::translate(uint64_t VirtualAddress) {
       std::cerr<<std::hex<<VirtualAddress<<" \n";
     }
 
-  } // End translations loop
-  JumpTargets.handleEmbeddedDataAddr(getEmbeddedData());
+	  } // End translations loop
+          waitForForkWorkers();
+	  JumpTargets.handleEmbeddedDataAddr(getEmbeddedData());
   embeddedData();
   JumpTargets.TestSuspectDataRegion(getPath());  
 
@@ -1392,4 +1440,109 @@ void CodeGenerator::serialize() {
     std::ofstream Output(OutputPath);
     Debug->print(Output, false);
   }
+  if (!ParallelConfig.WorkerMode)
+    mergeForkWorkerFragments();
+}
+
+void CodeGenerator::switchToWorkerOutput(uint64_t SeedPC) {
+  if (!ParallelConfig.FragmentDir.empty()) {
+    std::string Command = "mkdir -p \"" + ParallelConfig.FragmentDir + "\"";
+    ::system(Command.c_str());
+  }
+  std::ostringstream Path;
+  Path << ParallelConfig.FragmentDir << "/worker_" << hexValue(SeedPC) << ".ll";
+  OutputPath = Path.str();
+  CoveragePath = OutputPath + ".coverage.csv";
+  BBSummaryPath = OutputPath + ".bbsummary.csv";
+  LinkingInfoPath = OutputPath + ".li.csv";
+  Debug.reset(new DebugHelper(OutputPath, TheModule.get(), DebugInfo, DebugPath));
+}
+
+bool CodeGenerator::trySpawnBranchWorker(
+  uint64_t SeedPC,
+  std::vector<std::tuple<uint64_t, llvm::BasicBlock *, uint64_t>> &BranchTargets) {
+  if (!ParallelConfig.DynamicParallel || ParallelConfig.WorkerMode)
+    return false;
+  if (ParallelConfig.WorkerCount == 0)
+    return false;
+  if (ParallelSpawnedSeeds.count(SeedPC) != 0)
+    return false;
+
+  size_t ActiveWorkers = 0;
+  for (const auto &Worker : ParallelWorkers)
+    if (!Worker.Finished)
+      ActiveWorkers++;
+  if (ActiveWorkers >= ParallelConfig.WorkerCount)
+    return false;
+
+  pid_t PID = fork();
+  runnable_assert(PID >= 0, "failed to fork branch worker");
+  if (PID == 0) {
+    ParallelConfig.WorkerMode = true;
+    switchToWorkerOutput(SeedPC);
+    BranchTargets.erase(BranchTargets.begin());
+    ptc.deletCPULINEState();
+    return false;
+  }
+
+  BranchTargets.erase(BranchTargets.begin());
+  ptc.dropCPUState();
+  ParallelSpawnedSeeds.insert(SeedPC);
+  std::ostringstream WorkerOutput;
+  WorkerOutput << ParallelConfig.FragmentDir << "/worker_" << hexValue(SeedPC) << ".ll";
+  ParallelWorkers.push_back({ static_cast<int>(PID), SeedPC, WorkerOutput.str(), -1, false });
+  ParallelWorkersSpawned++;
+  return true;
+}
+
+void CodeGenerator::waitForForkWorkers() {
+  if (!ParallelConfig.DynamicParallel || ParallelConfig.WorkerMode)
+    return;
+
+  for (auto &Worker : ParallelWorkers) {
+    if (Worker.Finished)
+      continue;
+    int Status = 0;
+    pid_t Waited = waitpid(Worker.Pid, &Status, 0);
+    if (Waited != Worker.Pid)
+      continue;
+    Worker.Finished = true;
+    Worker.ExitCode = WIFEXITED(Status) ? WEXITSTATUS(Status) : -1;
+    if (Worker.ExitCode == 0)
+      ParallelWorkersSucceeded++;
+    else
+      ParallelWorkersFailed++;
+  }
+}
+
+void CodeGenerator::mergeForkWorkerFragments() {
+  if (!ParallelConfig.DynamicParallel || ParallelConfig.WorkerMode)
+    return;
+  if (ParallelWorkersSucceeded == 0)
+    return;
+
+  std::string RepoRoot = findRepoRootFromCwd();
+  if (RepoRoot.empty())
+    return;
+  std::string ScriptPath = RepoRoot + "/scripts/merge_dynamic_runnable_fragments.py";
+  if (access(ScriptPath.c_str(), F_OK) != 0)
+    return;
+
+  std::string TempOutput = OutputPath + ".merged.ll";
+  std::ostringstream EntryPC;
+  EntryPC << "0x" << std::hex << Binary.entryPoint();
+  std::ostringstream Command;
+  Command << "python3 " << ScriptPath
+          << " --output " << TempOutput
+          << " --entry-pc " << EntryPC.str()
+          << " " << OutputPath;
+  for (const auto &Worker : ParallelWorkers) {
+    if (Worker.ExitCode != 0)
+      continue;
+    Command << " " << Worker.OutputPath;
+  }
+  int RC = ::system(Command.str().c_str());
+  if (RC != 0)
+    return;
+  rename(TempOutput.c_str(), OutputPath.c_str());
 }

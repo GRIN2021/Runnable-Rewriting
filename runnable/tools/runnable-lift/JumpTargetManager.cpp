@@ -61,6 +61,20 @@ cl::opt<bool> FAST("fast",
 cl::opt<bool> SUPERFAST("super-fast",
                        cl::desc("fast rewriting"),
                        cl::cat(MainCategory));
+cl::opt<unsigned long long> AddrRangeMin("addr-range-min",
+                                         cl::desc("Lower bound (inclusive) of the address range"
+                                                  " to translate. When non-zero, execution leaving"
+                                                  " [addr-range-min, addr-range-max) is stopped."),
+                                         cl::value_desc("address"),
+                                         cl::init(0),
+                                         cl::cat(MainCategory));
+cl::opt<unsigned long long> AddrRangeMax("addr-range-max",
+                                         cl::desc("Upper bound (exclusive) of the address range"
+                                                  " to translate. Must be set together with"
+                                                  " --addr-range-min."),
+                                         cl::value_desc("address"),
+                                         cl::init(0),
+                                         cl::cat(MainCategory));
 cl::opt<bool> INFO("info",
                        cl::desc("print statistics information"),
                        cl::cat(MainCategory));
@@ -2935,7 +2949,17 @@ bool JumpTargetManager::isIllegalStaticAddr(uint64_t pc){
   //    return true;
   //}
 
+  if(isOutOfAddrRange(pc))
+    return true;
+
   return false;
+}
+
+bool JumpTargetManager::isOutOfAddrRange(uint64_t pc){
+  if(AddrRangeMin == 0 && AddrRangeMax == 0)
+    return false;
+
+  return (pc < AddrRangeMin || pc >= AddrRangeMax);
 }
 
 void JumpTargetManager::harvestNextAddrofBr(){
@@ -3929,7 +3953,7 @@ void JumpTargetManager::harvestBTBasicBlock(llvm::BasicBlock *thisBlock,
     if(std::get<0>(item) == destAddr)
         return;
   }
-  if(!haveTranslatedPC(destAddr, 0)){
+  if(!haveTranslatedPC(destAddr, 0) && !isOutOfAddrRange(destAddr)){
       ptc.storeCPUState();
       /* Recording not execute branch destination relationship with current BasicBlock */
      // thisBlock = nullptr; 
@@ -4675,8 +4699,10 @@ void JumpTargetManager::harvestCallBasicBlock(llvm::BasicBlock *thisBlock,uint64
        * So,this Block will not contain a call instruction, that has been splited
        * but we still record this relationship, because when we backtracking,
        * we will check splited Block. */ 
-      BranchTargets.push_back(std::make_tuple(*ptc.CallNext,thisBlock,thisAddr));
-      errs()<<format_hex(*ptc.CallNext,0)<<" <- Call next target add\n";
+      if(!isOutOfAddrRange(*ptc.CallNext)){
+        BranchTargets.push_back(std::make_tuple(*ptc.CallNext,thisBlock,thisAddr));
+        errs()<<format_hex(*ptc.CallNext,0)<<" <- Call next target add\n";
+      }
     }
   errs()<<"Branch targets total numbers: "<<BranchTargets.size()<<"\n";  
 }
@@ -4746,13 +4772,15 @@ void JumpTargetManager::harvestbranchBasicBlock(uint64_t nextAddr,
 	    runnable_abort("Store memory state failed!\n");
           /* Recording not execute branch destination relationship 
 	   * with current BasicBlock and address */ 
-          BranchTargets.push_back(std::make_tuple(
+          if(!isOutOfAddrRange(destAddrSrcBB.first)){
+            BranchTargets.push_back(std::make_tuple(
 				destAddrSrcBB.first,
 				//destAddrSrcBB.second,
 				thisBlock,
 				thisAddr
 				)); 
-          errs()<<format_hex(destAddrSrcBB.first,0)<<" <- Jmp target add\n";
+            errs()<<format_hex(destAddrSrcBB.first,0)<<" <- Jmp target add\n";
+          }
         }  
       }
     }
