@@ -1,0 +1,9 @@
+kind,name,start_hex,end_hex,source
+code_section,.text,0x1000,0x101f,readelf
+data_section,.rodata,0x1020,0x102f,readelf
+instruction_start,,0x1000,0x1000,objdump
+instruction_start,,0x1005,0x1005,objdump
+instruction_start,,0x1008,0x1008,objdump
+instruction_start,,0x100c,0x100c,objdump
+instruction_start,,0x1010,0x1010,objdump
+instruction_start,,0x1014,0x1014,objdump

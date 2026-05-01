@@ -161,12 +161,22 @@ configure_file(scripts/runnable "${CMAKE_BINARY_DIR}/runnable" COPYONLY)
 configure_file(scripts/runnable-merge-dynamic "${CMAKE_BINARY_DIR}/runnable-merge-dynamic" COPYONLY)
 configure_file(scripts/merge_dynamic_runnable_fragments.py "${CMAKE_BINARY_DIR}/merge_dynamic_runnable_fragments.py" COPYONLY)
 configure_file(scripts/_merge_dynamic_fragments_lib.py "${CMAKE_BINARY_DIR}/_merge_dynamic_fragments_lib.py" COPYONLY)
+configure_file(scripts/validate_libcrypto_ground_truth.py "${CMAKE_BINARY_DIR}/validate_libcrypto_ground_truth.py" COPYONLY)
+configure_file(scripts/analyze_fn_fp_root_causes.py "${CMAKE_BINARY_DIR}/analyze_fn_fp_root_causes.py" COPYONLY)
+configure_file(scripts/_fn_fp_root_cause_lib.py "${CMAKE_BINARY_DIR}/_fn_fp_root_cause_lib.py" COPYONLY)
 install(PROGRAMS scripts/runnable scripts/runnable-merge-dynamic DESTINATION bin)
-install(PROGRAMS scripts/merge_dynamic_runnable_fragments.py DESTINATION share/runnable)
+install(PROGRAMS
+  scripts/merge_dynamic_runnable_fragments.py
+  scripts/validate_libcrypto_ground_truth.py
+  scripts/analyze_fn_fp_root_causes.py
+  DESTINATION share/runnable)
 install(FILES runtime/support.c DESTINATION share/runnable)
 install(FILES runtime/support.h DESTINATION share/runnable)
 install(FILES include/runnable/Runtime/commonconstants.h DESTINATION share/runnable)
-install(FILES scripts/_merge_dynamic_fragments_lib.py DESTINATION share/runnable)
+install(FILES
+  scripts/_merge_dynamic_fragments_lib.py
+  scripts/_fn_fp_root_cause_lib.py
+  DESTINATION share/runnable)
 
 # Remove -rdynamic
 set(CMAKE_SHARED_LIBRARY_LINK_C_FLAGS)
@@ -174,4 +184,3 @@ set(CMAKE_SHARED_LIBRARY_LINK_C_FLAGS)
 
 
 install(EXPORT runnable NAMESPACE runnable:: DESTINATION share/runnable/cmake)
-
