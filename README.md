@@ -73,6 +73,45 @@ $ runnable-lift hello hello.ll 2>hello.log
 $ runnable translate hello
 ```
 
+## Dynamic Parallel Lift (Prototype)
+
+The `codex/dynamic-parallel-lift` branch adds an experimental dynamic
+branch-driven parallel mode to `runnable-lift`.
+
+User-facing flags:
+
+- `-dynamic-parallel`: enable dynamic branch-driven worker spawning
+- `-parallel-workers=<N>`: cap the number of worker subprocesses
+- `-parallel-fragment-dir=<PATH>`: directory for worker `.ll` fragments and logs
+
+Example:
+
+```
+$ mkdir -p /tmp/runnable-fragments
+$ runnable-lift hello hello.ll \
+    -dynamic-parallel \
+    -parallel-workers=4 \
+    -parallel-fragment-dir=/tmp/runnable-fragments \
+    2>hello.parallel.log
+```
+
+Artifacts:
+
+- coordinator output: `hello.ll`
+- worker fragments: `/tmp/runnable-fragments/worker_<pc>.ll`
+- worker stdout/stderr logs:
+  - `/tmp/runnable-fragments/worker_<pc>.ll.stdout.log`
+  - `/tmp/runnable-fragments/worker_<pc>.ll.stderr.log`
+
+Notes:
+
+- `-parallel-worker-mode` and `-parallel-seed-pc` are internal flags used by
+  worker subprocesses and should not be passed manually.
+- This branch is still a prototype. The worker-fragment auto-merge helper
+  expected by `runnable-lift` is not upstreamed in this repository yet, so a
+  plain checkout of this branch will emit worker fragments but will not
+  automatically merge them back into the final top-level `.ll` output.
+
 
 ## Experimental Evaluation
 
