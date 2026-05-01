@@ -107,10 +107,10 @@ Notes:
 
 - `-parallel-worker-mode` and `-parallel-seed-pc` are internal flags used by
   worker subprocesses and should not be passed manually.
-- This branch is still a prototype. The worker-fragment auto-merge helper
-  expected by `runnable-lift` is not upstreamed in this repository yet, so a
-  plain checkout of this branch will emit worker fragments but will not
-  automatically merge them back into the final top-level `.ll` output.
+- Successful worker fragments are merged back into the final top-level `.ll`
+  output with the repository helper `runnable/scripts/merge_dynamic_runnable_fragments.py`.
+- This branch is still experimental. If fragment merge fails, the coordinator
+  output and worker `.ll` fragments are still left on disk for manual inspection.
 
 
 ## Experimental Evaluation

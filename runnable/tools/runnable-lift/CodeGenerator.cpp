@@ -82,7 +82,10 @@ static std::string findRepoRootFromCwd() {
     return "";
   std::string Current(Buffer);
   while (!Current.empty()) {
-    std::string Probe = Current + "/scripts/merge_dynamic_runnable_fragments.py";
+    std::string Probe = Current + "/runnable/scripts/merge_dynamic_runnable_fragments.py";
+    if (access(Probe.c_str(), F_OK) == 0)
+      return Current;
+    Probe = Current + "/scripts/merge_dynamic_runnable_fragments.py";
     if (access(Probe.c_str(), F_OK) == 0)
       return Current;
     size_t Slash = Current.find_last_of('/');
@@ -1652,11 +1655,22 @@ void CodeGenerator::mergeForkWorkerFragments() {
   if (ParallelWorkersSucceeded == 0)
     return;
 
+  std::vector<std::string> CandidateScripts;
   std::string RepoRoot = findRepoRootFromCwd();
-  if (RepoRoot.empty())
-    return;
-  std::string ScriptPath = RepoRoot + "/scripts/merge_dynamic_runnable_fragments.py";
-  if (access(ScriptPath.c_str(), F_OK) != 0)
+  if (!RepoRoot.empty()) {
+    CandidateScripts.push_back(RepoRoot + "/runnable/scripts/merge_dynamic_runnable_fragments.py");
+    CandidateScripts.push_back(RepoRoot + "/scripts/merge_dynamic_runnable_fragments.py");
+  }
+  CandidateScripts.push_back("merge_dynamic_runnable_fragments.py");
+
+  std::string ScriptPath;
+  for (const auto &Candidate : CandidateScripts) {
+    if (access(Candidate.c_str(), F_OK) == 0) {
+      ScriptPath = Candidate;
+      break;
+    }
+  }
+  if (ScriptPath.empty())
     return;
 
   std::string TempOutput = OutputPath + ".merged.ll";
