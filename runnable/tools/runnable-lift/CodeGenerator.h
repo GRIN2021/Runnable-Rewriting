@@ -109,7 +109,11 @@ private:
   /// \param Name name of the imported function
   llvm::Function *importHelperFunctionDeclaration(llvm::StringRef Name);
 
+  std::string workerOutputPath(uint64_t SeedPC) const;
+  void configureOutputArtifacts(const std::string &Output);
   void switchToWorkerOutput(uint64_t SeedPC);
+  int runFreshBranchWorker(uint64_t SeedPC);
+  void pollFinishedForkWorkers(bool Block);
   bool trySpawnBranchWorker(uint64_t SeedPC,
                             std::vector<std::tuple<uint64_t, llvm::BasicBlock *, uint64_t>> &BranchTargets);
   void waitForForkWorkers();
@@ -121,6 +125,8 @@ private:
   std::unique_ptr<llvm::Module> TheModule;
   std::unique_ptr<llvm::Module> HelpersModule;
   std::unique_ptr<llvm::Module> EarlyLinkedModule;
+  std::string HelpersPath;
+  std::string EarlyLinkedPath;
   std::string OutputPath;
   std::unique_ptr<DebugHelper> Debug;
   BinaryFile &Binary;

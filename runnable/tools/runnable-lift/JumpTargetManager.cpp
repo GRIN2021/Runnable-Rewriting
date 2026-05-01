@@ -9,6 +9,7 @@
 
 // Standard includes
 #include "runnable/Support/Assert.h"
+#include <cstdlib>
 #include <cstdint>
 #include <fstream>
 #include <queue>
@@ -51,6 +52,11 @@ using namespace llvm;
 namespace {
 
 Logger<> JTCountLog("jtcount");
+
+static bool inParallelWorkerMode() {
+  const char *Value = std::getenv("RUNNABLE_PARALLEL_WORKER_MODE");
+  return Value != nullptr && Value[0] == '1';
+}
 
 cl::opt<bool> Statistics("Statistics",
                        cl::desc("Count rewriting information"),
@@ -3949,6 +3955,8 @@ void JumpTargetManager::handleIndirectJmp(llvm::BasicBlock *thisBlock,
 void JumpTargetManager::harvestBTBasicBlock(llvm::BasicBlock *thisBlock,
 		                            uint64_t thisAddr,
 					    uint64_t destAddr){
+  if (inParallelWorkerMode())
+    return;
   for(auto item : BranchTargets){
     if(std::get<0>(item) == destAddr)
         return;
@@ -4675,6 +4683,8 @@ void JumpTargetManager::harvestCallBasicBlock(llvm::BasicBlock *thisBlock,uint64
   }
   if(!haveTranslatedPC(*ptc.CallNext, 0))
       StaticAddrs[*ptc.CallNext] = 2;
+  if (inParallelWorkerMode())
+    return;
   for(auto item : BranchTargets){
     if(std::get<0>(item) == *ptc.CallNext)
         return;
@@ -4750,6 +4760,8 @@ void JumpTargetManager::harvestbranchBasicBlock(uint64_t nextAddr,
 	  CondBranches[thisAddr] = 1;
     }
     for (auto destAddrSrcBB : branchJT){
+      if (inParallelWorkerMode())
+        break;
       if(!haveTranslatedPC(destAddrSrcBB.first, nextAddr) && 
 		      !isIllegalStaticAddr(destAddrSrcBB.first)){
 	bool isRecord = false;

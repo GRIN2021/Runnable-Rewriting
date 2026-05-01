@@ -7,6 +7,8 @@
 //
 
 // Standard includes
+#include <cstdlib>
+#include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <memory>
@@ -217,6 +219,8 @@ CodeGenerator::CodeGenerator(BinaryFile &Binary,
   TargetArchitecture(Target),
   Context(TheContext),
   TheModule((new Module("top", Context))),
+  HelpersPath(Helpers),
+  EarlyLinkedPath(EarlyLinked),
   OutputPath(Output),
   Debug(new DebugHelper(Output, TheModule.get(), DebugInfo, DebugPath)),
   Binary(Binary),
@@ -224,7 +228,7 @@ CodeGenerator::CodeGenerator(BinaryFile &Binary,
   OriginalInstrMDKind = Context.getMDKindID("oi");
   PTCInstrMDKind = Context.getMDKindID("pi");
 
-  HelpersModule = parseIR(Helpers, Context);
+  HelpersModule = parseIR(HelpersPath, Context);
   for (auto &F : HelpersModule->functions()) {
     // Remove 'optnone' Function attribute from QEMU helpers.
     // QEMU helpers are compiled with -O0 in libtinycode because the LLVM IR
@@ -236,7 +240,7 @@ CodeGenerator::CodeGenerator(BinaryFile &Binary,
     F.removeFnAttr(Attribute::OptimizeNone);
     F.setDSOLocal(false);
   }
-  EarlyLinkedModule = parseIR(EarlyLinked, Context);
+  EarlyLinkedModule = parseIR(EarlyLinkedPath, Context);
 
   if (CoveragePath.size() == 0)
     CoveragePath = Output + ".coverage.csv";
@@ -842,6 +846,10 @@ void CodeGenerator::translate(uint64_t VirtualAddress) {
   bool StaticAddrFlag = false;
   uint32_t EntryFlag = 0;
   uint64_t SuspectEntryAddr = 0;
+  bool PreferBranchFrontier = false;
+  uint64_t LastHaveBBVA = 0;
+  size_t RepeatedHaveBBCount = 0;
+  const size_t ParallelHaveBBRepeatLimit = 4096;
   std::vector<uint64_t> BlockPCs1;
   std::vector<uint64_t> &BlockPCs = BlockPCs1;
   std::map<uint32_t, uint64_t> BaseData1;
@@ -850,6 +858,7 @@ void CodeGenerator::translate(uint64_t VirtualAddress) {
     jjj++;
     BlockBRs = nullptr;
     BlockPCs.clear();
+    DynamicVirtualAddress = 0;
     if(!JumpTargets.haveBB){
       Builder.SetInsertPoint(Entry);
       BlockBRs = Builder.GetInsertBlock();
@@ -869,6 +878,32 @@ void CodeGenerator::translate(uint64_t VirtualAddress) {
     if(traverseFLAG && JumpTargets.haveBB){
       ptc_instruction_list_malloc(InstructionList.get()); 
       errs()<<"Nop execute!\n";
+      if (ParallelConfig.DynamicParallel) {
+        if (LastHaveBBVA == VirtualAddress)
+          RepeatedHaveBBCount++;
+        else {
+          LastHaveBBVA = VirtualAddress;
+          RepeatedHaveBBCount = 1;
+        }
+        if (RepeatedHaveBBCount > ParallelHaveBBRepeatLimit) {
+          if (ParallelConfig.WorkerMode) {
+            errs() << "parallel worker loop guard stop repeated haveBB pc=0x"
+                   << Twine::utohexstr(VirtualAddress)
+                   << " repeats=" << RepeatedHaveBBCount << "\n";
+            break;
+          } else {
+            errs() << "parallel loop guard skip repeated haveBB pc=0x"
+                   << Twine::utohexstr(VirtualAddress)
+                   << " repeats=" << RepeatedHaveBBCount << "\n";
+            JumpTargets.haveBB = 0;
+            DynamicVirtualAddress = 0;
+            Entry = nullptr;
+            PreferBranchFrontier = !JumpTargets.BranchTargets.empty();
+          }
+        }
+      }
+    } else {
+      RepeatedHaveBBCount = 0;
     } 
 
     if(!JumpTargets.haveBB){
@@ -1056,8 +1091,17 @@ void CodeGenerator::translate(uint64_t VirtualAddress) {
       EntryFlag = false;
     }
 
-	    // Obtain a new program counter to translate
-	    std::tie(VirtualAddress, Entry) = JumpTargets.peek();
+            // Prefer draining saved branch-frontier states before resuming the
+            // general unexplored/static worklist. This preserves the serial
+            // queue discipline more closely when dynamic workers are active.
+            if (PreferBranchFrontier
+                && !ParallelConfig.WorkerMode
+                && !JumpTargets.BranchTargets.empty()) {
+              VirtualAddress = 0;
+              Entry = nullptr;
+            } else {
+	      std::tie(VirtualAddress, Entry) = JumpTargets.peek();
+            }
 
     if(*ptc.isCall and BlockBRs){
       if(!JumpTargets.isDataSegmAddr(ptc.regs[R_ESP])){
@@ -1068,6 +1112,8 @@ void CodeGenerator::translate(uint64_t VirtualAddress) {
       errs()<<*((unsigned long *)ptc.regs[4])<<"<--store callnext\n";
       errs()<<*ptc.CallNext<<"\n";
       JumpTargets.harvestCallBasicBlock(BlockBRs,tmpVA);
+      if (ParallelConfig.WorkerMode)
+        JumpTargets.BranchTargets.clear();
       *ptc.isCall = 0;
     }
 
@@ -1087,9 +1133,16 @@ void CodeGenerator::translate(uint64_t VirtualAddress) {
           JumpTargets.haveBB = 0;
           BlockBRs = nullptr;
           std::tie(jtVirtualAddress, srcBB, srcAddr) = JumpTargets.BranchTargets.front();
-          JumpTargets.BranchTargets.erase(JumpTargets.BranchTargets.begin());
-          ptc.deletCPULINEState();
-          DynamicVirtualAddress = jtVirtualAddress;  
+          if (trySpawnBranchWorker(jtVirtualAddress, JumpTargets.BranchTargets)) {
+            DynamicVirtualAddress = 0;
+            BaseData.clear();
+            PreferBranchFrontier = false;
+          } else {
+            JumpTargets.BranchTargets.erase(JumpTargets.BranchTargets.begin());
+            ptc.deletCPULINEState();
+            DynamicVirtualAddress = jtVirtualAddress;
+            PreferBranchFrontier = true;
+          }
           errs()<<"syscall--------------------\n";        
         }
       }
@@ -1142,6 +1195,7 @@ void CodeGenerator::translate(uint64_t VirtualAddress) {
                 JumpTargets.haveBB = 0;
                 DynamicVirtualAddress = 0;
                 BaseData.clear();
+                PreferBranchFrontier = false;
               } else if (ParallelConfig.WorkerMode) {
                 DynamicVirtualAddress = jtVirtualAddress;
                 BaseData.clear();
@@ -1150,6 +1204,7 @@ void CodeGenerator::translate(uint64_t VirtualAddress) {
 	        ptc.deletCPULINEState();
 	        DynamicVirtualAddress = jtVirtualAddress;
 	        BaseData.clear();
+                PreferBranchFrontier = true;
               }
 	    }
 
@@ -1176,12 +1231,16 @@ void CodeGenerator::translate(uint64_t VirtualAddress) {
                                    BlockBRs,
 	                                   Translator.branchsize(), 
 	                                   branchLabeledcontent);
+                if (ParallelConfig.WorkerMode)
+                  JumpTargets.BranchTargets.clear();
 	      }
       std::cerr<<std::hex<<VirtualAddress<<" \n";
     }
 
-    if(JumpTargets.BranchTargets.empty() and !EntryFlag)
+    if(JumpTargets.BranchTargets.empty() and !EntryFlag) {
       DynamicVirtualAddress = 0;
+      PreferBranchFrontier = false;
+    }
 
     }////?end if(traverseFLAG)
     if(!JumpTargets.haveBB)
@@ -1444,18 +1503,103 @@ void CodeGenerator::serialize() {
     mergeForkWorkerFragments();
 }
 
+std::string CodeGenerator::workerOutputPath(uint64_t SeedPC) const {
+  std::ostringstream Path;
+  if (!ParallelConfig.FragmentDir.empty())
+    Path << ParallelConfig.FragmentDir << "/";
+  Path << "worker_" << hexValue(SeedPC) << ".ll";
+  return Path.str();
+}
+
+void CodeGenerator::configureOutputArtifacts(const std::string &Output) {
+  OutputPath = Output;
+  CoveragePath = OutputPath + ".coverage.csv";
+  BBSummaryPath = OutputPath + ".bbsummary.csv";
+  LinkingInfoPath = OutputPath + ".li.csv";
+}
+
 void CodeGenerator::switchToWorkerOutput(uint64_t SeedPC) {
   if (!ParallelConfig.FragmentDir.empty()) {
     std::string Command = "mkdir -p \"" + ParallelConfig.FragmentDir + "\"";
     ::system(Command.c_str());
   }
-  std::ostringstream Path;
-  Path << ParallelConfig.FragmentDir << "/worker_" << hexValue(SeedPC) << ".ll";
-  OutputPath = Path.str();
-  CoveragePath = OutputPath + ".coverage.csv";
-  BBSummaryPath = OutputPath + ".bbsummary.csv";
-  LinkingInfoPath = OutputPath + ".li.csv";
+  configureOutputArtifacts(workerOutputPath(SeedPC));
   Debug.reset(new DebugHelper(OutputPath, TheModule.get(), DebugInfo, DebugPath));
+}
+
+int CodeGenerator::runFreshBranchWorker(uint64_t SeedPC) {
+  std::string WorkerOutput = workerOutputPath(SeedPC);
+  std::string WorkerStdout = WorkerOutput + ".stdout.log";
+  std::string WorkerStderr = WorkerOutput + ".stderr.log";
+  ::freopen(WorkerStdout.c_str(), "w", stdout);
+  ::freopen(WorkerStderr.c_str(), "w", stderr);
+  ::setenv("RUNNABLE_PARALLEL_WORKER_MODE", "1", 1);
+  uint32_t QueueDepth = ptc.queueDepth();
+  errs() << "parallel worker seed=0x" << Twine::utohexstr(SeedPC)
+         << " inherited-qdepth=" << QueueDepth << "\n";
+  if (QueueDepth != 0) {
+    ptc.deletCPULINEState();
+  } else {
+    errs() << "parallel worker seed=0x" << Twine::utohexstr(SeedPC)
+           << " inherited queue empty, continuing without saved state\n";
+  }
+
+  if (!ParallelConfig.FragmentDir.empty()) {
+    std::string Command = "mkdir -p \"" + ParallelConfig.FragmentDir + "\"";
+    ::system(Command.c_str());
+  }
+
+  CoveragePath = WorkerOutput + ".coverage.csv";
+  BBSummaryPath = WorkerOutput + ".bbsummary.csv";
+  LinkingInfoPath = WorkerOutput + ".li.csv";
+
+  ParallelOptions WorkerOptions = ParallelConfig;
+  WorkerOptions.DynamicParallel = true;
+  WorkerOptions.WorkerMode = true;
+  WorkerOptions.WorkerCount = 0;
+  WorkerOptions.SeedPC = SeedPC;
+
+  BinaryFile WorkerBinary(ParallelConfig.InputPath, Binary.relocate(0));
+  Architecture WorkerTargetArchitecture;
+  llvm::LLVMContext WorkerContext;
+
+  {
+    CodeGenerator WorkerGenerator(WorkerBinary,
+                                  WorkerTargetArchitecture,
+                                  WorkerContext,
+                                  WorkerOutput,
+                                  HelpersPath,
+                                  EarlyLinkedPath,
+                                  WorkerOptions);
+    WorkerGenerator.translate(SeedPC);
+    WorkerGenerator.serialize();
+  }
+
+  return EXIT_SUCCESS;
+}
+
+void CodeGenerator::pollFinishedForkWorkers(bool Block) {
+  if (!ParallelConfig.DynamicParallel || ParallelConfig.WorkerMode)
+    return;
+
+  for (auto &Worker : ParallelWorkers) {
+    if (Worker.Finished)
+      continue;
+
+    int Status = 0;
+    pid_t Waited = waitpid(Worker.Pid, &Status, Block ? 0 : WNOHANG);
+    if (Waited == 0)
+      continue;
+    if (Waited != Worker.Pid)
+      continue;
+
+    Worker.Finished = true;
+    Worker.ExitCode = WIFEXITED(Status) ? WEXITSTATUS(Status) : -1;
+    if (Worker.ExitCode == 0)
+      ParallelWorkersSucceeded++;
+    else
+      ParallelWorkersFailed++;
+  }
 }
 
 bool CodeGenerator::trySpawnBranchWorker(
@@ -1468,6 +1612,8 @@ bool CodeGenerator::trySpawnBranchWorker(
   if (ParallelSpawnedSeeds.count(SeedPC) != 0)
     return false;
 
+  pollFinishedForkWorkers(false);
+
   size_t ActiveWorkers = 0;
   for (const auto &Worker : ParallelWorkers)
     if (!Worker.Finished)
@@ -1478,13 +1624,14 @@ bool CodeGenerator::trySpawnBranchWorker(
   pid_t PID = fork();
   runnable_assert(PID >= 0, "failed to fork branch worker");
   if (PID == 0) {
-    ParallelConfig.WorkerMode = true;
-    switchToWorkerOutput(SeedPC);
-    BranchTargets.erase(BranchTargets.begin());
-    ptc.deletCPULINEState();
-    return false;
+    int Result = runFreshBranchWorker(SeedPC);
+    errs() << "parallel worker seed=0x" << Twine::utohexstr(SeedPC)
+           << " exit=" << Result << "\n";
+    ::_exit(Result);
   }
 
+  errs() << "parallel parent spawn seed=0x" << Twine::utohexstr(SeedPC)
+         << " qdepth-before-drop=" << ptc.queueDepth() << "\n";
   BranchTargets.erase(BranchTargets.begin());
   ptc.dropCPUState();
   ParallelSpawnedSeeds.insert(SeedPC);
@@ -1496,23 +1643,7 @@ bool CodeGenerator::trySpawnBranchWorker(
 }
 
 void CodeGenerator::waitForForkWorkers() {
-  if (!ParallelConfig.DynamicParallel || ParallelConfig.WorkerMode)
-    return;
-
-  for (auto &Worker : ParallelWorkers) {
-    if (Worker.Finished)
-      continue;
-    int Status = 0;
-    pid_t Waited = waitpid(Worker.Pid, &Status, 0);
-    if (Waited != Worker.Pid)
-      continue;
-    Worker.Finished = true;
-    Worker.ExitCode = WIFEXITED(Status) ? WEXITSTATUS(Status) : -1;
-    if (Worker.ExitCode == 0)
-      ParallelWorkersSucceeded++;
-    else
-      ParallelWorkersFailed++;
-  }
+  pollFinishedForkWorkers(true);
 }
 
 void CodeGenerator::mergeForkWorkerFragments() {
