@@ -16,6 +16,19 @@ from dataclasses import asdict, dataclass
 from pathlib import Path, PurePosixPath
 from typing import Dict, Iterable, List, Optional, Tuple
 
+REPO_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_CONTAINER_NAME = "runnable-parallel-lift-legacy"
+DEFAULT_RUN_DIR = REPO_ROOT
+DEFAULT_OUT_DIR = DEFAULT_RUN_DIR / "out" / "runnable-parallel-lift-legacy"
+DEFAULT_FUNCS_CSV = DEFAULT_RUN_DIR / "dataset" / "libcrypto.funcs.csv"
+DEFAULT_REFERENCE_LL = DEFAULT_OUT_DIR / "reference.ll"
+DEFAULT_GROUND_TRUTH = DEFAULT_RUN_DIR / "dataset" / "libcrypto.so"
+DEFAULT_RUN_CMP_EVAL = DEFAULT_RUN_DIR / "test" / "cmp_instruction.py"
+DEFAULT_CONTAINER_WORKDIR = "/workdir"
+DEFAULT_CONTAINER_BINARY = "/workdir/libcrypto.so"
+DEFAULT_RUNNABLE_LIFT = "runnable-lift"
+DEFAULT_CSV_IMAGE_BASE = 0x400000
+
 LL_COMMENT_RE = re.compile(r"^\s*;\s*(0x[0-9a-fA-F]+):(.*)$")
 ROOT_LABEL_RE = re.compile(r"^([A-Za-z$._0-9-]+):")
 ROOT_BLOCK_LABEL_RE = re.compile(r"^bb\.0x([0-9a-fA-F]+)")
@@ -252,7 +265,11 @@ class Config:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run the libcrypto address-ranged parallel lift workflow."
+        description=(
+            "Run the legacy libcrypto address-ranged parallel lift workflow. "
+            "This is the offline static sharding path, not runnable-lift's "
+            "dynamic branch-driven mode."
+        )
     )
     parser.add_argument("--container-name", default=DEFAULT_CONTAINER_NAME)
     parser.add_argument("--run-dir", type=Path, default=DEFAULT_RUN_DIR)
@@ -1814,3 +1831,17 @@ def resolve_raw_ll_path(config: Config, item: Dict[str, object]) -> Optional[Pat
     if fallback.exists():
         return fallback
     return None
+
+
+def main() -> int:
+    parse_args()
+    print(
+        "This module documents the legacy offline static sharding CLI shape only. "
+        "It is not the default dynamic branch-driven runnable-lift entrypoint.",
+        file=sys.stderr,
+    )
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
