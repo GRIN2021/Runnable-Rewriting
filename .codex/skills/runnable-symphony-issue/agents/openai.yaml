@@ -1,0 +1,4 @@
+interface:
+  display_name: "Runnable Symphony Issue"
+  short_description: "为 Runnable 写可被 Symphony 执行的 Linear issue"
+  default_prompt: "Use $runnable-symphony-issue to draft or rewrite a Runnable Linear issue so it matches the current Symphony workflow in WORKFLOW.md, including clear scope, acceptance criteria, and validation."

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Runnable Symphony Follow-Up"
+  short_description: "为 Runnable 拆分 Symphony follow-up / backlog issue"
+  default_prompt: "Use $runnable-symphony-followup to turn an out-of-scope finding into a separate Runnable Linear backlog issue with clear scope, acceptance criteria, and validation."

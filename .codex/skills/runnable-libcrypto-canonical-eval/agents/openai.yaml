@@ -1,0 +1,4 @@
+interface:
+  display_name: "Runnable Libcrypto Canonical Eval"
+  short_description: "按 SYM-20 canonical 合同评估 libcrypto"
+  default_prompt: "Use $runnable-libcrypto-canonical-eval to run or audit the canonical SYM-20 libcrypto evaluation contract, distinguish it from historical sidecar-union metrics, and report fresh HIT/FN/FP/precision/recall counters."
