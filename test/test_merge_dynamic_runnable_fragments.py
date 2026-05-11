@@ -72,6 +72,7 @@ class MergeDynamicRunnableFragmentsTest(unittest.TestCase):
             "runnable/scripts/merge_dynamic_runnable_fragments.py",
             source,
         )
+        self.assertIn("/proc/self/exe", source)
 
     def test_merge_helper_merges_dispatch_cases_from_multiple_modules(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

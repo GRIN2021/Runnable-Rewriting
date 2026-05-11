@@ -100,6 +100,39 @@ static std::string findRepoRootFromCwd() {
   return "";
 }
 
+static std::string findRepoRootFromExecutable() {
+  char *FullPath = realpath("/proc/self/exe", nullptr);
+  if (FullPath == nullptr)
+    return "";
+
+  std::string Current(FullPath);
+  free(FullPath);
+
+  size_t Slash = Current.find_last_of('/');
+  if (Slash == std::string::npos)
+    return "";
+  Current = Current.substr(0, Slash);
+
+  while (!Current.empty()) {
+    std::string Probe = Current + "/runnable/scripts/merge_dynamic_runnable_fragments.py";
+    if (access(Probe.c_str(), F_OK) == 0)
+      return Current;
+    Probe = Current + "/scripts/merge_dynamic_runnable_fragments.py";
+    if (access(Probe.c_str(), F_OK) == 0)
+      return Current;
+    Slash = Current.find_last_of('/');
+    if (Slash == std::string::npos)
+      break;
+    if (Slash == 0) {
+      Current = "/";
+      break;
+    }
+    Current = Current.substr(0, Slash);
+  }
+
+  return "";
+}
+
 } // namespace
 
 // Register all the arguments
@@ -1657,6 +1690,8 @@ void CodeGenerator::mergeForkWorkerFragments() {
 
   std::vector<std::string> CandidateScripts;
   std::string RepoRoot = findRepoRootFromCwd();
+  if (RepoRoot.empty())
+    RepoRoot = findRepoRootFromExecutable();
   if (!RepoRoot.empty()) {
     CandidateScripts.push_back(RepoRoot + "/runnable/scripts/merge_dynamic_runnable_fragments.py");
     CandidateScripts.push_back(RepoRoot + "/scripts/merge_dynamic_runnable_fragments.py");
