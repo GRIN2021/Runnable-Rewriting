@@ -1,0 +1,2582 @@
+#!/usr/bin/env python3
+
+from __future__ import annotations
+
+import argparse
+import csv
+import hashlib
+import json
+import math
+import os
+import queue
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
+
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+REPO_ROOT = SCRIPT_DIR.parents[1]
+WORKSPACE_ROOT = REPO_ROOT.parent
+DEFAULT_HDD_ROOT = Path("/hdd/runnable-libcrypto-dynamic-parallel")
+DEFAULT_RUNNABLE_IMAGE = "rr_bionic_exportfs:2026-04-14"
+DEFAULT_GROUNDTRUTH_X86_IMAGE = "bin2415/x86_gt:0.1"
+DEFAULT_GROUNDTRUTH_PY_IMAGE = "bin2415/py_gt"
+DEFAULT_BASE_ADDRESS = 0x50000000
+DEFAULT_MIN_FUNCTION_SIZE = 64
+DEFAULT_MAX_SEEDS = 0
+DEFAULT_WORKER_MEMORY_GB = 3.0
+DEFAULT_BUILD_MEMORY_GB = 16.0
+DEFAULT_LIFT_TIMEOUT_SEC = 1800
+DEFAULT_SHARD_BYTE_BUDGET = 4096
+DEFAULT_SHARD_MAX_SEEDS = 64
+DEFAULT_MERGE_WORKERS = 2
+DEFAULT_MERGE_BATCH_SIZE = 64
+DEFAULT_MERGE_POLL_INTERVAL_SEC = 1.0
+DEFAULT_EXECUTION_MODEL = "single-container-shards"
+DEFAULT_COORDINATOR_EXTRA_FLAGS = ["-use-debug-symbols", "-no-link"]
+DEFAULT_SHARED_INSTALL_DIR = Path("/hdd/runnable-libcrypto-dynamic-parallel-optimized/shared-install-runnable")
+SHARD_RUNNER_SCRIPT = SCRIPT_DIR / "libcrypto_parallel_shard_runner.py"
+READ_ELF_FUNC_RE = re.compile(
+    r"^\s*\d+:\s*([0-9a-fA-F]+)\s+(\d+)\s+FUNC\s+\w+\s+\w+\s+(\w+)\s+(.*)$"
+)
+
+
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+from libcrypto_bench_paths import default_blocks_pb2  # noqa: E402
+from libcrypto_bench_paths import default_compare_tool  # noqa: E402
+from libcrypto_bench_paths import detect_text_start  # noqa: E402
+
+
+@dataclass(frozen=True)
+class SeedFunction:
+    start: int
+    size: int
+    end_exclusive: int
+    name: str
+    binding: str
+
+    @property
+    def tag(self) -> str:
+        return f"fn_{self.start:016x}"
+
+
+@dataclass(frozen=True)
+class LiftShard:
+    shard_id: str
+    seeds: Tuple[SeedFunction, ...]
+    total_size: int
+
+    @property
+    def entry_pc(self) -> int:
+        return self.seeds[0].start
+
+    @property
+    def start(self) -> int:
+        return self.seeds[0].start
+
+    @property
+    def end_exclusive(self) -> int:
+        return self.seeds[-1].end_exclusive
+
+    @property
+    def seed_count(self) -> int:
+        return len(self.seeds)
+
+
+@dataclass(frozen=True)
+class LiftLayout:
+    root: Path
+    groundtruth_root: Path
+    runs_root: Path
+    current_run: Path
+    logs_dir: Path
+    build_dir: Path
+    install_dir: Path
+    shared_install_dir: Path
+    raw_dir: Path
+    merged_dir: Path
+    fragments_dir: Path
+    eval_dir: Path
+    manifests_dir: Path
+    binary_dir: Path
+    shard_dir: Path
+    shard_logs_dir: Path
+    shard_manifests_dir: Path
+    shard_merged_dir: Path
+    merge_state_dir: Path
+    merge_logs_dir: Path
+    merge_batches_dir: Path
+
+
+@dataclass(frozen=True)
+class LiftConfig:
+    workspace_root: Path
+    repo_root: Path
+    groudtruth_repo_root: Path
+    layout: LiftLayout
+    docker_image: str
+    gt_x86_image: str
+    gt_py_image: str
+    runnable_base: int
+    min_function_size: int
+    max_seeds: int
+    seed_start: Optional[int]
+    requested_parallel_workers: int
+    max_concurrent_coordinators: int
+    worker_memory_gb: float
+    build_memory_gb: float
+    memory_headroom_gb: float
+    container_memory_limit_gb: Optional[float]
+    rebuild_lift: bool
+    ensure_groundtruth: bool
+    dry_run: bool
+    lift_timeout_sec: int
+    skip_cmp: bool
+    groundtruth_version: str
+    groundtruth_openssl_version: str
+    run_label: str
+    coordinator_flags: Tuple[str, ...]
+    execution_model: str
+    shard_byte_budget: int
+    shard_max_seeds: int
+    shard_concurrency: int
+    container_cpus: Optional[float]
+    preserve_success_seed_logs: bool
+    streaming_merge: bool
+    merge_workers: int
+    merge_batch_size: int
+    merge_poll_interval_sec: float
+
+
+@dataclass(frozen=True)
+class MergeBatchNode:
+    level: int
+    index: int
+    children: Tuple[str, ...]
+    output: Path
+    summary_out: Path
+
+    @property
+    def node_id(self) -> str:
+        child_digest = hashlib.sha1(
+            "\n".join(self.children).encode("utf-8")
+        ).hexdigest()[:12]
+        return f"batch_l{self.level:02d}_{self.index:04d}_{child_digest}"
+
+
+@dataclass
+class MergeProgress:
+    seed_total: int
+    shard_total: int
+    lift_completed: int = 0
+    seed_merged: int = 0
+    shard_merged: int = 0
+    batch_merged: int = 0
+    queued_seed_merges: int = 0
+    queued_shard_merges: int = 0
+    queued_batch_merges: int = 0
+
+    def to_dict(self) -> Dict[str, object]:
+        return {
+            "seed_total": self.seed_total,
+            "shard_total": self.shard_total,
+            "lift_completed": self.lift_completed,
+            "seed_merged": self.seed_merged,
+            "shard_merged": self.shard_merged,
+            "batch_merged": self.batch_merged,
+            "queued_seed_merges": self.queued_seed_merges,
+            "queued_shard_merges": self.queued_shard_merges,
+            "queued_batch_merges": self.queued_batch_merges,
+        }
+
+
+@dataclass
+class MergeState:
+    shard_expected_counts: Dict[str, int]
+    shard_start_addrs: Dict[str, int]
+    seed_results: Dict[str, Dict[str, object]]
+    seed_merge_enqueued: Set[str]
+    seed_merge_completed: Set[str]
+    shard_merge_enqueued: Set[str]
+    shard_merge_completed: Set[str]
+    batch_merge_enqueued: Set[str]
+    batch_merge_completed: Set[str]
+    completed_results_offset: int = 0
+
+
+@dataclass
+class RestoredStreamingMergeState:
+    state: MergeState
+    progress: MergeProgress
+    shard_seed_results: Dict[str, Dict[str, Dict[str, object]]]
+    shard_summaries: Dict[str, Dict[str, object]]
+    available_inputs: Dict[str, Path]
+    batch_plan: List[MergeBatchNode]
+    batch_result_payloads: List[Dict[str, object]]
+    first_success_entry_pc: Optional[int]
+    frontier_root_id: Optional[str]
+    frontier_root_output: Optional[Path]
+
+
+def parse_int(value: str) -> int:
+    return int(value, 0)
+
+
+def format_ts() -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def log(message: str) -> None:
+    print(f"[{format_ts()}] {message}", flush=True)
+
+
+def shell_join(parts: Sequence[str]) -> str:
+    return " ".join(shlex.quote(part) for part in parts)
+
+
+def run_cmd(
+    cmd: Sequence[str],
+    *,
+    check: bool = True,
+    cwd: Optional[Path] = None,
+    env: Optional[Dict[str, str]] = None,
+    capture_output: bool = True,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        list(cmd),
+        check=check,
+        cwd=str(cwd) if cwd else None,
+        env=env,
+        text=True,
+        capture_output=capture_output,
+    )
+
+
+def ensure_dir(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+
+
+def maybe_float(value: Optional[str]) -> Optional[float]:
+    if value is None:
+        return None
+    return float(value)
+
+
+def now_stamp() -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S %z")
+
+
+def detect_total_memory_gb() -> float:
+    meminfo = Path("/proc/meminfo").read_text(encoding="utf-8")
+    for line in meminfo.splitlines():
+        if line.startswith("MemAvailable:"):
+            kb = int(line.split()[1])
+            return kb / (1024.0 * 1024.0)
+    raise RuntimeError("cannot detect MemAvailable from /proc/meminfo")
+
+
+def clamp(value: int, minimum: int, maximum: int) -> int:
+    return max(minimum, min(maximum, value))
+
+
+def choose_container_memory_limit_gb(
+    available_gb: float,
+    requested_limit_gb: Optional[float],
+    headroom_gb: float,
+) -> Optional[float]:
+    if requested_limit_gb is not None:
+        return requested_limit_gb
+    limit = math.floor(max(available_gb - headroom_gb, 1.0))
+    return float(limit) if limit > 0 else None
+
+
+def estimate_parallel_workers(
+    *,
+    requested_parallel_workers: int,
+    max_concurrent_coordinators: int,
+    worker_memory_gb: float,
+    container_memory_limit_gb: Optional[float],
+) -> Tuple[int, int]:
+    if container_memory_limit_gb is None:
+        return requested_parallel_workers, max_concurrent_coordinators
+    max_total_workers = max(1, int(container_memory_limit_gb // max(worker_memory_gb, 0.25)))
+    coordinators = clamp(max_concurrent_coordinators, 1, max_total_workers)
+    workers_per_coord = max(1, max_total_workers // coordinators)
+    return min(requested_parallel_workers, workers_per_coord), coordinators
+
+
+def build_layout(base_root: Path, run_label: str) -> LiftLayout:
+    current_run = base_root / "runs" / run_label
+    return LiftLayout(
+        root=base_root,
+        groundtruth_root=base_root / "groundtruth",
+        runs_root=base_root / "runs",
+        current_run=current_run,
+        logs_dir=current_run / "logs",
+        build_dir=current_run / "build-runnable",
+        install_dir=current_run / "install-runnable",
+        shared_install_dir=base_root / "shared-install-runnable",
+        raw_dir=current_run / "raw",
+        merged_dir=current_run / "merged",
+        fragments_dir=current_run / "fragments",
+        eval_dir=current_run / "eval",
+        manifests_dir=current_run / "manifests",
+        binary_dir=current_run / "binary",
+        shard_dir=current_run / "shards",
+        shard_logs_dir=current_run / "shards" / "logs",
+        shard_manifests_dir=current_run / "manifests" / "shards",
+        shard_merged_dir=current_run / "shards" / "merged",
+        merge_state_dir=current_run / "merge-state",
+        merge_logs_dir=current_run / "merge-state" / "logs",
+        merge_batches_dir=current_run / "merge-state" / "batches",
+    )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "One-shot libcrypto dynamic parallel lift orchestrator. "
+            "It builds or reuses canonical ground truth, compiles a current "
+            "dynamic-parallel runnable-lift inside Docker when needed, "
+            "runs per-function coordinators against libcrypto.so.3, "
+            "merges the resulting full modules, and optionally runs the "
+            "canonical gtBlock.pb compare."
+        )
+    )
+    parser.add_argument("--hdd-root", type=Path, default=DEFAULT_HDD_ROOT)
+    parser.add_argument("--workspace-root", type=Path, default=WORKSPACE_ROOT)
+    parser.add_argument("--repo-root", type=Path, default=REPO_ROOT)
+    parser.add_argument("--groudtruth-repo-root", type=Path, default=WORKSPACE_ROOT / "GroudTruth")
+    parser.add_argument("--docker-image", default=DEFAULT_RUNNABLE_IMAGE)
+    parser.add_argument("--gt-x86-image", default=DEFAULT_GROUNDTRUTH_X86_IMAGE)
+    parser.add_argument("--gt-py-image", default=DEFAULT_GROUNDTRUTH_PY_IMAGE)
+    parser.add_argument("--run-label", default=time.strftime("libcrypto-dyn-%Y%m%d-%H%M%S"))
+    parser.add_argument("--runnable-base", type=parse_int, default=DEFAULT_BASE_ADDRESS)
+    parser.add_argument("--min-function-size", type=int, default=DEFAULT_MIN_FUNCTION_SIZE)
+    parser.add_argument("--max-seeds", type=int, default=DEFAULT_MAX_SEEDS)
+    parser.add_argument(
+        "--seed-start",
+        type=parse_int,
+        default=None,
+        help="Only lift the function seed whose symbol start matches this address.",
+    )
+    parser.add_argument("--parallel-workers", type=int, default=8)
+    parser.add_argument("--max-concurrent-coordinators", type=int, default=2)
+    parser.add_argument(
+        "--shard-concurrency",
+        type=int,
+        default=None,
+        help="Maximum number of shard jobs to run concurrently inside the container.",
+    )
+    parser.add_argument(
+        "--shard-byte-budget",
+        type=int,
+        default=DEFAULT_SHARD_BYTE_BUDGET,
+        help="Approximate total function bytes to include in a shard.",
+    )
+    parser.add_argument(
+        "--shard-max-seeds",
+        type=int,
+        default=DEFAULT_SHARD_MAX_SEEDS,
+        help="Maximum number of function seeds to include in a shard.",
+    )
+    parser.add_argument("--worker-memory-gb", type=float, default=DEFAULT_WORKER_MEMORY_GB)
+    parser.add_argument("--build-memory-gb", type=float, default=DEFAULT_BUILD_MEMORY_GB)
+    parser.add_argument("--memory-headroom-gb", type=float, default=8.0)
+    parser.add_argument("--container-memory-limit-gb", type=float, default=None)
+    parser.add_argument(
+        "--container-cpus",
+        type=float,
+        default=None,
+        help="Optional Docker CPU limit for the long-lived execution container.",
+    )
+    parser.add_argument("--lift-timeout-sec", type=int, default=DEFAULT_LIFT_TIMEOUT_SEC)
+    parser.add_argument(
+        "--merge-workers",
+        type=int,
+        default=DEFAULT_MERGE_WORKERS,
+        help="Maximum number of host-side merge jobs to run concurrently.",
+    )
+    parser.add_argument(
+        "--merge-batch-size",
+        type=int,
+        default=DEFAULT_MERGE_BATCH_SIZE,
+        help="Maximum fan-in for one incremental merge batch node.",
+    )
+    parser.add_argument(
+        "--merge-poll-interval-sec",
+        type=float,
+        default=DEFAULT_MERGE_POLL_INTERVAL_SEC,
+        help="Polling interval for host-side streaming merge scheduling.",
+    )
+    parser.add_argument(
+        "--streaming-merge",
+        dest="streaming_merge",
+        action="store_true",
+        help="Start host-side merge work as soon as seed lifts complete.",
+    )
+    parser.add_argument(
+        "--no-streaming-merge",
+        dest="streaming_merge",
+        action="store_false",
+        help="Disable overlap and fall back to the barrier-style host merge path.",
+    )
+    parser.set_defaults(streaming_merge=True)
+    parser.add_argument(
+        "--execution-model",
+        choices=["single-container-shards", "legacy-seed-docker"],
+        default=DEFAULT_EXECUTION_MODEL,
+        help="Outer orchestration model for libcrypto dynamic parallel lift.",
+    )
+    parser.add_argument("--rebuild-lift", action="store_true")
+    parser.add_argument("--no-rebuild-lift", dest="rebuild_lift", action="store_false")
+    parser.set_defaults(rebuild_lift=True)
+    parser.add_argument("--ensure-groundtruth", action="store_true")
+    parser.add_argument("--no-ensure-groundtruth", dest="ensure_groundtruth", action="store_false")
+    parser.set_defaults(ensure_groundtruth=True)
+    parser.add_argument("--skip-cmp", action="store_true")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--preserve-success-seed-logs",
+        action="store_true",
+        help="Keep per-seed stdout/stderr logs even when the seed succeeds.",
+    )
+    parser.add_argument("--groundtruth-version", default="canonical")
+    parser.add_argument("--groundtruth-openssl-version", default="3.4.4")
+    parser.add_argument(
+        "--coordinator-flag",
+        action="append",
+        default=[],
+        help="Extra flag forwarded to each runnable-lift coordinator invocation.",
+    )
+    return parser
+
+
+def load_config(args: argparse.Namespace) -> LiftConfig:
+    layout = build_layout(args.hdd_root.resolve(), args.run_label)
+    available_gb = detect_total_memory_gb()
+    container_limit_gb = choose_container_memory_limit_gb(
+        available_gb=available_gb,
+        requested_limit_gb=args.container_memory_limit_gb,
+        headroom_gb=args.memory_headroom_gb,
+    )
+    requested_shard_concurrency = (
+        args.shard_concurrency
+        if args.shard_concurrency is not None
+        else args.max_concurrent_coordinators
+    )
+    tuned_workers, tuned_shards = estimate_parallel_workers(
+        requested_parallel_workers=args.parallel_workers,
+        max_concurrent_coordinators=requested_shard_concurrency,
+        worker_memory_gb=args.worker_memory_gb,
+        container_memory_limit_gb=container_limit_gb,
+    )
+    extra_flags = list(DEFAULT_COORDINATOR_EXTRA_FLAGS)
+    extra_flags.extend(args.coordinator_flag)
+    return LiftConfig(
+        workspace_root=args.workspace_root.resolve(),
+        repo_root=args.repo_root.resolve(),
+        groudtruth_repo_root=args.groudtruth_repo_root.resolve(),
+        layout=layout,
+        docker_image=args.docker_image,
+        gt_x86_image=args.gt_x86_image,
+        gt_py_image=args.gt_py_image,
+        runnable_base=args.runnable_base,
+        min_function_size=args.min_function_size,
+        max_seeds=args.max_seeds,
+        seed_start=args.seed_start,
+        requested_parallel_workers=tuned_workers,
+        max_concurrent_coordinators=tuned_shards,
+        worker_memory_gb=args.worker_memory_gb,
+        build_memory_gb=args.build_memory_gb,
+        memory_headroom_gb=args.memory_headroom_gb,
+        container_memory_limit_gb=container_limit_gb,
+        rebuild_lift=args.rebuild_lift,
+        ensure_groundtruth=args.ensure_groundtruth,
+        dry_run=args.dry_run,
+        lift_timeout_sec=args.lift_timeout_sec,
+        skip_cmp=args.skip_cmp,
+        groundtruth_version=args.groundtruth_version,
+        groundtruth_openssl_version=args.groundtruth_openssl_version,
+        run_label=args.run_label,
+        coordinator_flags=tuple(extra_flags),
+        execution_model=args.execution_model,
+        shard_byte_budget=max(args.shard_byte_budget, 1),
+        shard_max_seeds=max(args.shard_max_seeds, 1),
+        shard_concurrency=max(tuned_shards, 1),
+        container_cpus=maybe_float(args.container_cpus),
+        preserve_success_seed_logs=args.preserve_success_seed_logs,
+        streaming_merge=args.streaming_merge,
+        merge_workers=max(args.merge_workers, 1),
+        merge_batch_size=max(args.merge_batch_size, 2),
+        merge_poll_interval_sec=max(args.merge_poll_interval_sec, 0.1),
+    )
+
+
+def materialize_layout(layout: LiftLayout) -> None:
+    for path in (
+        layout.root,
+        layout.groundtruth_root,
+        layout.runs_root,
+        layout.current_run,
+        layout.logs_dir,
+        layout.build_dir,
+        layout.install_dir,
+        layout.shared_install_dir,
+        layout.raw_dir,
+        layout.merged_dir,
+        layout.fragments_dir,
+        layout.eval_dir,
+        layout.manifests_dir,
+        layout.binary_dir,
+        layout.shard_dir,
+        layout.shard_logs_dir,
+        layout.shard_manifests_dir,
+        layout.shard_merged_dir,
+        layout.merge_state_dir,
+        layout.merge_logs_dir,
+        layout.merge_batches_dir,
+    ):
+        ensure_dir(path)
+
+
+def groundtruth_artifact_paths(config: LiftConfig) -> Dict[str, Path]:
+    root = config.layout.groundtruth_root / "libcrypto-artifacts"
+    return {
+        "root": root,
+        "binary": root / "libcrypto.so.3",
+        "protobuf": root / "libcrypto.gtBlock.pb",
+        "blocks_pb2": default_blocks_pb2(config.repo_root),
+        "cmp_tool": default_compare_tool(config.repo_root),
+    }
+
+
+def repo_local_groundtruth_paths(config: LiftConfig) -> Dict[str, Path]:
+    root = config.groudtruth_repo_root / "groundtruth-gap-analysis-skill" / "results" / "libcrypto-artifacts"
+    return {
+        "root": root,
+        "binary": root / "libcrypto.so.3",
+        "protobuf": root / "libcrypto.gtBlock.pb",
+    }
+
+
+def host_mounts(config: LiftConfig) -> List[str]:
+    return [
+        f"{config.workspace_root}:/workspace",
+        f"{config.layout.root}:/hdd-work",
+    ]
+
+
+def sanitize_container_name(run_label: str) -> str:
+    collapsed = re.sub(r"[^a-zA-Z0-9_.-]+", "-", run_label)
+    return f"rr-libcrypto-{collapsed[:40]}"
+
+
+def map_host_path_to_container(config: LiftConfig, path: Path) -> str:
+    resolved = path.resolve()
+    workspace_root = config.workspace_root.resolve()
+    hdd_root = config.layout.root.resolve()
+    if str(resolved).startswith(str(workspace_root)):
+        return "/workspace/" + str(resolved.relative_to(workspace_root))
+    if str(resolved).startswith(str(hdd_root)):
+        return "/hdd-work/" + str(resolved.relative_to(hdd_root))
+    raise RuntimeError(f"path {resolved} is outside mounted roots")
+
+
+def map_container_path_to_host(config: LiftConfig, path: str) -> Path:
+    raw = Path(path)
+    raw_str = str(raw)
+    if raw_str == "/workspace" or raw_str.startswith("/workspace/"):
+        relative = raw.relative_to("/workspace")
+        return (config.workspace_root / relative).resolve()
+    if raw_str == "/hdd-work" or raw_str.startswith("/hdd-work/"):
+        relative = raw.relative_to("/hdd-work")
+        return (config.layout.root / relative).resolve()
+    return raw
+
+
+def docker_mem_args(limit_gb: Optional[float]) -> List[str]:
+    if limit_gb is None:
+        return []
+    gb = max(limit_gb, 1.0)
+    return ["--memory", f"{gb:.0f}g", "--memory-swap", f"{gb:.0f}g"]
+
+
+def docker_run_shell(
+    image: str,
+    shell_script: str,
+    *,
+    mounts: Sequence[str],
+    workdir: str,
+    env: Optional[Dict[str, str]] = None,
+    memory_limit_gb: Optional[float] = None,
+    capture_output: bool = True,
+    check: bool = True,
+) -> subprocess.CompletedProcess[str]:
+    cmd = ["docker", "run", "--rm"]
+    cmd.extend(docker_mem_args(memory_limit_gb))
+    for mount in mounts:
+        cmd.extend(["-v", mount])
+    if env:
+        for key, value in env.items():
+            cmd.extend(["-e", f"{key}={value}"])
+    cmd.extend(["-w", workdir, image, "bash", "-lc", shell_script])
+    return run_cmd(cmd, check=check, capture_output=capture_output)
+
+
+def docker_exec_shell(
+    container_name: str,
+    shell_script: str,
+    *,
+    env: Optional[Dict[str, str]] = None,
+    capture_output: bool = True,
+    check: bool = True,
+) -> subprocess.CompletedProcess[str]:
+    cmd = ["docker", "exec"]
+    if env:
+        for key, value in env.items():
+            cmd.extend(["-e", f"{key}={value}"])
+    cmd.extend([container_name, "bash", "-lc", shell_script])
+    return run_cmd(cmd, check=check, capture_output=capture_output)
+
+
+def docker_rm_force(container_name: str) -> None:
+    run_cmd(
+        ["docker", "rm", "-f", container_name],
+        check=False,
+        capture_output=True,
+    )
+
+
+def start_long_lived_container(
+    config: LiftConfig,
+    runtime: Dict[str, str],
+) -> str:
+    container_name = sanitize_container_name(config.run_label)
+    if config.dry_run:
+        return container_name
+    docker_rm_force(container_name)
+    cmd = ["docker", "run", "-d", "--rm", "--name", container_name]
+    cmd.extend(docker_mem_args(config.container_memory_limit_gb))
+    if config.container_cpus is not None:
+        cmd.extend(["--cpus", str(config.container_cpus)])
+    for mount in host_mounts(config):
+        cmd.extend(["-v", mount])
+    cmd.extend(
+        [
+            "-w",
+            "/workspace",
+            "-e",
+            f"PATH={runtime['PATH']}",
+            "-e",
+            f"LD_LIBRARY_PATH={runtime['LD_LIBRARY_PATH']}",
+            "-e",
+            f"PYTHONPATH={runtime['PYTHONPATH']}",
+            config.docker_image,
+            "bash",
+            "-lc",
+            "trap 'exit 0' TERM INT; while true; do sleep 60; done",
+        ]
+    )
+    result = run_cmd(cmd, capture_output=True)
+    container_id = result.stdout.strip()
+    if not container_id:
+        raise RuntimeError("docker run did not return a container id")
+    return container_name
+
+
+def readelf_function_seeds(binary: Path, min_function_size: int) -> List[SeedFunction]:
+    result = run_cmd(["readelf", "-Ws", str(binary)], capture_output=True)
+    current_table = ""
+    seeds: Dict[int, SeedFunction] = {}
+    for line in result.stdout.splitlines():
+        if line.startswith("Symbol table "):
+            current_table = line
+            continue
+        match = READ_ELF_FUNC_RE.match(line)
+        if match is None:
+            continue
+        value = int(match.group(1), 16)
+        size = int(match.group(2))
+        ndx = match.group(3)
+        raw_name = match.group(4).strip()
+        if ndx == "UND" or value == 0 or size < min_function_size or not raw_name:
+            continue
+        name = raw_name.split("@", 1)[0]
+        candidate = SeedFunction(
+            start=value,
+            size=size,
+            end_exclusive=value + size,
+            name=name,
+            binding="dynsym" if ".dynsym" in current_table else "symtab",
+        )
+        previous = seeds.get(value)
+        if previous is None or candidate.size > previous.size:
+            seeds[value] = candidate
+    return sorted(seeds.values(), key=lambda item: (item.start, item.name))
+
+
+def write_seed_manifest(path: Path, seeds: Sequence[SeedFunction]) -> None:
+    rows = [
+        {
+            "start_hex": hex(seed.start),
+            "size": seed.size,
+            "end_exclusive_hex": hex(seed.end_exclusive),
+            "name": seed.name,
+            "binding": seed.binding,
+        }
+        for seed in seeds
+    ]
+    path.write_text(json.dumps(rows, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def write_seed_csv(path: Path, seeds: Sequence[SeedFunction]) -> None:
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=["addr_hex", "name", "end_hex"])
+        writer.writeheader()
+        for seed in seeds:
+            writer.writerow(
+                {
+                    "addr_hex": hex(seed.start),
+                    "name": seed.name,
+                    "end_hex": hex(seed.end_exclusive - 1),
+                }
+            )
+
+
+def merge_state_paths(layout: LiftLayout) -> Dict[str, Path]:
+    return {
+        "seed_lift_events": layout.merge_state_dir / "seed-lift-events.jsonl",
+        "seed_merge_events": layout.merge_state_dir / "seed-merge-events.jsonl",
+        "shard_merge_events": layout.merge_state_dir / "shard-merge-events.jsonl",
+        "batch_merge_events": layout.merge_state_dir / "batch-merge-events.jsonl",
+        "progress": layout.merge_state_dir / "merge-progress.json",
+        "state": layout.merge_state_dir / "merge-state.json",
+        "frontier": layout.merge_state_dir / "merge-frontier.json",
+    }
+
+
+def append_jsonl(path: Path, payload: Dict[str, object]) -> None:
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, sort_keys=True) + "\n")
+
+
+def load_jsonl(path: Path) -> List[Dict[str, object]]:
+    if not path.exists():
+        return []
+    items: List[Dict[str, object]] = []
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            items.append(json.loads(line))
+    return items
+
+
+def write_merge_progress(layout: LiftLayout, progress: MergeProgress) -> None:
+    write_summary(merge_state_paths(layout)["progress"], progress.to_dict())
+
+
+def write_merge_state_summary(layout: LiftLayout, state: MergeState) -> None:
+    write_summary(
+        merge_state_paths(layout)["state"],
+        {
+            "completed_results_offset": state.completed_results_offset,
+            "seed_result_count": len(state.seed_results),
+            "seed_merge_enqueued": len(state.seed_merge_enqueued),
+            "seed_merge_completed": len(state.seed_merge_completed),
+            "shard_merge_enqueued": len(state.shard_merge_enqueued),
+            "shard_merge_completed": len(state.shard_merge_completed),
+            "batch_merge_enqueued": len(state.batch_merge_enqueued),
+            "batch_merge_completed": len(state.batch_merge_completed),
+            "shard_expected_counts": state.shard_expected_counts,
+        },
+    )
+
+
+def initialize_merge_state(shards: Sequence[LiftShard]) -> MergeState:
+    return MergeState(
+        shard_expected_counts={shard.shard_id: shard.seed_count for shard in shards},
+        shard_start_addrs={shard.shard_id: shard.start for shard in shards},
+        seed_results={},
+        seed_merge_enqueued=set(),
+        seed_merge_completed=set(),
+        shard_merge_enqueued=set(),
+        shard_merge_completed=set(),
+        batch_merge_enqueued=set(),
+        batch_merge_completed=set(),
+        completed_results_offset=0,
+    )
+
+
+def shard_seed_rows(shard: LiftShard) -> List[Dict[str, object]]:
+    return [
+        {
+            "start_hex": hex(seed.start),
+            "size": seed.size,
+            "end_exclusive_hex": hex(seed.end_exclusive),
+            "name": seed.name,
+            "binding": seed.binding,
+        }
+        for seed in shard.seeds
+    ]
+
+
+def plan_shards(config: LiftConfig, seeds: Sequence[SeedFunction]) -> List[LiftShard]:
+    shards: List[LiftShard] = []
+    current: List[SeedFunction] = []
+    current_size = 0
+
+    def flush() -> None:
+        nonlocal current, current_size
+        if not current:
+            return
+        shard_id = f"shard_{len(shards):05d}_{current[0].start:016x}"
+        shards.append(
+            LiftShard(
+                shard_id=shard_id,
+                seeds=tuple(current),
+                total_size=current_size,
+            )
+        )
+        current = []
+        current_size = 0
+
+    for seed in sorted(seeds, key=lambda item: (item.start, item.name)):
+        exceeds_budget = current and (
+            current_size + seed.size > config.shard_byte_budget
+            or len(current) >= config.shard_max_seeds
+        )
+        if seed.size >= config.shard_byte_budget:
+            flush()
+            shards.append(
+                LiftShard(
+                    shard_id=f"shard_{len(shards):05d}_{seed.start:016x}",
+                    seeds=(seed,),
+                    total_size=seed.size,
+                )
+            )
+            continue
+        if exceeds_budget:
+            flush()
+        current.append(seed)
+        current_size += seed.size
+
+    flush()
+    return shards
+
+
+def write_shard_manifests(layout: LiftLayout, shards: Sequence[LiftShard]) -> None:
+    overview = []
+    for shard in shards:
+        manifest_path = layout.shard_manifests_dir / f"{shard.shard_id}.json"
+        payload = {
+            "shard_id": shard.shard_id,
+            "seed_count": shard.seed_count,
+            "total_size": shard.total_size,
+            "start_hex": hex(shard.start),
+            "end_exclusive_hex": hex(shard.end_exclusive),
+            "entry_hex": hex(shard.entry_pc),
+            "seeds": shard_seed_rows(shard),
+        }
+        write_summary(manifest_path, payload)
+        overview.append(payload)
+    write_summary(layout.shard_manifests_dir / "shards.json", {"shards": overview})
+
+
+def status_flag_path(layout: LiftLayout) -> Path:
+    return layout.current_run / "status.flag"
+
+
+def mark_run_state(layout: LiftLayout, state: str, detail: Optional[str] = None) -> None:
+    stamp = now_stamp()
+    text = state if detail is None else f"{state} {detail}"
+    status_flag_path(layout).write_text(f"{text} {stamp}\n", encoding="utf-8")
+    if state == "running":
+        (layout.current_run / "started_at.txt").write_text(f"{stamp}\n", encoding="utf-8")
+    if state in {"ok", "failed"}:
+        (layout.current_run / "finished_at.txt").write_text(f"{stamp}\n", encoding="utf-8")
+
+
+def write_exit_code(layout: LiftLayout, rc: int) -> None:
+    (layout.current_run / "exit_code.txt").write_text(f"{rc}\n", encoding="utf-8")
+
+
+def should_build_groundtruth(paths: Dict[str, Path]) -> bool:
+    return not paths["binary"].exists() or not paths["protobuf"].exists()
+
+
+def ensure_groundtruth(config: LiftConfig, paths: Dict[str, Path]) -> None:
+    if not config.ensure_groundtruth:
+        return
+    if not should_build_groundtruth(paths):
+        return
+    ensure_dir(paths["root"])
+    source_paths = repo_local_groundtruth_paths(config)
+    if source_paths["binary"].exists() and source_paths["protobuf"].exists():
+        log("copying canonical Docker-built ground truth bundle into /hdd")
+        run_cmd(["cp", str(source_paths["binary"]), str(paths["binary"])], capture_output=False)
+        run_cmd(["cp", str(source_paths["protobuf"]), str(paths["protobuf"])], capture_output=False)
+        return
+    log("ground truth artifacts missing under /hdd; building canonical libcrypto bundle via Docker")
+    if config.dry_run:
+        return
+    work_dir = config.layout.groundtruth_root / "build-work"
+    ensure_dir(work_dir)
+    ensure_docker_image_available(config.gt_x86_image)
+    ensure_docker_image_available(config.gt_py_image)
+    run_cmd(
+        [
+            "bash",
+            "-lc",
+            (
+                f"cd {shlex.quote(str(config.groudtruth_repo_root))} && "
+                f"WORK_DIR={shlex.quote(str(work_dir))} "
+                f"OPENSSL_VER={shlex.quote(config.groundtruth_openssl_version)} "
+                "DOCKER_USE_SUDO=0 "
+                "bash groundtruth-gap-analysis-skill/docker/build_libcrypto_groundtruth.sh"
+            ),
+        ],
+        capture_output=False,
+    )
+    built_binary = work_dir / f"openssl-{config.groundtruth_openssl_version}" / "libcrypto.so.3"
+    built_pb = work_dir / "libcrypto.gtBlock.pb"
+    if not built_binary.exists() or not built_pb.exists():
+        raise RuntimeError("ground truth build finished without expected artifacts")
+    run_cmd(["cp", str(built_binary), str(paths["binary"])], capture_output=False)
+    run_cmd(["cp", str(built_pb), str(paths["protobuf"])], capture_output=False)
+
+
+def help_contains_dynamic_parallel(help_text: str) -> bool:
+    return (
+        "dynamic-parallel" in help_text
+        and "parallel-workers" in help_text
+        and "parallel-fragment-dir" in help_text
+    )
+
+
+def ensure_docker_image_available(image: str) -> None:
+    inspect = run_cmd(
+        ["docker", "image", "inspect", image],
+        check=False,
+        capture_output=True,
+    )
+    if inspect.returncode == 0:
+        return
+    run_cmd(["docker", "pull", image], capture_output=False)
+
+
+def probe_installed_runnable_lift(config: LiftConfig) -> Tuple[Optional[Path], Optional[Path], str]:
+    for install_dir, label in (
+        (config.layout.shared_install_dir, "shared dynamic-parallel binary"),
+        (config.layout.install_dir, "run-local dynamic-parallel binary"),
+    ):
+        installed = install_dir / "bin" / "runnable-lift"
+        if not installed.exists():
+            continue
+        env = os.environ.copy()
+        env["LD_LIBRARY_PATH"] = str(install_dir / "lib")
+        result = run_cmd([str(installed), "--help"], check=False, env=env)
+        help_text = (result.stdout or "") + (result.stderr or "")
+        if result.returncode != 0:
+            continue
+        if help_contains_dynamic_parallel(help_text):
+            return installed, install_dir, label
+    return None, None, "missing install prefix binary"
+
+
+def probe_build_tree_runnable_lift(config: LiftConfig) -> Tuple[Optional[Path], Optional[Path], str]:
+    candidates = [
+        config.layout.build_dir / "runnable-lift",
+        config.layout.build_dir / "tools" / "runnable-lift" / "runnable-lift",
+    ]
+    binary = next((candidate for candidate in candidates if candidate.exists()), None)
+    if binary is None:
+        return None, None, "missing build tree runnable-lift"
+    return binary, config.layout.build_dir, "build tree runnable-lift present"
+
+
+def compile_current_runnable(config: LiftConfig) -> Tuple[Path, Path]:
+    install_dir = config.layout.install_dir
+    build_dir = config.layout.build_dir
+    shared_install_dir = config.layout.shared_install_dir
+    ensure_dir(build_dir)
+    ensure_dir(shared_install_dir)
+    build_log = config.layout.logs_dir / "build-runnable.log"
+    install_root = "/hdd-work/runs/{}/install-runnable".format(config.run_label)
+    build_root = "/hdd-work/runs/{}/build-runnable".format(config.run_label)
+    shared_install_root = map_host_path_to_container(config, shared_install_dir)
+    container_build_log = map_host_path_to_container(config, build_log)
+    shell_script = f"""
+set -euo pipefail
+cd /workspace/Runnable-Rewriting
+mkdir -p {shlex.quote(build_root)} {shlex.quote(install_root)} {shlex.quote(str(shared_install_root))}
+{{
+  cd {shlex.quote(build_root)}
+  cmake /workspace/Runnable-Rewriting/runnable \\
+    -DCMAKE_BUILD_TYPE=Debug \\
+    -DCMAKE_INSTALL_PREFIX={shlex.quote(install_root)} \\
+    -DQEMU_INSTALL_PATH=/root/Runnable-Rewriting/root \\
+    -DLLVM_DIR=/root/Runnable-Rewriting/root/lib/cmake/llvm \\
+    -DBOOST_ROOT=/root/Runnable-Rewriting/root \\
+    -DBoost_NO_SYSTEM_PATHS=On \\
+    -DCMAKE_CXX_LINK_FLAGS='-static-libgcc -static-libstdc++' \\
+    -DCMAKE_C_LINK_FLAGS='-static-libgcc'
+  cmake --build .
+  cmake --install .
+  rm -rf {shlex.quote(str(shared_install_root))}
+  cp -a {shlex.quote(install_root)} {shlex.quote(str(shared_install_root))}
+}} >{shlex.quote(container_build_log)} 2>&1
+"""
+    log("building current dynamic-parallel runnable-lift inside rr_bionic_exportfs")
+    if not config.dry_run:
+        result = docker_run_shell(
+            config.docker_image,
+            shell_script,
+            mounts=host_mounts(config),
+            workdir="/workspace",
+            memory_limit_gb=config.build_memory_gb,
+            capture_output=False,
+            check=False,
+        )
+        if result.returncode != 0:
+            detail = f"current branch runnable-lift build failed; see {build_log}"
+            if build_log.exists():
+                log_text = build_log.read_text(encoding="utf-8", errors="ignore")
+                if "PTCInterface' has no member named 'queueDepth'" in log_text or "PTCInterface' has no member named 'dropCPUState'" in log_text:
+                    detail += (
+                        " (rr_bionic_exportfs:2026-04-14 exposes an older PTCInterface "
+                        "than this dynamic-parallel branch expects)"
+                    )
+            raise RuntimeError(detail)
+    installed = shared_install_dir / "bin" / "runnable-lift"
+    if not config.dry_run and installed.exists():
+        return installed, shared_install_dir
+    build_binary, build_prefix, build_reason = probe_build_tree_runnable_lift(config)
+    if not config.dry_run and build_binary is not None and build_prefix is not None:
+        log(f"using build tree runnable-lift fallback: {build_reason}")
+        return build_binary, build_prefix
+    if not config.dry_run:
+        raise RuntimeError(f"expected built runnable-lift at {installed}")
+    return installed, shared_install_dir
+
+
+def resolve_runnable_lift(config: LiftConfig) -> Tuple[Path, Path, str]:
+    binary, prefix, reason = probe_installed_runnable_lift(config)
+    if binary is not None and not config.rebuild_lift:
+        return binary, prefix, reason
+    build_binary, build_prefix, build_reason = probe_build_tree_runnable_lift(config)
+    if build_binary is not None and build_prefix is not None and not config.rebuild_lift:
+        return build_binary, build_prefix, build_reason
+    if binary is not None and config.rebuild_lift:
+        log(f"rebuilding current runnable-lift even though install exists: {reason}")
+    elif binary is None:
+        log(f"building current runnable-lift because probe failed: {reason}")
+    built_binary, built_prefix = compile_current_runnable(config)
+    return built_binary, built_prefix, "freshly built current branch binary"
+
+
+def build_container_runtime(config: LiftConfig, prefix: Path) -> Dict[str, str]:
+    prefix_in_container = map_host_path_to_container(config, prefix)
+    if prefix == config.layout.build_dir:
+        bin_dir = prefix_in_container
+        lib_dir = f"{prefix_in_container}/lib/Support"
+        share_dir = prefix_in_container
+    else:
+        bin_dir = f"{prefix_in_container}/bin"
+        lib_dir = f"{prefix_in_container}/lib"
+        share_dir = f"{prefix_in_container}/share/runnable"
+    path = f"{bin_dir}:/root/Runnable-Rewriting/root/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    ld_library_parts = [lib_dir]
+    if prefix == config.layout.build_dir:
+        ld_library_parts.extend(
+            [
+                f"{prefix_in_container}/lib/BasicAnalyses",
+                f"{prefix_in_container}/lib/Dump",
+                f"{prefix_in_container}/lib/FunctionIsolation",
+                f"{prefix_in_container}/lib/StackAnalysis",
+                f"{prefix_in_container}/analyses",
+            ]
+        )
+    ld_library_parts.append("/root/Runnable-Rewriting/root/lib")
+    ld_library_path = ":".join(ld_library_parts)
+    pythonpath = f"{share_dir}:/workspace/Runnable-Rewriting/runnable/scripts"
+    return {
+        "prefix_in_container": prefix_in_container,
+        "PATH": path,
+        "LD_LIBRARY_PATH": ld_library_path,
+        "PYTHONPATH": pythonpath,
+        "bin_dir": bin_dir,
+        "lib_dir": lib_dir,
+        "share_dir": share_dir,
+    }
+
+
+def run_dynamic_lift_for_seed(
+    *,
+    config: LiftConfig,
+    runtime: Dict[str, str],
+    binary_path: Path,
+    seed: SeedFunction,
+) -> Dict[str, object]:
+    raw_ll = config.layout.raw_dir / f"{seed.tag}.raw.ll"
+    merged_ll = config.layout.merged_dir / f"{seed.tag}.ll"
+    fragment_dir = config.layout.fragments_dir / seed.tag
+    stdout_log = config.layout.logs_dir / f"{seed.tag}.stdout.log"
+    stderr_log = config.layout.logs_dir / f"{seed.tag}.stderr.log"
+    merge_summary = config.layout.manifests_dir / f"{seed.tag}.merge.json"
+    if fragment_dir.exists():
+        shutil.rmtree(fragment_dir)
+    ensure_dir(fragment_dir)
+    for stale_path in (raw_ll, merged_ll, stdout_log, stderr_log, merge_summary):
+        if stale_path.exists():
+            stale_path.unlink()
+
+    container_binary = map_host_path_to_container(config, binary_path)
+    container_raw_ll = map_host_path_to_container(config, raw_ll)
+    container_merged_ll = map_host_path_to_container(config, merged_ll)
+    container_fragment_dir = map_host_path_to_container(config, fragment_dir)
+    container_stdout_log = map_host_path_to_container(config, stdout_log)
+    container_stderr_log = map_host_path_to_container(config, stderr_log)
+    container_merge_summary = map_host_path_to_container(config, merge_summary)
+    flags = [
+        "runnable-lift",
+        f"-base={hex(config.runnable_base)}",
+        f"-entry={hex(config.runnable_base + seed.start)}",
+        f"-addr-range-min={hex(config.runnable_base + seed.start)}",
+        f"-addr-range-max={hex(config.runnable_base + seed.end_exclusive)}",
+        "-dynamic-parallel",
+        f"-parallel-workers={config.requested_parallel_workers}",
+        f"-parallel-fragment-dir={container_fragment_dir}",
+    ]
+    flags.extend(config.coordinator_flags)
+    flags.extend([container_binary, container_raw_ll])
+    env = {
+        "PATH": runtime["PATH"],
+        "LD_LIBRARY_PATH": runtime["LD_LIBRARY_PATH"],
+        "PYTHONPATH": runtime["PYTHONPATH"],
+    }
+    shell_script = f"""
+set -euo pipefail
+mkdir -p {shlex.quote(container_fragment_dir)}
+cd /workspace/Runnable-Rewriting
+{{
+  timeout {int(config.lift_timeout_sec)} {shell_join(flags)}
+}} >{shlex.quote(container_stdout_log)} 2>{shlex.quote(container_stderr_log)}
+"""
+
+    started = time.time()
+    if config.dry_run:
+        rc = 0
+        stdout_log.write_text(shell_script, encoding="utf-8")
+        stderr_log.write_text("", encoding="utf-8")
+        ensure_dir(merged_ll.parent)
+        merged_ll.write_text("; dry-run placeholder\n", encoding="utf-8")
+    else:
+        result = docker_run_shell(
+            config.docker_image,
+            shell_script,
+            mounts=host_mounts(config),
+            workdir="/workspace",
+            env=env,
+            memory_limit_gb=config.container_memory_limit_gb,
+            capture_output=False,
+            check=False,
+        )
+        rc = result.returncode
+        if rc == 0:
+            worker_inputs = sorted(fragment_dir.glob("worker_*.ll"))
+            if worker_inputs:
+                run_cmd(
+                    [
+                        "python3",
+                        str(config.repo_root / "runnable" / "scripts" / "merge_dynamic_runnable_fragments.py"),
+                        "--output",
+                        str(merged_ll),
+                        "--entry-pc",
+                        hex(config.runnable_base + seed.start),
+                        "--summary-out",
+                        str(merge_summary),
+                        str(raw_ll),
+                        *(str(path) for path in worker_inputs),
+                    ],
+                    cwd=config.repo_root,
+                    capture_output=False,
+                )
+            else:
+                run_cmd(["cp", str(raw_ll), str(merged_ll)], capture_output=False)
+    elapsed = time.time() - started
+    worker_count = len(list(fragment_dir.glob("worker_*.ll")))
+    return {
+        "tag": seed.tag,
+        "name": seed.name,
+        "start": seed.start,
+        "entry_pc": config.runnable_base + seed.start,
+        "size": seed.size,
+        "status": "ok" if rc == 0 and (config.dry_run or merged_ll.exists()) else "failed",
+        "rc": rc,
+        "elapsed_sec": elapsed,
+        "workers_spawned": worker_count,
+        "raw_ll": str(raw_ll),
+        "merged_ll": str(merged_ll),
+        "fragment_dir": str(fragment_dir),
+        "stdout_log": str(stdout_log),
+        "stderr_log": str(stderr_log),
+        "merge_summary": str(merge_summary) if merge_summary.exists() else None,
+    }
+
+
+def merge_seed_result(config: LiftConfig, result: Dict[str, object]) -> Dict[str, object]:
+    if result["status"] != "ok":
+        return result
+    raw_ll = map_container_path_to_host(config, str(result["raw_ll"]))
+    merged_ll = map_container_path_to_host(config, str(result["merged_ll"]))
+    fragment_dir = map_container_path_to_host(config, str(result["fragment_dir"]))
+    merge_summary = Path(str(result["merge_summary"])) if result.get("merge_summary") else config.layout.manifests_dir / f"{result['tag']}.merge.json"
+    worker_inputs = sorted(fragment_dir.glob("worker_*.ll"))
+    ensure_dir(merged_ll.parent)
+    if worker_inputs:
+        run_cmd(
+            [
+                "python3",
+                str(config.repo_root / "runnable" / "scripts" / "merge_dynamic_runnable_fragments.py"),
+                "--output",
+                str(merged_ll),
+                "--entry-pc",
+                hex(int(result["entry_pc"])),
+                "--summary-out",
+                str(merge_summary),
+                str(raw_ll),
+                *(str(path) for path in worker_inputs),
+            ],
+            cwd=config.repo_root,
+            capture_output=False,
+        )
+    else:
+        run_cmd(["cp", str(raw_ll), str(merged_ll)], capture_output=False)
+    updated = dict(result)
+    updated["merge_summary"] = str(merge_summary) if merge_summary.exists() else None
+    updated["workers_spawned"] = len(worker_inputs)
+    updated["merged_ll"] = str(merged_ll)
+    updated["raw_ll"] = str(raw_ll)
+    updated["fragment_dir"] = str(fragment_dir)
+    updated["stdout_log"] = str(map_container_path_to_host(config, str(result["stdout_log"])))
+    updated["stderr_log"] = str(map_container_path_to_host(config, str(result["stderr_log"])))
+    return updated
+
+
+def host_merge_seed_results(config: LiftConfig, seed_results: Sequence[Dict[str, object]]) -> List[Dict[str, object]]:
+    merged_results: List[Dict[str, object]] = []
+    for result in sorted(seed_results, key=lambda item: item["start"]):
+        if result["status"] != "ok":
+            merged_results.append(dict(result))
+            continue
+        merged_results.append(merge_seed_result(config, result))
+    return merged_results
+
+
+def host_merge_shards_from_seed_results(
+    config: LiftConfig,
+    *,
+    shard_summaries: Sequence[Dict[str, object]],
+    seed_results: Sequence[Dict[str, object]],
+) -> List[Dict[str, object]]:
+    by_shard: Dict[str, List[Dict[str, object]]] = {}
+    for result in seed_results:
+        by_shard.setdefault(str(result["shard_id"]), []).append(result)
+
+    updated_summaries: List[Dict[str, object]] = []
+    for shard in sorted(shard_summaries, key=lambda item: int(item["start"])):
+        shard_id = str(shard["shard_id"])
+        ok_results = [item for item in by_shard.get(shard_id, []) if item["status"] == "ok"]
+        merged_ll = config.layout.shard_merged_dir / f"{shard_id}.ll"
+        merge_summary = config.layout.shard_logs_dir / f"{shard_id}.merge.json"
+        payload = dict(shard)
+        if ok_results:
+            merged = merge_module_paths(
+                config,
+                inputs=[Path(str(item["merged_ll"])) for item in sorted(ok_results, key=lambda item: item["start"])],
+                entry_pc=int(ok_results[0]["entry_pc"]),
+                final_output=merged_ll,
+                summary_name=f"{shard_id}.summary.json",
+            )
+            payload["merged_ll"] = str(merged_ll)
+            payload["merge_summary"] = str(merged["summary_out"])
+            payload["status"] = "ok" if len(ok_results) == int(shard["seed_count"]) else "partial"
+        else:
+            payload["status"] = "failed"
+            payload["merged_ll"] = str(merged_ll)
+            payload["merge_summary"] = None
+        updated_summaries.append(payload)
+    return updated_summaries
+
+
+def load_incremental_results(
+    path: Path,
+    *,
+    known_tags: Set[str],
+) -> List[Dict[str, object]]:
+    if not path.exists():
+        return []
+    items: List[Dict[str, object]] = []
+    seen_tags = set(known_tags)
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            payload = json.loads(line)
+            tag = str(payload["tag"])
+            if tag in seen_tags:
+                continue
+            seen_tags.add(tag)
+            items.append(payload)
+    return items
+
+
+def normalize_seed_result_paths(
+    config: LiftConfig,
+    result: Dict[str, object],
+) -> Dict[str, object]:
+    updated = dict(result)
+    for key in ("raw_ll", "merged_ll", "fragment_dir", "stdout_log", "stderr_log"):
+        if updated.get(key) is not None:
+            updated[key] = str(map_container_path_to_host(config, str(updated[key])))
+    if updated.get("merge_summary") is not None:
+        updated["merge_summary"] = str(map_container_path_to_host(config, str(updated["merge_summary"])))
+    return updated
+
+
+def seed_merge_summary_path(config: LiftConfig, result: Dict[str, object]) -> Path:
+    if result.get("merge_summary"):
+        return Path(str(result["merge_summary"]))
+    return config.layout.manifests_dir / f"{result['tag']}.merge.json"
+
+
+def shard_merge_summary_path(config: LiftConfig, shard_id: str) -> Path:
+    return config.layout.manifests_dir / f"{shard_id}.summary.json"
+
+
+def recover_seed_merge_result(
+    config: LiftConfig,
+    result: Dict[str, object],
+) -> Optional[Dict[str, object]]:
+    if result["status"] != "ok":
+        return None
+    normalized = normalize_seed_result_paths(config, result)
+    raw_ll = Path(str(normalized["raw_ll"]))
+    merged_ll = Path(str(normalized["merged_ll"]))
+    fragment_dir = Path(str(normalized["fragment_dir"]))
+    merge_summary = seed_merge_summary_path(config, normalized)
+    if not raw_ll.exists() or not merged_ll.exists():
+        return None
+    worker_inputs = sorted(fragment_dir.glob("worker_*.ll"))
+    if worker_inputs and not merge_summary.exists():
+        return None
+    updated = dict(normalized)
+    updated["merge_summary"] = str(merge_summary) if merge_summary.exists() else None
+    updated["workers_spawned"] = len(worker_inputs)
+    return updated
+
+
+def recover_shard_merge_payload(
+    config: LiftConfig,
+    *,
+    shard_id: str,
+    seed_results: Sequence[Dict[str, object]],
+    expected_seed_count: int,
+    shard_start: int,
+) -> Optional[Dict[str, object]]:
+    merged_ll = config.layout.shard_merged_dir / f"{shard_id}.ll"
+    merge_summary = shard_merge_summary_path(config, shard_id)
+    if not merged_ll.exists() or not merge_summary.exists():
+        return None
+    ok_results = [item for item in seed_results if item["status"] == "ok"]
+    if not ok_results:
+        return None
+    failed_count = len(seed_results) - len(ok_results)
+    status = "ok" if len(seed_results) == expected_seed_count and failed_count == 0 else "partial"
+    return {
+        "shard_id": shard_id,
+        "start": shard_start,
+        "seed_count": expected_seed_count,
+        "ok_seed_count": len(ok_results),
+        "failed_seed_count": failed_count,
+        "status": status,
+        "merged_ll": str(merged_ll),
+        "merge_summary": str(merge_summary),
+        "log_path": str(config.layout.shard_logs_dir / f"{shard_id}.log"),
+    }
+
+
+def recover_batch_merge_payload(node: MergeBatchNode) -> Optional[Dict[str, object]]:
+    if not node.output.exists() or not node.summary_out.exists():
+        return None
+    return {
+        "node_id": node.node_id,
+        "level": node.level,
+        "index": node.index,
+        "children": list(node.children),
+        "output": str(node.output),
+        "summary_out": str(node.summary_out),
+    }
+
+
+def restore_streaming_merge_state(
+    config: LiftConfig,
+    *,
+    planned_shards: Sequence[LiftShard],
+) -> RestoredStreamingMergeState:
+    state = initialize_merge_state(planned_shards)
+    progress = MergeProgress(
+        seed_total=sum(shard.seed_count for shard in planned_shards),
+        shard_total=len(planned_shards),
+    )
+    paths = merge_state_paths(config.layout)
+    shard_seed_results: Dict[str, Dict[str, Dict[str, object]]] = {
+        shard.shard_id: {} for shard in planned_shards
+    }
+    shard_summaries: Dict[str, Dict[str, object]] = {}
+    available_inputs: Dict[str, Path] = {}
+    batch_result_payloads: List[Dict[str, object]] = []
+    first_success_entry_pc: Optional[int] = None
+
+    def record_shard_result(result: Dict[str, object]) -> None:
+        shard_id = str(result["shard_id"])
+        shard_seed_results.setdefault(shard_id, {})[str(result["tag"])] = dict(result)
+
+    for result in load_jsonl(paths["seed_lift_events"]):
+        tag = str(result["tag"])
+        if tag in state.seed_results:
+            continue
+        state.seed_results[tag] = dict(result)
+        if result["status"] == "ok" and first_success_entry_pc is None:
+            first_success_entry_pc = int(result["entry_pc"])
+        if result["status"] != "ok":
+            record_shard_result(result)
+
+    for result in load_jsonl(paths["seed_merge_events"]):
+        tag = str(result["tag"])
+        normalized = normalize_seed_result_paths(config, result)
+        state.seed_merge_enqueued.add(tag)
+        if tag in state.seed_merge_completed:
+            continue
+        state.seed_merge_completed.add(tag)
+        state.seed_results[tag] = normalized
+        if first_success_entry_pc is None:
+            first_success_entry_pc = int(normalized["entry_pc"])
+        record_shard_result(normalized)
+
+    recovered_seed_merges: List[Dict[str, object]] = []
+    for result in sorted(state.seed_results.values(), key=lambda item: int(item["start"])):
+        tag = str(result["tag"])
+        if result["status"] != "ok" or tag in state.seed_merge_completed:
+            continue
+        recovered = recover_seed_merge_result(config, result)
+        if recovered is None:
+            continue
+        state.seed_merge_enqueued.add(tag)
+        state.seed_merge_completed.add(tag)
+        state.seed_results[tag] = recovered
+        if first_success_entry_pc is None:
+            first_success_entry_pc = int(recovered["entry_pc"])
+        record_shard_result(recovered)
+        recovered_seed_merges.append(recovered)
+
+    for result in recovered_seed_merges:
+        append_jsonl(paths["seed_merge_events"], result)
+
+    for payload in load_jsonl(paths["shard_merge_events"]):
+        shard_id = str(payload["shard_id"])
+        state.shard_merge_enqueued.add(shard_id)
+        if shard_id in state.shard_merge_completed:
+            continue
+        state.shard_merge_completed.add(shard_id)
+        shard_summaries[shard_id] = dict(payload)
+        if payload.get("status") in {"ok", "partial"} and Path(str(payload["merged_ll"])).exists():
+            available_inputs[shard_id] = Path(str(payload["merged_ll"]))
+
+    recovered_shard_merges: List[Dict[str, object]] = []
+    for shard in planned_shards:
+        shard_id = shard.shard_id
+        if shard_id in state.shard_merge_completed:
+            continue
+        if len(shard_seed_results[shard_id]) < shard.seed_count:
+            continue
+        recovered = recover_shard_merge_payload(
+            config,
+            shard_id=shard_id,
+            seed_results=sorted(shard_seed_results[shard_id].values(), key=lambda item: int(item["start"])),
+            expected_seed_count=shard.seed_count,
+            shard_start=shard.start,
+        )
+        if recovered is None:
+            continue
+        state.shard_merge_enqueued.add(shard_id)
+        state.shard_merge_completed.add(shard_id)
+        shard_summaries[shard_id] = recovered
+        available_inputs[shard_id] = Path(str(recovered["merged_ll"]))
+        recovered_shard_merges.append(recovered)
+
+    for payload in recovered_shard_merges:
+        append_jsonl(paths["shard_merge_events"], payload)
+
+    batch_plan, frontier_root_id, _ = plan_merge_batches(config, list(shard_summaries.values()))
+
+    for payload in load_jsonl(paths["batch_merge_events"]):
+        node_id = str(payload["node_id"])
+        state.batch_merge_enqueued.add(node_id)
+        if node_id in state.batch_merge_completed:
+            continue
+        state.batch_merge_completed.add(node_id)
+        batch_result_payloads.append(dict(payload))
+        if Path(str(payload["output"])).exists():
+            available_inputs[node_id] = Path(str(payload["output"]))
+
+    recovered_batch_merges: List[Dict[str, object]] = []
+    for node in batch_plan:
+        if node.node_id in state.batch_merge_completed:
+            continue
+        recovered = recover_batch_merge_payload(node)
+        if recovered is None:
+            continue
+        state.batch_merge_enqueued.add(node.node_id)
+        state.batch_merge_completed.add(node.node_id)
+        batch_result_payloads.append(recovered)
+        available_inputs[node.node_id] = Path(str(recovered["output"]))
+        recovered_batch_merges.append(recovered)
+
+    for payload in recovered_batch_merges:
+        append_jsonl(paths["batch_merge_events"], payload)
+
+    frontier_root_output = available_inputs.get(frontier_root_id) if frontier_root_id is not None else None
+    progress.lift_completed = len(state.seed_results)
+    progress.seed_merged = len(state.seed_merge_completed)
+    progress.shard_merged = len(state.shard_merge_completed)
+    progress.batch_merged = len(state.batch_merge_completed)
+    state.completed_results_offset = len(state.seed_results)
+
+    return RestoredStreamingMergeState(
+        state=state,
+        progress=progress,
+        shard_seed_results=shard_seed_results,
+        shard_summaries=shard_summaries,
+        available_inputs=available_inputs,
+        batch_plan=batch_plan,
+        batch_result_payloads=sorted(
+            batch_result_payloads,
+            key=lambda item: (int(item["level"]), int(item["index"])),
+        ),
+        first_success_entry_pc=first_success_entry_pc,
+        frontier_root_id=frontier_root_id,
+        frontier_root_output=frontier_root_output,
+    )
+
+
+def summarize_shard_payload(
+    config: LiftConfig,
+    *,
+    shard_id: str,
+    seed_results: Sequence[Dict[str, object]],
+    expected_seed_count: int,
+    shard_start: int,
+) -> Dict[str, object]:
+    merged_ll = config.layout.shard_merged_dir / f"{shard_id}.ll"
+    merge_summary = config.layout.shard_logs_dir / f"{shard_id}.merge.json"
+    ok_results = [item for item in seed_results if item["status"] == "ok"]
+    failed_count = len(seed_results) - len(ok_results)
+    if ok_results:
+        merged = merge_module_paths(
+            config,
+            inputs=[Path(str(item["merged_ll"])) for item in sorted(ok_results, key=lambda item: item["start"])],
+            entry_pc=int(ok_results[0]["entry_pc"]),
+            final_output=merged_ll,
+            summary_name=f"{shard_id}.summary.json",
+        )
+        status = "ok" if len(seed_results) == expected_seed_count and failed_count == 0 else "partial"
+        return {
+            "shard_id": shard_id,
+            "start": shard_start,
+            "seed_count": expected_seed_count,
+            "ok_seed_count": len(ok_results),
+            "failed_seed_count": failed_count,
+            "status": status,
+            "merged_ll": str(merged_ll),
+            "merge_summary": str(merged["summary_out"]),
+            "log_path": str(config.layout.shard_logs_dir / f"{shard_id}.log"),
+        }
+    return {
+        "shard_id": shard_id,
+        "start": shard_start,
+        "seed_count": expected_seed_count,
+        "ok_seed_count": 0,
+        "failed_seed_count": failed_count,
+        "status": "failed",
+        "merged_ll": str(merged_ll),
+        "merge_summary": None,
+        "log_path": str(config.layout.shard_logs_dir / f"{shard_id}.log"),
+    }
+
+
+def ready_shard_merge_inputs(
+    shard_summaries: Sequence[Dict[str, object]],
+) -> List[Dict[str, object]]:
+    return [
+        item
+        for item in sorted(shard_summaries, key=lambda value: int(value["start"]))
+        if item.get("status") in {"ok", "partial"} and Path(str(item["merged_ll"])).exists()
+    ]
+
+
+def plan_merge_batches(
+    config: LiftConfig,
+    shard_summaries: Sequence[Dict[str, object]],
+) -> Tuple[List[MergeBatchNode], Optional[str], List[Dict[str, object]]]:
+    ready = ready_shard_merge_inputs(shard_summaries)
+    if not ready:
+        return [], None, []
+    current_ids = [str(item["shard_id"]) for item in ready]
+    current_inputs = {str(item["shard_id"]): Path(str(item["merged_ll"])) for item in ready}
+    plan: List[MergeBatchNode] = []
+    level = 0
+    while len(current_ids) > 1:
+        next_ids: List[str] = []
+        next_inputs: Dict[str, Path] = {}
+        for index in range(0, len(current_ids), config.merge_batch_size):
+            children = tuple(current_ids[index:index + config.merge_batch_size])
+            if len(children) == 1:
+                next_ids.append(children[0])
+                next_inputs[children[0]] = current_inputs[children[0]]
+                continue
+            batch_index = index // config.merge_batch_size
+            child_digest = hashlib.sha1(
+                "\n".join(children).encode("utf-8")
+            ).hexdigest()[:12]
+            output = config.layout.merge_batches_dir / (
+                f"level{level:02d}-batch{batch_index:04d}-{child_digest}.ll"
+            )
+            summary_out = config.layout.merge_batches_dir / (
+                f"level{level:02d}-batch{batch_index:04d}-{child_digest}.json"
+            )
+            node = MergeBatchNode(
+                level=level,
+                index=batch_index,
+                children=children,
+                output=output,
+                summary_out=summary_out,
+            )
+            plan.append(node)
+            next_ids.append(node.node_id)
+            next_inputs[node.node_id] = output
+        current_ids = next_ids
+        current_inputs = next_inputs
+        level += 1
+    return plan, current_ids[0], ready
+
+
+def build_merge_batch_plan(
+    config: LiftConfig,
+    shard_summaries: Sequence[Dict[str, object]],
+) -> List[MergeBatchNode]:
+    plan, _, _ = plan_merge_batches(config, shard_summaries)
+    return plan
+
+
+def execute_merge_batch_node(
+    config: LiftConfig,
+    *,
+    node: MergeBatchNode,
+    available_inputs: Dict[str, Path],
+    entry_pc: int,
+) -> Dict[str, object]:
+    inputs = [available_inputs[child] for child in node.children]
+    payload = merge_module_paths(
+        config,
+        inputs=inputs,
+        entry_pc=entry_pc,
+        final_output=node.output,
+        summary_name=node.summary_out.name,
+        summary_out_path=node.summary_out,
+    )
+    return {
+        "node_id": node.node_id,
+        "level": node.level,
+        "index": node.index,
+        "children": list(node.children),
+        "output": str(node.output),
+        "summary_out": str(payload["summary_out"]),
+    }
+
+
+def persist_merge_frontier(layout: LiftLayout, payload: Dict[str, object]) -> None:
+    write_summary(merge_state_paths(layout)["frontier"], payload)
+
+
+def run_streaming_merge_scheduler(
+    config: LiftConfig,
+    *,
+    shard_runner_proc: subprocess.Popen[str],
+    shard_results_jsonl: Path,
+    planned_shards: Sequence[LiftShard],
+) -> Tuple[List[Dict[str, object]], List[Dict[str, object]], Dict[str, object]]:
+    paths = merge_state_paths(config.layout)
+    for path_key in ("seed_lift_events", "seed_merge_events", "shard_merge_events", "batch_merge_events"):
+        path = paths[path_key]
+        if not path.exists():
+            path.write_text("", encoding="utf-8")
+
+    restored = restore_streaming_merge_state(config, planned_shards=planned_shards)
+    state = restored.state
+    progress = restored.progress
+    shard_seed_results: Dict[str, Dict[str, Dict[str, object]]] = restored.shard_seed_results
+    shard_summaries: Dict[str, Dict[str, object]] = restored.shard_summaries
+    available_inputs: Dict[str, Path] = restored.available_inputs
+    batch_plan: List[MergeBatchNode] = restored.batch_plan
+    batch_result_payloads: List[Dict[str, object]] = restored.batch_result_payloads
+    seed_merge_futures = {}
+    shard_merge_futures = {}
+    batch_merge_futures = {}
+    first_success_entry_pc: Optional[int] = restored.first_success_entry_pc
+    frontier_root_id: Optional[str] = restored.frontier_root_id
+    frontier_root_output: Optional[Path] = restored.frontier_root_output
+
+    def update_frontier_state() -> None:
+        nonlocal frontier_root_output
+        root_output = None
+        if frontier_root_id is not None:
+            root_output = available_inputs.get(frontier_root_id)
+        frontier_root_output = root_output
+        persist_merge_frontier(
+            config.layout,
+            {
+                "available_inputs": {key: str(value) for key, value in available_inputs.items()},
+                "batch_plan": [
+                    {
+                        "node_id": node.node_id,
+                        "level": node.level,
+                        "index": node.index,
+                        "children": list(node.children),
+                        "output": str(node.output),
+                    }
+                    for node in batch_plan
+                ],
+                "root_id": frontier_root_id,
+                "root_output": str(root_output) if root_output is not None else None,
+            },
+        )
+
+    update_frontier_state()
+    write_merge_progress(config.layout, progress)
+    write_merge_state_summary(config.layout, state)
+
+    def submit_seed_merge(executor: ThreadPoolExecutor, result: Dict[str, object]) -> None:
+        tag = str(result["tag"])
+        if tag in state.seed_merge_enqueued:
+            return
+        state.seed_merge_enqueued.add(tag)
+        progress.queued_seed_merges += 1
+        future = executor.submit(merge_seed_result, config, result)
+        seed_merge_futures[future] = tag
+
+    def maybe_submit_shard_merge(executor: ThreadPoolExecutor, shard_id: str) -> None:
+        if shard_id in state.shard_merge_enqueued:
+            return
+        results = list(shard_seed_results[shard_id].values())
+        expected = state.shard_expected_counts[shard_id]
+        if len(results) < expected:
+            return
+        state.shard_merge_enqueued.add(shard_id)
+        progress.queued_shard_merges += 1
+        future = executor.submit(
+            summarize_shard_payload,
+            config,
+            shard_id=shard_id,
+            seed_results=list(results),
+            expected_seed_count=expected,
+            shard_start=state.shard_start_addrs[shard_id],
+        )
+        shard_merge_futures[future] = shard_id
+
+    def maybe_submit_batch_merges(executor: ThreadPoolExecutor, entry_pc: int) -> None:
+        for node in batch_plan:
+            if node.node_id in state.batch_merge_enqueued:
+                continue
+            if any(child not in available_inputs for child in node.children):
+                continue
+            state.batch_merge_enqueued.add(node.node_id)
+            progress.queued_batch_merges += 1
+            future = executor.submit(
+                execute_merge_batch_node,
+                config,
+                node=node,
+                available_inputs=dict(available_inputs),
+                entry_pc=entry_pc,
+            )
+            batch_merge_futures[future] = node.node_id
+
+    with ThreadPoolExecutor(max_workers=config.merge_workers) as merge_executor:
+        while True:
+            new_results = load_incremental_results(
+                shard_results_jsonl,
+                known_tags=set(state.seed_results),
+            )
+            for result in new_results:
+                tag = str(result["tag"])
+                normalized = normalize_seed_result_paths(config, result)
+                state.seed_results[tag] = normalized
+                progress.lift_completed += 1
+                state.completed_results_offset += 1
+                append_jsonl(paths["seed_lift_events"], normalized)
+                if normalized["status"] == "ok":
+                    if first_success_entry_pc is None:
+                        first_success_entry_pc = int(normalized["entry_pc"])
+                    submit_seed_merge(merge_executor, normalized)
+                else:
+                    shard_id = str(normalized["shard_id"])
+                    shard_seed_results[shard_id][tag] = dict(normalized)
+                    maybe_submit_shard_merge(merge_executor, shard_id)
+
+            done_seed = [future for future in list(seed_merge_futures) if future.done()]
+            for future in done_seed:
+                tag = seed_merge_futures.pop(future)
+                progress.queued_seed_merges -= 1
+                merged_result = future.result()
+                state.seed_merge_completed.add(tag)
+                progress.seed_merged += 1
+                state.seed_results[tag] = merged_result
+                shard_id = str(merged_result["shard_id"])
+                shard_seed_results[shard_id][tag] = merged_result
+                append_jsonl(paths["seed_merge_events"], merged_result)
+                maybe_submit_shard_merge(merge_executor, shard_id)
+
+            done_shards = [future for future in list(shard_merge_futures) if future.done()]
+            for future in done_shards:
+                shard_id = shard_merge_futures.pop(future)
+                progress.queued_shard_merges -= 1
+                shard_payload = future.result()
+                state.shard_merge_completed.add(shard_id)
+                progress.shard_merged += 1
+                shard_summaries[shard_id] = shard_payload
+                if shard_payload.get("status") in {"ok", "partial"} and Path(str(shard_payload["merged_ll"])).exists():
+                    available_inputs[shard_id] = Path(str(shard_payload["merged_ll"]))
+                append_jsonl(paths["shard_merge_events"], shard_payload)
+                batch_plan, frontier_root_id, _ = plan_merge_batches(config, list(shard_summaries.values()))
+                if first_success_entry_pc is not None:
+                    maybe_submit_batch_merges(merge_executor, first_success_entry_pc)
+                update_frontier_state()
+
+            done_batches = [future for future in list(batch_merge_futures) if future.done()]
+            for future in done_batches:
+                node_id = batch_merge_futures.pop(future)
+                progress.queued_batch_merges -= 1
+                payload = future.result()
+                state.batch_merge_completed.add(node_id)
+                progress.batch_merged += 1
+                available_inputs[node_id] = Path(payload["output"])
+                batch_result_payloads.append(payload)
+                append_jsonl(paths["batch_merge_events"], payload)
+            if first_success_entry_pc is not None and batch_plan:
+                maybe_submit_batch_merges(merge_executor, first_success_entry_pc)
+            if done_batches:
+                update_frontier_state()
+
+            write_merge_progress(config.layout, progress)
+            write_merge_state_summary(config.layout, state)
+
+            proc_rc = shard_runner_proc.poll()
+            if proc_rc is not None and not seed_merge_futures and not shard_merge_futures and not batch_merge_futures:
+                if state.completed_results_offset >= progress.seed_total or proc_rc != 0:
+                    break
+            time.sleep(config.merge_poll_interval_sec)
+
+    rc = shard_runner_proc.wait()
+    ordered_seed_results = sorted(state.seed_results.values(), key=lambda item: int(item["start"]))
+    ordered_shards = sorted(shard_summaries.values(), key=lambda item: int(item["start"]))
+    ordered_batch_results = sorted(batch_result_payloads, key=lambda item: (int(item["level"]), int(item["index"])))
+    return ordered_seed_results, ordered_shards, {
+        "seed_lift_completed": progress.lift_completed,
+        "seed_merge_completed": progress.seed_merged,
+        "shard_merge_completed": progress.shard_merged,
+        "batch_merge_completed": progress.batch_merged,
+        "batch_results": ordered_batch_results,
+        "final_frontier_id": frontier_root_id,
+        "final_frontier_output": str(frontier_root_output) if frontier_root_output is not None else None,
+        "rc": rc,
+    }
+
+
+def run_shard_runner(
+    *,
+    config: LiftConfig,
+    runtime: Dict[str, str],
+    container_name: str,
+    binary_path: Path,
+    shards: Sequence[LiftShard],
+) -> Dict[str, object]:
+    runner_path = SHARD_RUNNER_SCRIPT
+    if not runner_path.exists():
+        raise FileNotFoundError(runner_path)
+    manifest_path = config.layout.shard_manifests_dir / "shards.json"
+    summary_path = config.layout.shard_dir / "shard-runner-summary.json"
+    stdout_log = config.layout.shard_logs_dir / "runner.stdout.log"
+    stderr_log = config.layout.shard_logs_dir / "runner.stderr.log"
+    run_summary_json = config.layout.shard_dir / "shard-results.json"
+    run_summary_jsonl = config.layout.shard_dir / "shard-results.jsonl"
+
+    container_runner = map_host_path_to_container(config, runner_path)
+    container_binary = map_host_path_to_container(config, binary_path)
+    container_manifest = map_host_path_to_container(config, manifest_path)
+    container_raw_dir = map_host_path_to_container(config, config.layout.raw_dir)
+    container_fragment_root = map_host_path_to_container(config, config.layout.fragments_dir)
+    container_merged_dir = map_host_path_to_container(config, config.layout.shard_merged_dir)
+    container_logs_dir = map_host_path_to_container(config, config.layout.shard_logs_dir)
+    container_summary = map_host_path_to_container(config, summary_path)
+    container_results_json = map_host_path_to_container(config, run_summary_json)
+    container_results_jsonl = map_host_path_to_container(config, run_summary_jsonl)
+    container_stdout = map_host_path_to_container(config, stdout_log)
+    container_stderr = map_host_path_to_container(config, stderr_log)
+
+    command = [
+        "python3",
+        container_runner,
+        "--manifest",
+        container_manifest,
+        "--binary",
+        container_binary,
+        "--raw-dir",
+        container_raw_dir,
+        "--fragment-root",
+        container_fragment_root,
+        "--merged-dir",
+        container_merged_dir,
+        "--logs-dir",
+        container_logs_dir,
+        "--results-json",
+        container_results_json,
+        "--results-jsonl",
+        container_results_jsonl,
+        "--summary-out",
+        container_summary,
+        "--runnable-base",
+        hex(config.runnable_base),
+        "--parallel-workers",
+        str(config.requested_parallel_workers),
+        "--shard-concurrency",
+        str(config.shard_concurrency),
+        "--timeout-sec",
+        str(config.lift_timeout_sec),
+    ]
+    if config.preserve_success_seed_logs:
+        command.append("--preserve-success-seed-logs")
+    for flag in config.coordinator_flags:
+        if not str(flag).strip():
+            continue
+        command.append(f"--coordinator-flag={flag}")
+
+    shell_script = f"""
+set -euo pipefail
+mkdir -p {shlex.quote(container_logs_dir)} {shlex.quote(container_merged_dir)} {shlex.quote(container_fragment_root)} {shlex.quote(container_raw_dir)}
+{{ {' '.join(shlex.quote(part) for part in command)}; }} >{shlex.quote(container_stdout)} 2>{shlex.quote(container_stderr)}
+"""
+    started = time.time()
+    if config.dry_run:
+        stdout_log.write_text(shell_script, encoding="utf-8")
+        stderr_log.write_text("", encoding="utf-8")
+        dummy_results = []
+        for shard in shards:
+            for seed in shard.seeds:
+                raw_ll = config.layout.raw_dir / f"{seed.tag}.raw.ll"
+                merged_ll = config.layout.merged_dir / f"{seed.tag}.ll"
+                fragment_dir = config.layout.fragments_dir / seed.tag
+                ensure_dir(fragment_dir)
+                raw_ll.write_text("; dry-run raw placeholder\n", encoding="utf-8")
+                dummy_results.append(
+                    {
+                        "shard_id": shard.shard_id,
+                        "tag": seed.tag,
+                        "name": seed.name,
+                        "start": seed.start,
+                        "entry_pc": config.runnable_base + seed.start,
+                        "size": seed.size,
+                        "status": "ok",
+                        "rc": 0,
+                        "elapsed_sec": 0.0,
+                        "workers_spawned": 0,
+                        "raw_ll": str(raw_ll),
+                        "merged_ll": str(merged_ll),
+                        "fragment_dir": str(fragment_dir),
+                        "stdout_log": str(config.layout.shard_logs_dir / f"{seed.tag}.stdout.log"),
+                        "stderr_log": str(config.layout.shard_logs_dir / f"{seed.tag}.stderr.log"),
+                        "merge_summary": None,
+                    }
+                )
+        run_summary_jsonl.write_text(
+            "".join(json.dumps(item, sort_keys=True) + "\n" for item in dummy_results),
+            encoding="utf-8",
+        )
+        write_summary(run_summary_json, {"results": dummy_results})
+        summary_path.write_text(
+            json.dumps(
+                {
+                    "shard_count": len(shards),
+                    "seed_count": sum(shard.seed_count for shard in shards),
+                    "results_json": str(run_summary_json),
+                    "results_jsonl": str(run_summary_jsonl),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        return {
+            "rc": 0,
+            "elapsed_sec": time.time() - started,
+            "results_json": str(run_summary_json),
+            "results_jsonl": str(run_summary_jsonl),
+            "summary_path": str(summary_path),
+            "stdout_log": str(stdout_log),
+            "stderr_log": str(stderr_log),
+        }
+
+    result = docker_exec_shell(
+        container_name,
+        shell_script,
+        capture_output=False,
+        check=False,
+    )
+    return {
+        "rc": result.returncode,
+        "elapsed_sec": time.time() - started,
+        "results_json": str(run_summary_json),
+        "results_jsonl": str(run_summary_jsonl),
+        "summary_path": str(summary_path),
+        "stdout_log": str(stdout_log),
+        "stderr_log": str(stderr_log),
+    }
+
+
+def start_shard_runner_process(
+    *,
+    config: LiftConfig,
+    runtime: Dict[str, str],
+    container_name: str,
+    binary_path: Path,
+    shards: Sequence[LiftShard],
+) -> subprocess.Popen[str]:
+    runner_path = SHARD_RUNNER_SCRIPT
+    if not runner_path.exists():
+        raise FileNotFoundError(runner_path)
+    manifest_path = config.layout.shard_manifests_dir / "shards.json"
+    summary_path = config.layout.shard_dir / "shard-runner-summary.json"
+    stdout_log = config.layout.shard_logs_dir / "runner.stdout.log"
+    stderr_log = config.layout.shard_logs_dir / "runner.stderr.log"
+    run_summary_json = config.layout.shard_dir / "shard-results.json"
+    run_summary_jsonl = config.layout.shard_dir / "shard-results.jsonl"
+
+    container_runner = map_host_path_to_container(config, runner_path)
+    container_binary = map_host_path_to_container(config, binary_path)
+    container_manifest = map_host_path_to_container(config, manifest_path)
+    container_raw_dir = map_host_path_to_container(config, config.layout.raw_dir)
+    container_fragment_root = map_host_path_to_container(config, config.layout.fragments_dir)
+    container_merged_dir = map_host_path_to_container(config, config.layout.shard_merged_dir)
+    container_logs_dir = map_host_path_to_container(config, config.layout.shard_logs_dir)
+    container_summary = map_host_path_to_container(config, summary_path)
+    container_results_json = map_host_path_to_container(config, run_summary_json)
+    container_results_jsonl = map_host_path_to_container(config, run_summary_jsonl)
+    container_stdout = map_host_path_to_container(config, stdout_log)
+    container_stderr = map_host_path_to_container(config, stderr_log)
+
+    command = [
+        "python3",
+        container_runner,
+        "--manifest",
+        container_manifest,
+        "--binary",
+        container_binary,
+        "--raw-dir",
+        container_raw_dir,
+        "--fragment-root",
+        container_fragment_root,
+        "--merged-dir",
+        container_merged_dir,
+        "--logs-dir",
+        container_logs_dir,
+        "--results-json",
+        container_results_json,
+        "--results-jsonl",
+        container_results_jsonl,
+        "--summary-out",
+        container_summary,
+        "--runnable-base",
+        hex(config.runnable_base),
+        "--parallel-workers",
+        str(config.requested_parallel_workers),
+        "--shard-concurrency",
+        str(config.shard_concurrency),
+        "--timeout-sec",
+        str(config.lift_timeout_sec),
+    ]
+    if config.preserve_success_seed_logs:
+        command.append("--preserve-success-seed-logs")
+    for flag in config.coordinator_flags:
+        if not str(flag).strip():
+            continue
+        command.append(f"--coordinator-flag={flag}")
+
+    shell_script = f"""
+set -euo pipefail
+mkdir -p {shlex.quote(container_logs_dir)} {shlex.quote(container_merged_dir)} {shlex.quote(container_fragment_root)} {shlex.quote(container_raw_dir)}
+{{ {' '.join(shlex.quote(part) for part in command)}; }} >{shlex.quote(container_stdout)} 2>{shlex.quote(container_stderr)}
+"""
+    cmd = ["docker", "exec", container_name, "bash", "-lc", shell_script]
+    if config.dry_run:
+        stdout_log.write_text(shell_script, encoding="utf-8")
+        stderr_log.write_text("", encoding="utf-8")
+        raise RuntimeError("background shard runner is not supported in dry-run mode")
+    return subprocess.Popen(
+        cmd,
+        cwd=str(config.repo_root),
+        text=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def load_seed_results(path: Path) -> List[Dict[str, object]]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    return list(payload.get("results", []))
+
+
+def load_results_payload(path: Path) -> Dict[str, object]:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def merge_module_paths(
+    config: LiftConfig,
+    *,
+    inputs: Sequence[Path],
+    entry_pc: int,
+    final_output: Path,
+    summary_name: str,
+    summary_out_path: Optional[Path] = None,
+) -> Dict[str, object]:
+    if not inputs:
+        raise RuntimeError("no successful lift outputs to merge")
+    summary_out = summary_out_path if summary_out_path is not None else config.layout.manifests_dir / summary_name
+    batch_dir = config.layout.manifests_dir / "merge-batches"
+    ensure_dir(batch_dir)
+    batch_size = 128
+    entry_pc_hex = hex(entry_pc)
+    merge_invocation_id = hashlib.sha1(
+        "\n".join(
+            [
+                str(final_output),
+                str(summary_out),
+                *(str(path) for path in inputs),
+            ]
+        ).encode("utf-8")
+    ).hexdigest()[:12]
+    current_inputs = inputs
+    round_index = 0
+    while len(current_inputs) > 1:
+        next_inputs: List[Path] = []
+        for batch_index in range(0, len(current_inputs), batch_size):
+            batch = current_inputs[batch_index:batch_index + batch_size]
+            batch_output = batch_dir / (
+                f"round{round_index:02d}-batch{batch_index // batch_size:04d}-{merge_invocation_id}.ll"
+            )
+            batch_summary = batch_dir / (
+                f"round{round_index:02d}-batch{batch_index // batch_size:04d}-{merge_invocation_id}.json"
+            )
+            cmd = [
+                "python3",
+                str(config.repo_root / "runnable" / "scripts" / "merge_dynamic_runnable_fragments.py"),
+                "--output",
+                str(batch_output),
+                "--entry-pc",
+                entry_pc_hex,
+                "--summary-out",
+                str(batch_summary),
+            ]
+            cmd.extend(str(path) for path in batch)
+            if config.dry_run:
+                batch_output.write_text("; dry-run batch merge placeholder\n", encoding="utf-8")
+            else:
+                run_cmd(cmd, cwd=config.repo_root, capture_output=False)
+            next_inputs.append(batch_output)
+        current_inputs = next_inputs
+        round_index += 1
+
+    if config.dry_run:
+        final_output.write_text("; dry-run final merge placeholder\n", encoding="utf-8")
+    else:
+        run_cmd(["cp", str(current_inputs[0]), str(final_output)], capture_output=False)
+    payload = {
+        "final_ll": str(final_output),
+        "summary_out": str(summary_out),
+        "inputs": [str(path) for path in inputs],
+        "merge_rounds": round_index,
+    }
+    write_summary(summary_out, payload)
+    return payload
+
+
+def promote_existing_merge_output(
+    config: LiftConfig,
+    *,
+    source_output: Path,
+    final_output: Path,
+    summary_name: str,
+    source_kind: str,
+) -> Dict[str, object]:
+    summary_out = config.layout.manifests_dir / summary_name
+    ensure_dir(final_output.parent)
+    if config.dry_run:
+        final_output.write_text("; dry-run final merge placeholder\n", encoding="utf-8")
+    else:
+        run_cmd(["cp", str(source_output), str(final_output)], capture_output=False)
+    payload = {
+        "final_ll": str(final_output),
+        "frontier_output": str(source_output),
+        "inputs": [str(source_output)],
+        "merge_rounds": 0,
+        "source_kind": source_kind,
+        "summary_out": str(summary_out),
+    }
+    write_summary(summary_out, payload)
+    return payload
+
+
+def merge_seed_modules(config: LiftConfig, seed_results: Sequence[Dict[str, object]], final_output: Path) -> Dict[str, object]:
+    ok_items = [item for item in seed_results if item["status"] == "ok"]
+    if not ok_items:
+        raise RuntimeError("no successful seed lifts to merge")
+    payload = merge_module_paths(
+        config,
+        inputs=[Path(item["merged_ll"]) for item in sorted(ok_items, key=lambda item: item["start"])],
+        entry_pc=int(ok_items[0]["entry_pc"]),
+        final_output=final_output,
+        summary_name="final-merge.summary.json",
+    )
+    payload["successful_seed_count"] = len(ok_items)
+    return payload
+
+
+def merge_shard_modules(
+    config: LiftConfig,
+    *,
+    shard_summaries: Sequence[Dict[str, object]],
+    seed_results: Sequence[Dict[str, object]],
+    final_output: Path,
+) -> Dict[str, object]:
+    successful_shards = [
+        item for item in shard_summaries
+        if item.get("status") in {"ok", "partial"} and Path(str(item["merged_ll"])).exists()
+    ]
+    if not successful_shards:
+        raise RuntimeError("no successful shard lifts to merge")
+    successful_seeds = [item for item in seed_results if item["status"] == "ok"]
+    if not successful_seeds:
+        raise RuntimeError("no successful seed lifts available for shard merge entry point")
+    payload = merge_module_paths(
+        config,
+        inputs=[Path(str(item["merged_ll"])) for item in sorted(successful_shards, key=lambda item: int(item["start"]))],
+        entry_pc=int(successful_seeds[0]["entry_pc"]),
+        final_output=final_output,
+        summary_name="final-shard-merge.summary.json",
+    )
+    payload["successful_shard_count"] = len(successful_shards)
+    payload["successful_seed_count"] = len(successful_seeds)
+    return payload
+
+
+def run_canonical_cmp(
+    *,
+    config: LiftConfig,
+    binary: Path,
+    groundtruth_pb: Path,
+    ll_path: Path,
+    cmp_tool: Path,
+    blocks_pb2: Path,
+) -> Dict[str, object]:
+    out_dir = config.layout.eval_dir
+    ensure_dir(out_dir)
+    cmd = [
+        "python3",
+        str(config.repo_root / "runnable" / "scripts" / "validate_libcrypto_ground_truth.py"),
+        "cmp",
+        "--binary",
+        str(binary),
+        "--groundtruth",
+        str(groundtruth_pb),
+        "--blocks-pb2",
+        str(blocks_pb2),
+        "--ll",
+        str(ll_path),
+        "--run-cmp-eval",
+        str(cmp_tool),
+        "--text-start",
+        hex(detect_text_start(binary)),
+        "--runnable-base",
+        hex(config.runnable_base),
+        "--out-dir",
+        str(out_dir),
+        "--allow-low-metrics",
+    ]
+    if config.dry_run:
+        return {"cmd": cmd, "status": "dry-run"}
+    result = run_cmd(cmd, cwd=config.repo_root, capture_output=True, check=False)
+    (out_dir / "cmp.stdout.log").write_text(result.stdout, encoding="utf-8")
+    (out_dir / "cmp.stderr.log").write_text(result.stderr, encoding="utf-8")
+    verdict = out_dir / "cmp.verdict.txt"
+    payload = {
+        "cmd": cmd,
+        "rc": result.returncode,
+        "verdict": str(verdict) if verdict.exists() else None,
+        "cmp_json": str(out_dir / "cmp.json"),
+        "cmp_txt": str(out_dir / "cmp.txt"),
+    }
+    return payload
+
+
+def write_summary(path: Path, payload: Dict[str, object]) -> None:
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    args = build_parser().parse_args(argv)
+    config = load_config(args)
+    materialize_layout(config.layout)
+    mark_run_state(config.layout, "running")
+
+    try:
+        artifact_paths = groundtruth_artifact_paths(config)
+        ensure_groundtruth(config, artifact_paths)
+
+        binary_path = artifact_paths["binary"]
+        groundtruth_pb = artifact_paths["protobuf"]
+        if not binary_path.exists() or not groundtruth_pb.exists():
+            raise FileNotFoundError("canonical libcrypto artifacts are missing")
+
+        seeds = readelf_function_seeds(binary_path, config.min_function_size)
+        if config.seed_start is not None:
+            seeds = [seed for seed in seeds if seed.start == config.seed_start]
+        if config.max_seeds > 0:
+            seeds = seeds[: config.max_seeds]
+        if not seeds:
+            raise RuntimeError("no function seeds discovered from libcrypto symbol tables")
+
+        write_seed_manifest(config.layout.manifests_dir / "seed-functions.json", seeds)
+        write_seed_csv(config.layout.manifests_dir / "seed-functions.csv", seeds)
+
+        runnable_lift, install_prefix, lift_reason = resolve_runnable_lift(config)
+        runtime = build_container_runtime(config, install_prefix)
+        log(f"using runnable-lift at {runnable_lift} ({lift_reason})")
+        log(
+            "memory plan: "
+            f"container_limit_gb={config.container_memory_limit_gb} "
+            f"parallel_workers={config.requested_parallel_workers} "
+            f"shard_concurrency={config.shard_concurrency} "
+            f"container_cpus={config.container_cpus}"
+        )
+
+        seed_results: List[Dict[str, object]]
+        shard_summaries: List[Dict[str, object]] = []
+        shard_payload: Dict[str, object] = {"status": "unused"}
+        planned_shards: Optional[List[LiftShard]] = None
+        if config.execution_model == "legacy-seed-docker":
+            seed_results = []
+            with ThreadPoolExecutor(max_workers=config.max_concurrent_coordinators) as executor:
+                futures = {
+                    executor.submit(
+                        run_dynamic_lift_for_seed,
+                        config=config,
+                        runtime=runtime,
+                        binary_path=binary_path,
+                        seed=seed,
+                    ): seed
+                    for seed in seeds
+                }
+                for future in as_completed(futures):
+                    seed = futures[future]
+                    result = future.result()
+                    seed_results.append(result)
+                    log(
+                        f"{seed.tag} status={result['status']} rc={result['rc']} "
+                        f"workers_spawned={result['workers_spawned']} elapsed_sec={result['elapsed_sec']:.1f}"
+                    )
+        else:
+            planned_shards = plan_shards(config, seeds)
+            write_shard_manifests(config.layout, planned_shards)
+            log(
+                f"planned {len(planned_shards)} shards from {len(seeds)} seeds "
+                f"(byte_budget={config.shard_byte_budget}, shard_max_seeds={config.shard_max_seeds})"
+            )
+            container_name = start_long_lived_container(config, runtime)
+            write_summary(
+                config.layout.current_run / "container.json",
+                {
+                    "container_name": container_name,
+                    "execution_model": config.execution_model,
+                    "memory_limit_gb": config.container_memory_limit_gb,
+                    "container_cpus": config.container_cpus,
+                    "streaming_merge": config.streaming_merge,
+                    "merge_workers": config.merge_workers,
+                    "merge_batch_size": config.merge_batch_size,
+                },
+            )
+            try:
+                if config.dry_run or not config.streaming_merge:
+                    shard_payload = run_shard_runner(
+                        config=config,
+                        runtime=runtime,
+                        container_name=container_name,
+                        binary_path=binary_path,
+                        shards=planned_shards,
+                    )
+                    results_payload = load_results_payload(Path(shard_payload["results_json"]))
+                    seed_results = host_merge_seed_results(config, list(results_payload.get("results", [])))
+                    shard_summaries = host_merge_shards_from_seed_results(
+                        config,
+                        shard_summaries=list(results_payload.get("shards", [])),
+                        seed_results=seed_results,
+                    )
+                else:
+                    shard_runner_proc = start_shard_runner_process(
+                        config=config,
+                        runtime=runtime,
+                        container_name=container_name,
+                        binary_path=binary_path,
+                        shards=planned_shards,
+                    )
+                    seed_results, shard_summaries, merge_progress_payload = run_streaming_merge_scheduler(
+                        config,
+                        shard_runner_proc=shard_runner_proc,
+                        shard_results_jsonl=config.layout.shard_dir / "shard-results.jsonl",
+                        planned_shards=planned_shards,
+                    )
+                    shard_payload = {
+                        "rc": int(merge_progress_payload["rc"]),
+                        "elapsed_sec": None,
+                        "results_json": str(config.layout.shard_dir / "shard-results.json"),
+                        "results_jsonl": str(config.layout.shard_dir / "shard-results.jsonl"),
+                        "summary_path": str(config.layout.shard_dir / "shard-runner-summary.json"),
+                        "stdout_log": str(config.layout.shard_logs_dir / "runner.stdout.log"),
+                        "stderr_log": str(config.layout.shard_logs_dir / "runner.stderr.log"),
+                        "merge_progress": merge_progress_payload,
+                    }
+            finally:
+                docker_rm_force(container_name)
+            if int(shard_payload["rc"]) != 0:
+                raise RuntimeError(
+                    f"shard runner failed rc={shard_payload['rc']} "
+                    f"see {shard_payload['stdout_log']} and {shard_payload['stderr_log']}"
+                )
+            for result in seed_results:
+                log(
+                    f"{result['tag']} shard={result.get('shard_id')} status={result['status']} "
+                    f"rc={result['rc']} workers_spawned={result['workers_spawned']} "
+                    f"elapsed_sec={float(result['elapsed_sec']):.1f}"
+                )
+
+        seed_results.sort(key=lambda item: item["start"])
+        write_summary(config.layout.manifests_dir / "seed-results.json", {"results": seed_results})
+
+        final_ll = config.layout.current_run / "libcrypto.dynamic.parallel.ll"
+        if config.execution_model == "legacy-seed-docker":
+            merge_payload = merge_seed_modules(config, seed_results, final_ll)
+        else:
+            write_summary(config.layout.manifests_dir / "shard-results.json", {"shards": shard_summaries})
+            successful_shards = ready_shard_merge_inputs(shard_summaries)
+            successful_seed_count = sum(1 for item in seed_results if item["status"] == "ok")
+            if config.streaming_merge and not config.dry_run:
+                frontier_output = None
+                if isinstance(shard_payload.get("merge_progress"), dict):
+                    raw_frontier = shard_payload["merge_progress"].get("final_frontier_output")
+                    if raw_frontier:
+                        frontier_output = Path(str(raw_frontier))
+                if frontier_output is not None and frontier_output.exists():
+                    merge_payload = promote_existing_merge_output(
+                        config,
+                        source_output=frontier_output,
+                        final_output=final_ll,
+                        summary_name="final-shard-merge.summary.json",
+                        source_kind="incremental-frontier",
+                    )
+                else:
+                    merge_payload = merge_shard_modules(
+                        config,
+                        shard_summaries=shard_summaries,
+                        seed_results=seed_results,
+                        final_output=final_ll,
+                    )
+            else:
+                merge_payload = merge_shard_modules(
+                    config,
+                    shard_summaries=shard_summaries,
+                    seed_results=seed_results,
+                    final_output=final_ll,
+                )
+            merge_payload["successful_shard_count"] = len(successful_shards)
+            merge_payload["successful_seed_count"] = successful_seed_count
+        write_summary(config.layout.manifests_dir / "final-merge.json", merge_payload)
+
+        cmp_payload: Dict[str, object] = {"status": "skipped"}
+        if not config.skip_cmp:
+            cmp_payload = run_canonical_cmp(
+                config=config,
+                binary=binary_path,
+                groundtruth_pb=groundtruth_pb,
+                ll_path=final_ll,
+                cmp_tool=artifact_paths["cmp_tool"],
+                blocks_pb2=artifact_paths["blocks_pb2"],
+            )
+            write_summary(config.layout.manifests_dir / "canonical-cmp.json", cmp_payload)
+
+        final_summary = {
+            "run_label": config.run_label,
+            "run_root": str(config.layout.current_run),
+            "binary": str(binary_path),
+            "groundtruth_pb": str(groundtruth_pb),
+            "final_ll": str(final_ll),
+            "seed_count": len(seeds),
+            "shard_count": len(planned_shards) if planned_shards is not None else None,
+            "successful_seed_count": sum(1 for item in seed_results if item["status"] == "ok"),
+            "parallel_workers": config.requested_parallel_workers,
+            "max_concurrent_coordinators": config.max_concurrent_coordinators,
+            "shard_concurrency": config.shard_concurrency,
+            "container_memory_limit_gb": config.container_memory_limit_gb,
+            "container_cpus": config.container_cpus,
+            "execution_model": config.execution_model,
+            "streaming_merge": config.streaming_merge,
+            "shard_runner": shard_payload,
+            "merge_progress": json.loads(merge_state_paths(config.layout)["progress"].read_text(encoding="utf-8"))
+            if merge_state_paths(config.layout)["progress"].exists()
+            else None,
+            "cmp": cmp_payload,
+        }
+        write_summary(config.layout.current_run / "run-summary.json", final_summary)
+        mark_run_state(config.layout, "ok")
+        write_exit_code(config.layout, 0)
+        print(json.dumps(final_summary, indent=2, sort_keys=True))
+        return 0
+    except Exception as exc:
+        write_exit_code(config.layout, 1)
+        mark_run_state(config.layout, "failed", f"error={type(exc).__name__}")
+        raise
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
