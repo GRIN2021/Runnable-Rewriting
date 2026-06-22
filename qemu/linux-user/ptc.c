@@ -451,7 +451,9 @@ void ptc_init(const char *filename, const char *exe_args){
      */
 
     target_argc = 1;
-    target_argv = calloc(target_argc, sizeof (char *));
+    /* Reserve one extra slot for the mandatory NULL terminator even when
+     * exe_args is empty. */
+    target_argv = calloc(target_argc + 1, sizeof (char *));
     if (target_argv == NULL) {
 	(void) fprintf(stderr, "Unable to allocate memory for target_argv\n");
 	exit(1);
@@ -1744,6 +1746,11 @@ void ptc_disassemble(FILE *output, uint32_t buffer, size_t buffer_size,
     fseek(output,0,SEEK_SET);
     fwrite(C,sizeof(C),1,output);
   }
+}
+
+int ptc_disassemble_bytes(FILE *output, const uint8_t *buffer,
+                          size_t buffer_size, int flags) {
+  return buffer_disas_insn(output, buffer, buffer_size, flags);
 }
 
 void initArchCPUStateQueueLine(void){

@@ -8,6 +8,7 @@
 // Standard includes
 #include <memory>
 #include <type_traits>
+#include <utility>
 
 // Local libraries includes
 #include "runnable/Support/runnable.h"
@@ -25,6 +26,70 @@ using PTCInstructionListPtr = std::unique_ptr<PTCInstructionList,
                                               PTCDestructor>;
 
 extern PTCInterface ptc;
+
+namespace ptc_compat {
+
+template<typename T>
+auto queueDepthImpl(T &Interface, int)
+  -> decltype(Interface.queueDepth(), uint32_t()) {
+  return Interface.queueDepth();
+}
+
+template<typename T>
+uint32_t queueDepthImpl(T &, long) {
+  return 0;
+}
+
+inline uint32_t queueDepth(PTCInterface &Interface) {
+  return queueDepthImpl(Interface, 0);
+}
+
+template<typename T>
+auto dropCPUStateImpl(T &Interface, int)
+  -> decltype(Interface.dropCPUState(), uint32_t()) {
+  return Interface.dropCPUState();
+}
+
+template<typename T>
+uint32_t dropCPUStateImpl(T &, long) {
+  return 0;
+}
+
+inline uint32_t dropCPUState(PTCInterface &Interface) {
+  return dropCPUStateImpl(Interface, 0);
+}
+
+template<typename T>
+auto supportsQueueDepthImpl(int)
+  -> decltype(std::declval<T &>().queueDepth(), std::true_type()) {
+  return std::true_type();
+}
+
+template<typename T>
+std::false_type supportsQueueDepthImpl(long) {
+  return std::false_type();
+}
+
+inline bool supportsQueueDepth() {
+  return decltype(supportsQueueDepthImpl<PTCInterface>(0))::value;
+}
+
+template<typename T>
+auto supportsDropCPUStateImpl(int)
+  -> decltype(std::declval<T &>().dropCPUState(), std::true_type()) {
+  return std::true_type();
+}
+
+template<typename T>
+std::false_type supportsDropCPUStateImpl(long) {
+  return std::false_type();
+}
+
+inline bool supportsDropCPUState() {
+  return decltype(supportsDropCPUStateImpl<PTCInterface>(0))::value;
+}
+
+} // namespace ptc_compat
 
 #define RAX 97120 
 #define RCX 99120

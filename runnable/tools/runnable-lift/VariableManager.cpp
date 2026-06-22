@@ -36,6 +36,8 @@
 
 using namespace llvm;
 
+static Logger<> VMStateLog("vm-state");
+
 // TODO: rename
 cl::opt<bool> External("external",
                        cl::desc("set CSVs linkage to external, useful for "
@@ -243,6 +245,15 @@ VariableManager::VariableManager(Module &TheModule,
       }
     }
   }
+
+  runnable_log(VMStateLog,
+               "CPUStateType=" << CPUStateType->getName().str()
+                               << " EnvOffset=" << EnvOffset
+                               << " ptc.pc=" << ptc.pc
+                               << " ptc.sp=" << ptc.sp
+                               << " initialized_env="
+                               << static_cast<const void *>(ptc.initialized_env)
+                               << DoLog);
 }
 
 bool VariableManager::storeToCPUStateOffset(IRBuilder<> &Builder,
@@ -662,8 +673,15 @@ VariableManager::getByCPUStateOffsetInternal(intptr_t Offset,
     }
 
     // TODO: offset could be negative, we could segfault here
-    auto *InitialValue = fromBytes(cast<IntegerType>(VariableType),
-                                   ptc.initialized_env - EnvOffset + Offset);
+    auto *InitialData = ptc.initialized_env - EnvOffset + Offset;
+    runnable_log(VMStateLog,
+                 "offset=" << Offset
+                           << " remaining=" << Remaining
+                           << " name=" << Name
+                           << " initial_data="
+                           << static_cast<const void *>(InitialData)
+                           << DoLog);
+    auto *InitialValue = fromBytes(cast<IntegerType>(VariableType), InitialData);
 
     auto *NewVariable = new GlobalVariable(TheModule,
                                            VariableType,

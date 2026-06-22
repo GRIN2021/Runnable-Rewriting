@@ -98,6 +98,10 @@ opt<unsigned long long> ParallelSeedPC("parallel-seed-pc",
 opt<string> ParallelFragmentDir("parallel-fragment-dir",
                                 desc("fragment output directory"),
                                 cat(MainCategory));
+opt<bool> KeepWorkerFragments("keep-worker-fragments",
+                              desc("preserve worker fragment files after merge (for debugging)"),
+                              cat(MainCategory),
+                              init(false));
 
 } // namespace
 
@@ -232,6 +236,7 @@ int main(int argc, const char *argv[]) {
   Options.FragmentDir = ParallelFragmentDir;
   Options.InputPath = InputPath;
   Options.ExecutableArgs = ExecutableArgs;
+  Options.KeepWorkerFragments = KeepWorkerFragments;
   CodeGenerator Generator(TheBinary,
                           TargetArchitecture,
                           RevambGlobalContext,

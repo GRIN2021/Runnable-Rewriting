@@ -310,6 +310,96 @@ int target_disas_max2(FILE *out, CPUState *cpu, target_ulong code,
     }
     return 0;
 }
+
+int buffer_disas_insn(FILE *out, const void *buffer,
+                      target_ulong size, int flags)
+{
+    int count;
+    CPUDebug s;
+    int (*print_insn)(bfd_vma pc, disassemble_info *info) = NULL;
+
+    INIT_DISASSEMBLE_INFO(s.info, out, fprintf);
+    s.info.read_memory_func = buffer_read_memory;
+    s.info.buffer = buffer;
+    s.info.buffer_vma = 0;
+    s.info.buffer_length = size;
+    s.info.print_address_func = generic_print_host_address;
+
+#ifdef TARGET_WORDS_BIGENDIAN
+    s.info.endian = BFD_ENDIAN_BIG;
+#else
+    s.info.endian = BFD_ENDIAN_LITTLE;
+#endif
+
+#if defined(TARGET_I386)
+    if (flags == 2) {
+        s.info.mach = bfd_mach_x86_64;
+    } else if (flags == 1) {
+        s.info.mach = bfd_mach_i386_i8086;
+    } else {
+        s.info.mach = bfd_mach_i386_i386;
+    }
+    print_insn = print_insn_i386;
+#elif defined(TARGET_SPARC)
+    print_insn = print_insn_sparc;
+#ifdef TARGET_SPARC64
+    s.info.mach = bfd_mach_sparc_v9b;
+#endif
+#elif defined(TARGET_PPC)
+    if ((flags >> 16) & 1) {
+        s.info.endian = BFD_ENDIAN_LITTLE;
+    }
+    if (flags & 0xFFFF) {
+        s.info.mach = flags & 0xFFFF;
+    } else {
+#ifdef TARGET_PPC64
+        s.info.mach = bfd_mach_ppc64;
+#else
+        s.info.mach = bfd_mach_ppc;
+#endif
+    }
+    s.info.disassembler_options = (char *)"any";
+    print_insn = print_insn_ppc;
+#elif defined(TARGET_M68K)
+    print_insn = print_insn_m68k;
+#elif defined(TARGET_MIPS)
+#ifdef TARGET_WORDS_BIGENDIAN
+    print_insn = print_insn_big_mips;
+#else
+    print_insn = print_insn_little_mips;
+#endif
+#elif defined(TARGET_SH4)
+    s.info.mach = bfd_mach_sh4;
+    print_insn = print_insn_sh;
+#elif defined(TARGET_ALPHA)
+    s.info.mach = bfd_mach_alpha_ev6;
+    print_insn = print_insn_alpha;
+#elif defined(TARGET_S390X)
+    s.info.mach = bfd_mach_s390_64;
+    print_insn = print_insn_s390;
+#elif defined(TARGET_MOXIE)
+    s.info.mach = bfd_arch_moxie;
+    print_insn = print_insn_moxie;
+#elif defined(TARGET_LM32)
+    s.info.mach = bfd_mach_lm32;
+    print_insn = print_insn_lm32;
+#endif
+
+    if (print_insn == NULL) {
+        print_insn = print_insn_od_host;
+    }
+
+    fprintf(out, "0x%08x:  ", 0);
+    count = print_insn(0, &s.info);
+    fprintf(out, "\n");
+
+    if (disassembler_error) {
+        disassembler_error = 0;
+        return -1;
+    }
+
+    return count;
+}
 #endif
 
 void target_disas_max(FILE *out, CPUState *cpu, target_ulong code,

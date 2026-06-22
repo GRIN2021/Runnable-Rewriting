@@ -14,6 +14,12 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 # This has to be first to get highest priority
 include_directories(include/)
+get_filename_component(REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/.." ABSOLUTE)
+include_directories(BEFORE
+  "${REPO_ROOT}/qemu"
+  "${REPO_ROOT}/qemu/include"
+  "${REPO_ROOT}/qemu/linux-user"
+  "${REPO_ROOT}/qemu/tcg")
 
 # Doxygen
 find_package(Doxygen)
@@ -103,7 +109,11 @@ include_directories("${QEMU_INSTALL_PATH}/include/")
 #
 
 # Basic compiler options
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++14 -Wall -Werror")
+option(RUNNABLE_STRICT_WARNINGS "Treat runnable C++ warnings as errors." ON)
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++14 -Wall")
+if(RUNNABLE_STRICT_WARNINGS)
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Werror")
+endif()
 
 # Additional compiler options
 include(CheckCXXCompilerFlag)

@@ -18,6 +18,7 @@
  */
 
 #include <math.h>
+#include <string.h>
 #include "cpu.h"
 #include "exec/helper-proto.h"
 #include "qemu/host-utils.h"
@@ -1308,6 +1309,23 @@ void helper_emms(CPUX86State *env)
     env->fptags[5] = 1;
     env->fptags[6] = 1;
     env->fptags[7] = 1;
+}
+
+void helper_avx_vzeroupper(CPUX86State *env)
+{
+    int reg;
+    int part;
+
+    for (reg = 0; reg < ARRAY_SIZE(env->xmm_regs); reg++) {
+        for (part = 2; part < 8; part++) {
+            env->xmm_regs[reg].XMM_Q(part) = 0;
+        }
+    }
+}
+
+void helper_avx_vzeroall(CPUX86State *env)
+{
+    memset(env->xmm_regs, 0, sizeof(env->xmm_regs));
 }
 
 /* XXX: suppress */

@@ -144,6 +144,86 @@ typedef struct DisasContext {
     int cpuid_7_0_ebx_features;
 } DisasContext;
 
+static int ptc_modrm_bytes(CPUX86State *env, target_ulong pc, TCGMemOp aflag)
+{
+    int modrm = cpu_ldub_code(env, pc);
+    int mod = (modrm >> 6) & 3;
+    int rm = modrm & 7;
+    int length = 1;
+
+    if (mod == 3) {
+        return length;
+    }
+
+    if (aflag == MO_16) {
+        if (mod == 0 && rm == 6) {
+            length += 2;
+        } else if (mod == 1) {
+            length += 1;
+        } else if (mod == 2) {
+            length += 2;
+        }
+        return length;
+    }
+
+    if (rm == 4) {
+        int sib = cpu_ldub_code(env, pc + length);
+        length++;
+        rm = sib & 7;
+        if (mod == 0 && rm == 5) {
+            length += 4;
+        }
+    } else if (mod == 0 && rm == 5) {
+        length += 4;
+    }
+
+    if (mod == 1) {
+        length += 1;
+    } else if (mod == 2) {
+        length += 4;
+    }
+
+    return length;
+}
+
+static int ptc_evex_tail_bytes(CPUX86State *env,
+                               target_ulong pc,
+                               TCGMemOp aflag,
+                               int p0,
+                               int p1,
+                               int opcode)
+{
+    int map = p0 & 0x3;
+    int pp = p1 & 0x3;
+    int length = ptc_modrm_bytes(env, pc, aflag);
+
+    switch (map) {
+    case 1: /* 0f */
+        if (pp == 1 && opcode == 0xef) {
+            return length;
+        }
+        if ((opcode == 0x6f || opcode == 0x7f)
+            && (pp == 1 || pp == 2 || pp == 3)) {
+            return length;
+        }
+        break;
+    case 2: /* 0f 38 */
+        if (pp == 1 && (opcode == 0x00 || opcode == 0x1a || opcode == 0xdc)) {
+            return length;
+        }
+        break;
+    case 3: /* 0f 3a */
+        if (pp == 1 && (opcode == 0x25 || opcode == 0x39 || opcode == 0x44)) {
+            return length + 1;
+        }
+        break;
+    default:
+        break;
+    }
+
+    return -1;
+}
+
 static void gen_eob(DisasContext *s);
 static void gen_jmp(DisasContext *s, target_ulong eip);
 static void gen_jmp_tb(DisasContext *s, target_ulong eip, int tb_num);
@@ -3046,8 +3126,16 @@ static void gen_sse(CPUX86State *env, DisasContext *s, int b,
         return;
     }
     if (b == 0x77) {
-        /* emms */
-        gen_helper_emms(cpu_env);
+        if (s->prefix & PREFIX_VEX) {
+            if (s->vex_l != 0) {
+                gen_helper_avx_vzeroall(cpu_env);
+            } else {
+                gen_helper_avx_vzeroupper(cpu_env);
+            }
+        } else {
+            /* emms */
+            gen_helper_emms(cpu_env);
+        }
         return;
     }
     /* prepare MMX state (XXX: optimize by storing fptt and fptags in
@@ -4429,6 +4517,10 @@ static target_ulong disas_insn(CPUX86State *env, DisasContext *s,
     int modrm, reg, rm, mod, op, opreg, val;
     target_ulong next_eip, tval;
     int rex_w, rex_r;
+    int evex_p0 = 0, evex_p1 = 0;
+    static const int pp_prefix[4] = {
+        0, PREFIX_DATA, PREFIX_REPZ, PREFIX_REPNZ
+    };
 
     if (unlikely(qemu_loglevel_mask(CPU_LOG_TB_OP | CPU_LOG_TB_OP_OPT))) {
         tcg_gen_debug_insn_start(pc_start);
@@ -4499,12 +4591,8 @@ static target_ulong disas_insn(CPUX86State *env, DisasContext *s,
 #endif
     case 0xc5: /* 2-byte VEX */
     case 0xc4: /* 3-byte VEX */
-        /* VEX prefixes cannot be used except in 32-bit mode.
-           Otherwise the instruction is LES or LDS.  */
-        if (s->code32 && !s->vm86) {
-            static const int pp_prefix[4] = {
-                0, PREFIX_DATA, PREFIX_REPZ, PREFIX_REPNZ
-            };
+        /* In 16-bit mode these bytes are legacy LES/LDS. */
+        if ((s->code32 || CODE64(s)) && !s->vm86) {
             int vex3, vex2 = cpu_ldub_code(env, s->pc);
 
             if (!CODE64(s) && (vex2 & 0xc0) != 0xc0) {
@@ -4527,7 +4615,7 @@ static target_ulong disas_insn(CPUX86State *env, DisasContext *s,
             rex_r = (~vex2 >> 4) & 8;
             if (b == 0xc5) {
                 vex3 = vex2;
-                b = cpu_ldub_code(env, s->pc++);
+                b = cpu_ldub_code(env, s->pc++) | 0x100;
             } else {
 #ifdef TARGET_X86_64
                 s->rex_x = (~vex2 >> 3) & 8;
@@ -4552,6 +4640,38 @@ static target_ulong disas_insn(CPUX86State *env, DisasContext *s,
             s->vex_v = (~vex3 >> 3) & 0xf;
             s->vex_l = (vex3 >> 2) & 1;
             prefixes |= pp_prefix[vex3 & 3] | PREFIX_VEX;
+        }
+        break;
+    case 0x62: /* EVEX or bound */
+        if (CODE64(s) && !s->vm86) {
+            int p0 = cpu_ldub_code(env, s->pc);
+            int p1 = cpu_ldub_code(env, s->pc + 1);
+            int p2 = cpu_ldub_code(env, s->pc + 2);
+
+            if ((p0 & 0x3) != 0
+                && (p0 & 0x0c) == 0
+                && (p1 & 0x04) != 0) {
+                if (prefixes & (PREFIX_REPZ | PREFIX_REPNZ
+                                | PREFIX_LOCK | PREFIX_DATA)) {
+                    goto illegal_op;
+                }
+#ifdef TARGET_X86_64
+                if (x86_64_hregs) {
+                    goto illegal_op;
+                }
+                rex_r = (~p0 >> 4) & 8;
+                s->rex_x = (~p0 >> 3) & 8;
+                s->rex_b = (~p0 >> 2) & 8;
+#endif
+                rex_w = (p1 >> 7) & 1;
+                evex_p0 = p0;
+                evex_p1 = p1;
+                s->vex_v = (~p1 >> 3) & 0xf;
+                s->vex_l = (p2 >> 5) & 1;
+                prefixes |= pp_prefix[p1 & 3] | PREFIX_VEX;
+                s->pc += 3;
+                b = cpu_ldub_code(env, s->pc++) | 0x200;
+            }
         }
         break;
     }
@@ -4593,8 +4713,27 @@ static target_ulong disas_insn(CPUX86State *env, DisasContext *s,
     case 0x0f:
         /**************************/
         /* extended op code */
+        if ((prefixes & PREFIX_REPZ)
+            && cpu_ldub_code(env, s->pc) == 0x1e
+            && cpu_ldub_code(env, s->pc + 1) == 0xfa) {
+            s->pc += 2;
+            break;
+        }
         b = cpu_ldub_code(env, s->pc++) | 0x100;
         goto reswitch;
+    case 0x200 ... 0x2ff: {
+        int tail_bytes = ptc_evex_tail_bytes(env,
+                                             s->pc,
+                                             aflag,
+                                             evex_p0,
+                                             evex_p1,
+                                             b & 0xff);
+        if (tail_bytes < 0) {
+            goto illegal_op;
+        }
+        s->pc += tail_bytes;
+        break;
+    }
 
         /**************************/
         /* arith & logic */
@@ -6595,6 +6734,10 @@ static target_ulong disas_insn(CPUX86State *env, DisasContext *s,
         break;
 
     case 0x190 ... 0x19f: /* setcc Gv */
+        if ((prefixes & PREFIX_VEX) && b <= 0x193) {
+            s->pc += ptc_modrm_bytes(env, s->pc, aflag);
+            break;
+        }
         modrm = cpu_ldub_code(env, s->pc++);
         gen_setcc1(s, b, cpu_T[0]);
         gen_ldst_modrm(env, s, modrm, MO_8, OR_TMP0, 1);
@@ -7892,9 +8035,33 @@ static target_ulong disas_insn(CPUX86State *env, DisasContext *s,
     case 0x10e ... 0x10f:
         /* 3DNow! instructions, ignore prefixes */
         s->prefix &= ~(PREFIX_REPZ | PREFIX_REPNZ | PREFIX_DATA);
+    case 0x138:
+        if (prefixes & PREFIX_VEX) {
+            int opcode = cpu_ldub_code(env, s->pc);
+
+            if (opcode == 0x00 || opcode == 0xdc) {
+                s->pc++;
+                s->pc += ptc_modrm_bytes(env, s->pc, aflag);
+                break;
+            }
+        }
+        gen_sse(env, s, b, pc_start, rex_r);
+        break;
+    case 0x13a:
+        if (prefixes & PREFIX_VEX) {
+            int opcode = cpu_ldub_code(env, s->pc);
+
+            if (opcode == 0x44) {
+                s->pc++;
+                s->pc += ptc_modrm_bytes(env, s->pc, aflag);
+                s->pc++;
+                break;
+            }
+        }
+        gen_sse(env, s, b, pc_start, rex_r);
+        break;
     case 0x110 ... 0x117:
     case 0x128 ... 0x12f:
-    case 0x138 ... 0x13a:
     case 0x150 ... 0x179:
     case 0x17c ... 0x17f:
     case 0x1c2:

@@ -3,6 +3,7 @@ import json
 import tempfile
 import sys
 import unittest
+from concurrent.futures import Future
 from unittest import mock
 from pathlib import Path
 
@@ -41,6 +42,9 @@ class LibcryptoDynamicParallelLiftTests(unittest.TestCase):
         self.assertEqual(args.shard_byte_budget, 4096)
         self.assertEqual(args.shard_max_seeds, 64)
         self.assertTrue(args.streaming_merge)
+        self.assertEqual(args.hdd_min_free_gb, 50.0)
+        self.assertIsNone(args.libtinycode_path)
+        self.assertIsNone(args.libtinycode_helpers_path)
 
     def test_memory_budget_limits_workers_per_coordinator(self):
         module = load_module()
@@ -110,6 +114,79 @@ class LibcryptoDynamicParallelLiftTests(unittest.TestCase):
             ),
             "/hdd-work/runs/demo/out.txt",
         )
+
+    def test_stage_libtinycode_runtime_assets_targets_runtime_search_dir(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            layout = module.build_layout(root, "demo")
+            module.materialize_layout(layout)
+            libtinycode = root / "libtinycode-x86_64.so"
+            helpers = root / "libtinycode-helpers-x86_64.ll"
+            libtinycode.write_text("so\n", encoding="utf-8")
+            helpers.write_text("ll\n", encoding="utf-8")
+            config = module.LiftConfig(
+                workspace_root=Path("/repo/workspace"),
+                repo_root=Path("/repo/workspace/Runnable-Rewriting"),
+                groudtruth_repo_root=Path("/repo/workspace/GroudTruth"),
+                layout=layout,
+                docker_image="rr_bionic_exportfs:2026-04-14",
+                gt_x86_image="bin2415/x86_gt:0.1",
+                gt_py_image="bin2415/py_gt",
+                runnable_base=0x50000000,
+                min_function_size=64,
+                max_seeds=0,
+                seed_start=None,
+                requested_parallel_workers=4,
+                max_concurrent_coordinators=2,
+                worker_memory_gb=3.0,
+                build_memory_gb=16.0,
+                memory_headroom_gb=8.0,
+                container_memory_limit_gb=24.0,
+                rebuild_lift=True,
+                ensure_groundtruth=True,
+                dry_run=True,
+                lift_timeout_sec=1800,
+                skip_cmp=False,
+                groundtruth_version="canonical",
+                groundtruth_openssl_version="3.4.4",
+                run_label="demo",
+                coordinator_flags=tuple(module.DEFAULT_COORDINATOR_EXTRA_FLAGS),
+                execution_model="single-container-shards",
+                shard_byte_budget=4096,
+                shard_max_seeds=64,
+                shard_concurrency=2,
+                container_cpus=30.0,
+                preserve_success_seed_logs=False,
+                streaming_merge=True,
+                merge_workers=2,
+                merge_batch_size=64,
+                merge_poll_interval_sec=1.0,
+                libtinycode_override=libtinycode,
+                libtinycode_helpers_override=helpers,
+            )
+
+            staged_build = module.stage_libtinycode_runtime_assets(config, layout.build_dir)
+            self.assertEqual(staged_build, layout.build_dir)
+            self.assertEqual(
+                (layout.build_dir / "libtinycode-x86_64.so").read_text(encoding="utf-8"),
+                "so\n",
+            )
+            self.assertEqual(
+                (layout.build_dir / "libtinycode-helpers-x86_64.ll").read_text(encoding="utf-8"),
+                "ll\n",
+            )
+
+            staged_install = module.stage_libtinycode_runtime_assets(config, layout.install_dir)
+            self.assertEqual(staged_install, layout.install_dir / "lib")
+            self.assertEqual(
+                (layout.install_dir / "lib" / "libtinycode-x86_64.so").read_text(encoding="utf-8"),
+                "so\n",
+            )
+            self.assertEqual(
+                (layout.install_dir / "lib" / "libtinycode-helpers-x86_64.ll").read_text(encoding="utf-8"),
+                "ll\n",
+            )
 
     def test_plan_shards_groups_small_adjacent_and_keeps_large_seed(self):
         module = load_module()
@@ -186,6 +263,53 @@ class LibcryptoDynamicParallelLiftTests(unittest.TestCase):
             self.assertTrue(overview.exists())
             self.assertTrue(per_shard.exists())
 
+    def test_load_completed_seed_tags_reads_seed_lift_events(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            layout = module.build_layout(Path(tmp), "demo")
+            module.materialize_layout(layout)
+            seed_lift_events = module.merge_state_paths(layout)["seed_lift_events"]
+            seed_lift_events.write_text(
+                json.dumps({"tag": "fn_0000000000001000"}) + "\n"
+                + json.dumps({"tag": "fn_0000000000002000"}) + "\n",
+                encoding="utf-8",
+            )
+
+            completed = module.load_completed_seed_tags(layout)
+
+            self.assertEqual(
+                completed,
+                {"fn_0000000000001000", "fn_0000000000002000"},
+            )
+
+    def test_filter_pending_shards_keeps_only_unfinished_seeds(self):
+        module = load_module()
+        shard_a = module.LiftShard(
+            shard_id="shard_00000_0000000000001000",
+            seeds=(
+                module.SeedFunction(start=0x1000, size=64, end_exclusive=0x1040, name="a", binding="symtab"),
+                module.SeedFunction(start=0x1040, size=64, end_exclusive=0x1080, name="b", binding="symtab"),
+            ),
+            total_size=128,
+        )
+        shard_b = module.LiftShard(
+            shard_id="shard_00001_0000000000002000",
+            seeds=(
+                module.SeedFunction(start=0x2000, size=64, end_exclusive=0x2040, name="c", binding="symtab"),
+            ),
+            total_size=64,
+        )
+
+        pending = module.filter_pending_shards(
+            [shard_a, shard_b],
+            completed_tags={"fn_0000000000001000", "fn_0000000000002000"},
+        )
+
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0].shard_id, shard_a.shard_id)
+        self.assertEqual([seed.name for seed in pending[0].seeds], ["b"])
+        self.assertEqual(pending[0].total_size, 64)
+
     def test_merge_state_paths_live_under_merge_state_dir(self):
         module = load_module()
         layout = module.build_layout(Path("/hdd/runs-root"), "demo")
@@ -195,6 +319,171 @@ class LibcryptoDynamicParallelLiftTests(unittest.TestCase):
         self.assertEqual(paths["seed_lift_events"], layout.merge_state_dir / "seed-lift-events.jsonl")
         self.assertEqual(paths["progress"], layout.merge_state_dir / "merge-progress.json")
         self.assertEqual(paths["frontier"], layout.merge_state_dir / "merge-frontier.json")
+
+    def test_load_incremental_results_uses_offsets_and_skips_known_tags(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "results.jsonl"
+            initial_rows = [
+                {"tag": "fn_00000001", "start": 1},
+                {"tag": "fn_00000002", "start": 2},
+            ]
+            path.write_text(
+                "".join(json.dumps(row) + "\n" for row in initial_rows),
+                encoding="utf-8",
+            )
+
+            known = set()
+            first_batch, offset = module.load_incremental_results(
+                path,
+                known_tags=known,
+                start_offset=0,
+            )
+
+            self.assertEqual([item["tag"] for item in first_batch], ["fn_00000001", "fn_00000002"])
+            self.assertGreater(offset, 0)
+            known.update(str(item["tag"]) for item in first_batch)
+
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps({"tag": "fn_00000002", "start": 2}) + "\n")
+                handle.write(json.dumps({"tag": "fn_00000003", "start": 3}) + "\n")
+
+            second_batch, second_offset = module.load_incremental_results(
+                path,
+                known_tags=known,
+                start_offset=offset,
+            )
+
+            self.assertEqual([item["tag"] for item in second_batch], ["fn_00000003"])
+            self.assertGreaterEqual(second_offset, offset)
+
+    def test_load_incremental_results_resets_offset_after_file_truncation(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "results.jsonl"
+            initial_rows = [
+                {"tag": "fn_00000001", "start": 1},
+                {"tag": "fn_00000002", "start": 2},
+            ]
+            path.write_text(
+                "".join(json.dumps(row) + "\n" for row in initial_rows),
+                encoding="utf-8",
+            )
+
+            first_batch, offset = module.load_incremental_results(
+                path,
+                known_tags=set(),
+                start_offset=0,
+            )
+            self.assertEqual([item["tag"] for item in first_batch], ["fn_00000001", "fn_00000002"])
+
+            path.write_text(
+                json.dumps({"tag": "fn_00000003", "start": 3}) + "\n",
+                encoding="utf-8",
+            )
+            second_batch, second_offset = module.load_incremental_results(
+                path,
+                known_tags={"fn_00000001", "fn_00000002"},
+                start_offset=offset,
+            )
+
+            self.assertEqual([item["tag"] for item in second_batch], ["fn_00000003"])
+            self.assertGreater(second_offset, 0)
+
+    def test_drain_completed_futures_consumes_callback_ready_queue_once(self):
+        module = load_module()
+        future_map = {}
+        completed = module.queue.SimpleQueue()
+        first = Future()
+        second = Future()
+
+        module.track_future_completion(future_map, completed, first, "first")
+        module.track_future_completion(future_map, completed, second, "second")
+        first.set_result("done-1")
+
+        ready = module.drain_completed_futures(future_map, completed)
+        self.assertEqual(ready, [first])
+        self.assertEqual(module.drain_completed_futures(future_map, completed), [])
+
+        second.set_result("done-2")
+        ready = module.drain_completed_futures(future_map, completed)
+        self.assertEqual(ready, [second])
+
+    def test_write_summary_if_changed_skips_identical_payloads(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "summary.json"
+            cache = {}
+            first = {"value": 1, "state": "ok"}
+            second = {"value": 2, "state": "ok"}
+
+            self.assertTrue(module.write_summary_if_changed(path, first, cache))
+            self.assertFalse(module.write_summary_if_changed(path, first, cache))
+            self.assertTrue(module.write_summary_if_changed(path, second, cache))
+            self.assertEqual(
+                path.read_text(encoding="utf-8"),
+                module.render_summary(second),
+            )
+
+    def test_collect_disk_budget_snapshot_flags_low_free_space(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            layout = module.build_layout(Path(tmp), "demo")
+            module.materialize_layout(layout)
+            config = module.LiftConfig(
+                workspace_root=Path("/repo/workspace"),
+                repo_root=Path("/repo/workspace/Runnable-Rewriting"),
+                groudtruth_repo_root=Path("/repo/workspace/GroudTruth"),
+                layout=layout,
+                docker_image="rr_bionic_exportfs:2026-04-14",
+                gt_x86_image="bin2415/x86_gt:0.1",
+                gt_py_image="bin2415/py_gt",
+                runnable_base=0x50000000,
+                min_function_size=64,
+                max_seeds=0,
+                seed_start=None,
+                requested_parallel_workers=4,
+                max_concurrent_coordinators=2,
+                worker_memory_gb=3.0,
+                build_memory_gb=16.0,
+                memory_headroom_gb=8.0,
+                container_memory_limit_gb=24.0,
+                rebuild_lift=True,
+                ensure_groundtruth=True,
+                dry_run=True,
+                lift_timeout_sec=1800,
+                skip_cmp=False,
+                groundtruth_version="canonical",
+                groundtruth_openssl_version="3.4.4",
+                run_label="demo",
+                coordinator_flags=tuple(module.DEFAULT_COORDINATOR_EXTRA_FLAGS),
+                execution_model="single-container-shards",
+                shard_byte_budget=4096,
+                shard_max_seeds=64,
+                shard_concurrency=2,
+                container_cpus=30.0,
+                preserve_success_seed_logs=False,
+                streaming_merge=True,
+                merge_workers=2,
+                merge_batch_size=64,
+                merge_poll_interval_sec=1.0,
+                hdd_min_free_gb=50.0,
+            )
+
+            with mock.patch.object(
+                module.shutil,
+                "disk_usage",
+                return_value=module.shutil._ntuple_diskusage(
+                    total=200 * 1024 ** 3,
+                    used=160 * 1024 ** 3,
+                    free=40 * 1024 ** 3,
+                ),
+            ):
+                snapshot = module.collect_disk_budget_snapshot(config)
+
+            self.assertTrue(snapshot["limit_exceeded"])
+            self.assertEqual(snapshot["limit_reason_codes"], ["hdd_min_free_exceeded"])
+            self.assertIn("hdd_free_gb=40.00", snapshot["limit_message"])
 
     def test_build_merge_batch_plan_reduces_successful_shards_only(self):
         module = load_module()

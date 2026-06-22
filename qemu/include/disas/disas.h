@@ -13,6 +13,8 @@ void target_disas_max(FILE *out, CPUState *cpu, target_ulong code,
 #ifdef CONFIG_LIBTINYCODE
 int target_disas_max2(FILE *out, CPUState *cpu, target_ulong code,
                       target_ulong size, int flags, int max);
+int buffer_disas_insn(FILE *out, const void *buffer,
+                      target_ulong size, int flags);
 #endif
 
 void monitor_disas(Monitor *mon, CPUState *cpu,

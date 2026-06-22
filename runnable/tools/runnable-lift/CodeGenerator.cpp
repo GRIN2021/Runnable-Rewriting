@@ -850,6 +850,36 @@ void CodeGenerator::translate(uint64_t VirtualAddress) {
   auto *InitEnvInsertPoint = Delimiter;
   Builder.CreateStore(&*MainFunction->arg_begin(), SPReg);
 
+  // PoC: in worker mode with a captured register snapshot, materialize each GPR
+  // as an IR store in the entry block. This gives the interior seed block's
+  // register uses a reaching definition (so haveDef in handleEntryBlock accepts
+  // the seed instead of flagging illegalEntry) and seeds the concrete value the
+  // coordinator held at the branch point.
+  if (ParallelConfig.WorkerMode && ParallelConfig.HasSeedRegs) {
+    static const char *GPRName[16] = {
+      "rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi",
+      "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15"
+    };
+    // The x86-64 GPR file is a contiguous uint64_t regs[16] in the CPU env;
+    // ptc.sp is the env offset of RSP (= regs[R_ESP]), so regs[i] sits at
+    // env offset RegBase + i*8. Derive the base from the known ptc.sp offset
+    // (ptc.regs is a separate pointer, not the env base, so we must not use it).
+    intptr_t RegBase = ptc.sp - (intptr_t)R_ESP * 8;
+    if (RegBase >= 0) {
+      for (int i = 0; i < 16; i++) {
+        intptr_t Off = RegBase + (intptr_t)i * 8;
+        GlobalVariable *RegGV = Variables.getByEnvOffset(Off, GPRName[i]).first;
+        if (RegGV == nullptr)
+          continue;
+        auto *Ty = RegGV->getType()->getPointerElementType();
+        Builder.CreateStore(ConstantInt::get(Ty, ParallelConfig.SeedRegs[i]),
+                            RegGV);
+      }
+      errs() << "parallel worker seed-reg IR defs injected seed=0x"
+             << Twine::utohexstr(ParallelConfig.SeedPC) << "\n";
+    }
+  }
+
   // Fake jumps to the dispatcher-related basic blocks. This way all the blocks
   // are always reachable.
   auto *ReachSwitch = Builder.CreateSwitch(Builder.getInt8(0),
@@ -890,6 +920,19 @@ void CodeGenerator::translate(uint64_t VirtualAddress) {
   std::vector<uint64_t> &BlockPCs = BlockPCs1;
   std::map<uint32_t, uint64_t> BaseData1;
   std::map<uint32_t, uint64_t> &BaseData = BaseData1;
+  // Restore the coordinator's register snapshot before exploring the seed, so
+  // the interior seed block decodes with valid pointer registers. ptc is the
+  // (COW-inherited) global QEMU env, so writing ptc.regs sets the concrete
+  // state the next ptc.translate() uses.
+  if (ParallelConfig.WorkerMode && ParallelConfig.HasSeedRegs
+      && ptc.regs != nullptr) {
+    for (int i = 0; i < 16; i++)
+      ptc.regs[i] = ParallelConfig.SeedRegs[i];
+    errs() << "parallel worker seed regs restored seed=0x"
+           << Twine::utohexstr(ParallelConfig.SeedPC) << " rsp=0x"
+           << Twine::utohexstr(ParallelConfig.SeedRegs[R_ESP]) << " rbx=0x"
+           << Twine::utohexstr(ParallelConfig.SeedRegs[R_EBX]) << "\n";
+  }
   while (Entry != nullptr) {
     jjj++;
     BlockBRs = nullptr;
@@ -1175,7 +1218,7 @@ void CodeGenerator::translate(uint64_t VirtualAddress) {
             PreferBranchFrontier = false;
           } else {
             JumpTargets.BranchTargets.erase(JumpTargets.BranchTargets.begin());
-            ptc.deletCPULINEState();
+            activateBranchFrontierState();
             DynamicVirtualAddress = jtVirtualAddress;
             PreferBranchFrontier = true;
           }
@@ -1237,7 +1280,7 @@ void CodeGenerator::translate(uint64_t VirtualAddress) {
                 BaseData.clear();
               } else {
 	        JumpTargets.BranchTargets.erase(JumpTargets.BranchTargets.begin());
-	        ptc.deletCPULINEState();
+	        activateBranchFrontierState();
 	        DynamicVirtualAddress = jtVirtualAddress;
 	        BaseData.clear();
                 PreferBranchFrontier = true;
@@ -1570,10 +1613,19 @@ int CodeGenerator::runFreshBranchWorker(uint64_t SeedPC) {
   ::freopen(WorkerStdout.c_str(), "w", stdout);
   ::freopen(WorkerStderr.c_str(), "w", stderr);
   ::setenv("RUNNABLE_PARALLEL_WORKER_MODE", "1", 1);
-  uint32_t QueueDepth = ptc.queueDepth();
+  uint32_t QueueDepth = ptc_compat::queueDepth(ptc);
+  bool LegacyQueueAssumed = !ptc_compat::supportsQueueDepth();
   errs() << "parallel worker seed=0x" << Twine::utohexstr(SeedPC)
          << " inherited-qdepth=" << QueueDepth << "\n";
-  if (QueueDepth != 0) {
+  if (LegacyQueueAssumed && PendingWorkerStateDrops != 0) {
+    errs() << "parallel worker seed=0x" << Twine::utohexstr(SeedPC)
+           << " skip-inherited-stale-states=" << PendingWorkerStateDrops << "\n";
+    while (PendingWorkerStateDrops != 0) {
+      ptc.deletCPULINEState();
+      PendingWorkerStateDrops--;
+    }
+  }
+  if (QueueDepth != 0 || LegacyQueueAssumed) {
     ptc.deletCPULINEState();
   } else {
     errs() << "parallel worker seed=0x" << Twine::utohexstr(SeedPC)
@@ -1594,6 +1646,11 @@ int CodeGenerator::runFreshBranchWorker(uint64_t SeedPC) {
   WorkerOptions.WorkerMode = true;
   WorkerOptions.WorkerCount = 0;
   WorkerOptions.SeedPC = SeedPC;
+  if (SeedRegsSnapshotValid) {
+    WorkerOptions.HasSeedRegs = true;
+    for (int i = 0; i < 16; i++)
+      WorkerOptions.SeedRegs[i] = SeedRegsSnapshot[i];
+  }
 
   BinaryFile WorkerBinary(ParallelConfig.InputPath, Binary.relocate(0));
   Architecture WorkerTargetArchitecture;
@@ -1612,6 +1669,18 @@ int CodeGenerator::runFreshBranchWorker(uint64_t SeedPC) {
   }
 
   return EXIT_SUCCESS;
+}
+
+void CodeGenerator::activateBranchFrontierState() {
+  if (PendingWorkerStateDrops != 0) {
+    errs() << "parallel parent drop-pending-states=" << PendingWorkerStateDrops
+           << "\n";
+    while (PendingWorkerStateDrops != 0) {
+      ptc.deletCPULINEState();
+      PendingWorkerStateDrops--;
+    }
+  }
+  ptc.deletCPULINEState();
 }
 
 void CodeGenerator::pollFinishedForkWorkers(bool Block) {
@@ -1657,6 +1726,19 @@ bool CodeGenerator::trySpawnBranchWorker(
   if (ActiveWorkers >= ParallelConfig.WorkerCount)
     return false;
 
+  // Snapshot the concrete register file at the branch point. The coordinator
+  // has just decoded the block that branches to SeedPC, so ptc.regs holds the
+  // register context on entry to the seed. The fresh worker restores this so
+  // its interior seed block resolves pointer registers (rbx/rsp/...) instead
+  // of failing the use-def check in handleEntryBlock (illegalEntry).
+  if (ptc.regs != nullptr) {
+    for (int i = 0; i < 16; i++)
+      SeedRegsSnapshot[i] = ptc.regs[i];
+    SeedRegsSnapshotValid = true;
+  } else {
+    SeedRegsSnapshotValid = false;
+  }
+
   pid_t PID = fork();
   runnable_assert(PID >= 0, "failed to fork branch worker");
   if (PID == 0) {
@@ -1667,9 +1749,13 @@ bool CodeGenerator::trySpawnBranchWorker(
   }
 
   errs() << "parallel parent spawn seed=0x" << Twine::utohexstr(SeedPC)
-         << " qdepth-before-drop=" << ptc.queueDepth() << "\n";
+         << " qdepth-before-drop=" << ptc_compat::queueDepth(ptc) << "\n";
   BranchTargets.erase(BranchTargets.begin());
-  ptc.dropCPUState();
+  if (ptc_compat::supportsDropCPUState()) {
+    ptc_compat::dropCPUState(ptc);
+  } else {
+    PendingWorkerStateDrops++;
+  }
   ParallelSpawnedSeeds.insert(SeedPC);
   std::ostringstream WorkerOutput;
   WorkerOutput << ParallelConfig.FragmentDir << "/worker_" << hexValue(SeedPC) << ".ll";
@@ -1725,4 +1811,26 @@ void CodeGenerator::mergeForkWorkerFragments() {
   if (RC != 0)
     return;
   rename(TempOutput.c_str(), OutputPath.c_str());
+
+  // Clean up worker fragment files after successful merge
+  // (unless --keep-worker-fragments is set for debugging)
+  if (!ParallelConfig.KeepWorkerFragments) {
+    for (const auto &Worker : ParallelWorkers) {
+      if (Worker.ExitCode == 0) {
+        // Delete the worker .ll file
+        unlink(Worker.OutputPath.c_str());
+        // Delete associated log and CSV files
+        std::string WorkerStdout = Worker.OutputPath + ".stdout.log";
+        std::string WorkerStderr = Worker.OutputPath + ".stderr.log";
+        std::string WorkerCov = Worker.OutputPath + ".coverage.csv";
+        std::string WorkerBBSummary = Worker.OutputPath + ".bbsummary.csv";
+        std::string WorkerLI = Worker.OutputPath + ".li.csv";
+        unlink(WorkerStdout.c_str());
+        unlink(WorkerStderr.c_str());
+        unlink(WorkerCov.c_str());
+        unlink(WorkerBBSummary.c_str());
+        unlink(WorkerLI.c_str());
+      }
+    }
+  }
 }

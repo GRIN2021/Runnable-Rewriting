@@ -6,6 +6,7 @@ extern "C" {
 #endif
 
 #include <stdint.h>
+#include <stdbool.h>
 #include <stdlib.h>
 #include <assert.h>
 
@@ -239,6 +240,8 @@ extern unsigned ptc_helper_defs_size;
 
 EXPORTED(void, ptc_init, (const char *filename, const char *exe_args));
 EXPORTED(void, ptc_disassemble, (FILE *output, uint32_t buffer, size_t buffer_size, int max));
+EXPORTED(int, ptc_disassemble_bytes, (FILE *output, const uint8_t *buffer,
+                                      size_t buffer_size, int flags));
 EXPORTED(const char *, ptc_get_condition_name, (PTCCondition condition));
 EXPORTED(const char *, ptc_get_load_store_name, (PTCLoadStoreType condition));
 EXPORTED(PTCLoadStoreArg, ptc_parse_load_store_arg, (PTCInstructionArg arg));

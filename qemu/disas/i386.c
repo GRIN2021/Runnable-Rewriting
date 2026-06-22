@@ -268,6 +268,7 @@ static int used_prefixes;
 
 /* The VEX.vvvv register, unencoded.  */
 static int vex_reg;
+static int vex_l;
 
 /* Flags stored in PREFIXES.  */
 #define PREFIX_REPZ 1
@@ -701,6 +702,11 @@ struct dis386 {
       op_rtn rtn;
       int bytemode;
     } op[MAX_OPERANDS];
+};
+
+static const struct dis386 vex_zero_table[] = {
+  { "vzeroupper", { XX } },
+  { "vzeroall",   { XX } },
 };
 
 /* Upper case letters in the instruction names here are macros.
@@ -3551,11 +3557,13 @@ ckvexprefix (void)
         codep += 3;
     } else {
         /* Two byte VEX prefix.  */
+        newpfx |= PREFIX_VEX_0F;
         newrex |= (vex2 & 0x80 ? 0 : REX_R);
         codep += 2;
     }
 
     vex_reg = (~vex2 >> 3) & 15;     /* VEX.vvvv */
+    vex_l = (vex2 >> 2) & 1;         /* VEX.L */
     switch (vex2 & 3) {              /* VEX.pp */
     case 1:
         newpfx |= PREFIX_DATA;     /* 0x66 */
@@ -3570,6 +3578,125 @@ ckvexprefix (void)
 
     rex = newrex;
     prefixes = newpfx;
+}
+
+static int
+ptc_modrm_length(disassemble_info *info, bfd_byte *cursor)
+{
+  bfd_byte *start = cursor;
+  int mod, rm, sib, disp = 0;
+
+  fetch_data(info, cursor + 1);
+  mod = (*cursor >> 6) & 3;
+  rm = *cursor & 7;
+  cursor++;
+
+  if (mod == 3)
+    return cursor - start;
+
+  if (address_mode == mode_16bit)
+    {
+      if (mod == 0 && rm == 6)
+        disp = 2;
+      else if (mod == 1)
+        disp = 1;
+      else if (mod == 2)
+        disp = 2;
+    }
+  else
+    {
+      if (rm == 4)
+        {
+          fetch_data(info, cursor + 1);
+          sib = *cursor++;
+          rm = sib & 7;
+          if (mod == 0 && rm == 5)
+            disp = 4;
+        }
+      else if (mod == 0 && rm == 5)
+        {
+          disp = 4;
+        }
+
+      if (mod == 1)
+        disp += 1;
+      else if (mod == 2)
+        disp += 4;
+    }
+
+  fetch_data(info, cursor + disp);
+  cursor += disp;
+  return cursor - start;
+}
+
+static const char *
+ptc_vex_kmov_name(void)
+{
+  if (prefixes & PREFIX_DATA)
+    return "kmovb";
+  if (prefixes & PREFIX_REPZ)
+    return "kmovd";
+  if (prefixes & PREFIX_REPNZ)
+    return "kmovq";
+  return "kmovw";
+}
+
+static int
+ptc_evex_imm_bytes(int map, int opcode)
+{
+  if (map == 3) {
+    switch (opcode) {
+    case 0x25: /* vpternlog* */
+    case 0x39: /* vextracti32x4 */
+    case 0x44: /* vpclmul* */
+      return 1;
+    default:
+      break;
+    }
+  }
+
+  return 0;
+}
+
+static const char *
+ptc_evex_name(int p0, int p1, int opcode)
+{
+  int map = p0 & 0x3;
+  int pp = p1 & 0x3;
+  int w = (p1 >> 7) & 1;
+
+  switch (map) {
+  case 1: /* 0f */
+    if (pp == 1 && opcode == 0xef)
+      return w ? "vpxorq" : "vpxord";
+    if ((opcode == 0x6f || opcode == 0x7f) && pp == 1)
+      return w ? "vmovdqa64" : "vmovdqa32";
+    if ((opcode == 0x6f || opcode == 0x7f) && pp == 2)
+      return "vmovdqu64";
+    if ((opcode == 0x6f || opcode == 0x7f) && pp == 3)
+      return "vmovdqu8";
+    break;
+  case 2: /* 0f 38 */
+    if (pp == 1 && opcode == 0x00)
+      return "vpshufb";
+    if (pp == 1 && opcode == 0x1a)
+      return "vbroadcastf64x2";
+    if (pp == 1 && opcode == 0xdc)
+      return "vaesenc";
+    break;
+  case 3: /* 0f 3a */
+    if (pp == 1 && opcode == 0x25)
+      return w ? "vpternlogq" : "vpternlogd";
+    if (pp == 1 && opcode == 0x39)
+      return "vextracti32x4";
+    if (pp == 1 && opcode == 0x44)
+      return "vpclmul";
+    break;
+  default:
+    break;
+  }
+
+  return NULL;
 }
 
 /* Return the name of the prefix byte PREF, or NULL if PREF is not a
@@ -3874,6 +4001,58 @@ print_insn (bfd_vma pc, disassemble_info *info)
       return 1;
     }
 
+  if ((prefixes & PREFIX_REPZ) && *codep == 0x0f)
+    {
+      fetch_data(info, codep + 3);
+      if (codep[1] == 0x1e && codep[2] == 0xfa)
+        {
+          (*info->fprintf_func) (info->stream, "endbr64");
+          return 4;
+        }
+    }
+
+  if ((prefixes & PREFIX_VEX_0F) != 0)
+    {
+      bfd_byte *cursor = codep;
+      int opcode_length;
+
+      fetch_data(info, cursor + 1);
+      if (*cursor >= 0x90 && *cursor <= 0x93)
+        {
+          cursor++;
+          opcode_length = ptc_modrm_length(info, cursor);
+          (*info->fprintf_func) (info->stream, "%s", ptc_vex_kmov_name());
+          return (cursor - priv.the_buffer) + opcode_length;
+        }
+    }
+
+  if (address_mode == mode_64bit && *codep == 0x62)
+    {
+      int p0, p1, opcode, map, imm_bytes, tail_length;
+      const char *name;
+      bfd_byte *cursor;
+
+      fetch_data(info, codep + 5);
+      p0 = codep[1];
+      p1 = codep[2];
+      opcode = codep[4];
+      name = ptc_evex_name(p0, p1, opcode);
+      map = p0 & 0x3;
+
+      if (name != NULL
+          && (p0 & 0x3) != 0
+          && (p0 & 0x0c) == 0
+          && (p1 & 0x04) != 0)
+        {
+          cursor = codep + 5;
+          tail_length = ptc_modrm_length(info, cursor);
+          imm_bytes = ptc_evex_imm_bytes(map, opcode);
+          fetch_data(info, cursor + tail_length + imm_bytes);
+          (*info->fprintf_func) (info->stream, "%s", name);
+          return 5 + tail_length + imm_bytes;
+        }
+    }
+
   op = 0;
   if (prefixes & PREFIX_VEX_0F)
     {
@@ -3892,12 +4071,24 @@ print_insn (bfd_vma pc, disassemble_info *info)
       threebyte = codep[1];
       codep += 2;
     vex_opcode:
-      dp = &dis386_twobyte[threebyte];
-      need_modrm = twobyte_has_modrm[threebyte];
-      uses_DATA_prefix = twobyte_uses_DATA_prefix[threebyte];
-      uses_REPNZ_prefix = twobyte_uses_REPNZ_prefix[threebyte];
-      uses_REPZ_prefix = twobyte_uses_REPZ_prefix[threebyte];
-      uses_LOCK_prefix = (threebyte & ~0x02) == 0x20;
+      if ((prefixes & PREFIX_VEX_0F) && threebyte == 0x77)
+        {
+          dp = &vex_zero_table[vex_l != 0];
+          need_modrm = 0;
+          uses_DATA_prefix = 0;
+          uses_REPNZ_prefix = 0;
+          uses_REPZ_prefix = 0;
+          uses_LOCK_prefix = 0;
+        }
+      else
+        {
+          dp = &dis386_twobyte[threebyte];
+          need_modrm = twobyte_has_modrm[threebyte];
+          uses_DATA_prefix = twobyte_uses_DATA_prefix[threebyte];
+          uses_REPNZ_prefix = twobyte_uses_REPNZ_prefix[threebyte];
+          uses_REPZ_prefix = twobyte_uses_REPZ_prefix[threebyte];
+          uses_LOCK_prefix = (threebyte & ~0x02) == 0x20;
+        }
       if (dp->name == NULL && dp->op[0].bytemode == IS_3BYTE_OPCODE)
 	{
           fetch_data(info, codep + 2);
@@ -4523,6 +4714,12 @@ putop (const char *template, int sizeflag)
 {
   const char *p;
   int alt = 0;
+
+  if ((prefixes & PREFIX_VEX_0F) != 0
+      && template[0] != '\0'
+      && template[0] != '('
+      && template[0] != 'v')
+    *obufp++ = 'v';
 
   for (p = template; *p; p++)
     {

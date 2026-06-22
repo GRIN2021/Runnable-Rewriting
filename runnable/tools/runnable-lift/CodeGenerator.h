@@ -116,6 +116,7 @@ private:
   void pollFinishedForkWorkers(bool Block);
   bool trySpawnBranchWorker(uint64_t SeedPC,
                             std::vector<std::tuple<uint64_t, llvm::BasicBlock *, uint64_t>> &BranchTargets);
+  void activateBranchFrontierState();
   void waitForForkWorkers();
   void mergeForkWorkerFragments();
 
@@ -140,6 +141,12 @@ private:
   std::vector<ParallelWorkerState> ParallelWorkers;
   std::set<uint64_t> ParallelSpawnedSeeds;
   uint64_t ParallelFrontierCandidates = 0;
+  uint64_t PendingWorkerStateDrops = 0;
+  // Register file snapshot taken right before forking a branch worker; the
+  // forked child reads it (COW-inherited) and hands it to the fresh worker so
+  // the seed block decodes with the coordinator's concrete register context.
+  bool SeedRegsSnapshotValid = false;
+  uint64_t SeedRegsSnapshot[16] = { 0 };
   uint64_t ParallelWorkersSpawned = 0;
   uint64_t ParallelWorkersSucceeded = 0;
   uint64_t ParallelWorkersFailed = 0;
