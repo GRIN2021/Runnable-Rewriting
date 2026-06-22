@@ -20,6 +20,9 @@ CANONICAL_TEXT_START_ENV = "RUNNABLE_LIBCRYPTO_TEXT_START"
 CANONICAL_GT_DIRNAME = "libcrypto_groudtruth_20260428"
 LEGACY_GT_DIRNAME = "libcrypto_master_test_20260414"
 READELF_TEXT_RE = re.compile(r"^\s*\[\s*\d+\]\s+(\S+)\s+\S+\s+([0-9a-fA-F]+)\s")
+READELF_TEXT_BOUNDS_RE = re.compile(
+    r"^\s*\[\s*\d+\]\s+(\S+)\s+\S+\s+([0-9a-fA-F]+)\s+[0-9a-fA-F]+\s+([0-9a-fA-F]+)\s"
+)
 
 
 def _unique_paths(paths: Iterable[Path]) -> List[Path]:
@@ -165,6 +168,23 @@ def detect_text_start(binary: Path) -> int:
         text=True,
     )
     return parse_text_start_from_readelf_output(result.stdout)
+
+
+def detect_text_bounds(binary: Path) -> tuple:
+    """Return (text_start, text_end_exclusive) as relative VMA offsets."""
+    result = subprocess.run(
+        ["readelf", "-WS", str(binary)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    for line in result.stdout.splitlines():
+        m = READELF_TEXT_BOUNDS_RE.match(line)
+        if m and m.group(1) == ".text":
+            start = int(m.group(2), 16)
+            size = int(m.group(3), 16)
+            return (start, start + size)
+    raise RuntimeError("cannot detect .text bounds from readelf output")
 
 
 def canonical_text_start(repo_root: Path = ROOT_DIR) -> int:
