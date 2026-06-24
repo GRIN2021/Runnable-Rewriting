@@ -14,6 +14,7 @@ RUNTIME_DIR="$RR_DIR/docker/qemu-v2-runtime"
 IMAGE="${RUNNABLE_QEMU_V2_IMAGE:-rr_qemu_v2_runtime:latest}"
 BUILD_DIR="build-codex-dynamic-current"
 LLVM_ROOT="root"
+LLVM_DIR_OVERRIDE=""
 QEMU_INSTALL_PATH="/usr"
 BUILD_TYPE="Debug"
 JOBS="${RUNNABLE_QEMU_V2_JOBS:-$(nproc)}"
@@ -29,7 +30,9 @@ Usage:
 Options:
   --build-dir DIR         Build directory. Default: build-codex-dynamic-current
   --llvm-root DIR         LLVM/Clang prefix with lib/cmake/llvm.
-                          Default: root
+                          Default: root. The script auto-detects both
+                          DIR/lib/cmake/llvm and DIR/share/llvm/cmake.
+  --llvm-dir DIR          Exact LLVM CMake directory. Overrides --llvm-root.
   --qemu-install-path DIR Include prefix for QEMU headers. Default: /usr
   --build-type TYPE       CMake build type. Default: Debug
   --image NAME            Docker image tag for host mode.
@@ -102,6 +105,51 @@ container_repo_path() {
   fi
 }
 
+container_path_or_passthrough() {
+  local abs="$1"
+  case "$abs" in
+    "$RR_DIR"|"$RR_DIR"/*)
+      container_repo_path "$abs"
+      ;;
+    *)
+      printf '%s\n' "$abs"
+      ;;
+  esac
+}
+
+resolve_llvm_dir() {
+  local llvm_root_abs="$1"
+  local llvm_dir_override_abs="$2"
+  local candidate
+  local -a candidates=()
+
+  if [[ -n "$llvm_dir_override_abs" ]]; then
+    candidates+=("$llvm_dir_override_abs")
+  else
+    candidates+=(
+      "$llvm_root_abs/lib/cmake/llvm"
+      "$llvm_root_abs/share/llvm/cmake"
+    )
+  fi
+
+  for candidate in "${candidates[@]}"; do
+    if [[ -f "$candidate/LLVMConfig.cmake" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+
+  {
+    echo "LLVM CMake directory not found."
+    echo "Checked:"
+    for candidate in "${candidates[@]}"; do
+      echo "  $candidate"
+    done
+    echo "Pass --llvm-dir <dir-containing-LLVMConfig.cmake> if your LLVM install uses a different layout."
+  } >&2
+  exit 1
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --build-dir)
@@ -110,6 +158,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --llvm-root)
       LLVM_ROOT="${2:?missing value for --llvm-root}"
+      shift 2
+      ;;
+    --llvm-dir)
+      LLVM_DIR_OVERRIDE="${2:?missing value for --llvm-dir}"
       shift 2
       ;;
     --qemu-install-path)
@@ -156,14 +208,20 @@ fi
 
 BUILD_DIR_ABS="$(abs_path "$BUILD_DIR")"
 LLVM_ROOT_ABS="$(abs_path "$LLVM_ROOT")"
-LLVM_DIR="$LLVM_ROOT_ABS/lib/cmake/llvm"
+LLVM_DIR_OVERRIDE_ABS=""
+if [[ -n "$LLVM_DIR_OVERRIDE" ]]; then
+  LLVM_DIR_OVERRIDE_ABS="$(abs_path "$LLVM_DIR_OVERRIDE")"
+fi
 
-[[ -d "$LLVM_DIR" ]] || die "LLVM CMake directory not found: $LLVM_DIR"
 [[ -f "$RR_DIR/runnable/CMakeLists.txt" ]] || die "missing runnable/CMakeLists.txt under $RR_DIR"
 
 if [[ "$USE_DOCKER" != "never" && ! is_container ]]; then
   BUILD_DIR_CONTAINER="$(container_repo_path "$BUILD_DIR_ABS")"
-  LLVM_ROOT_CONTAINER="$(container_repo_path "$LLVM_ROOT_ABS")"
+  LLVM_ROOT_CONTAINER="$(container_path_or_passthrough "$LLVM_ROOT_ABS")"
+  LLVM_DIR_CONTAINER=""
+  if [[ -n "$LLVM_DIR_OVERRIDE_ABS" ]]; then
+    LLVM_DIR_CONTAINER="$(container_path_or_passthrough "$LLVM_DIR_OVERRIDE_ABS")"
+  fi
 
   note "Build image"
   echo "IMAGE=$IMAGE"
@@ -192,11 +250,16 @@ if [[ "$USE_DOCKER" != "never" && ! is_container ]]; then
       --jobs "$JOBS"
       --no-docker
   )
+  if [[ -n "$LLVM_DIR_CONTAINER" ]]; then
+    DOCKER_CMD+=(--llvm-dir "$LLVM_DIR_CONTAINER")
+  fi
   if [[ "$RUN_VERIFY" -eq 1 ]]; then
     DOCKER_CMD+=(--verify)
   fi
   exec "${DOCKER_CMD[@]}"
 fi
+
+LLVM_DIR="$(resolve_llvm_dir "$LLVM_ROOT_ABS" "$LLVM_DIR_OVERRIDE_ABS")"
 
 mkdir -p "$BUILD_DIR_ABS"
 
