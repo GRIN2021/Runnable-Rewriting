@@ -450,6 +450,7 @@ JumpTargetManager::JumpTargetManager(Function *TheFunction,
   Context(TheModule.getContext()),
   TheFunction(TheFunction),
   OriginalInstructionAddresses(),
+  OriginalInstructionSizes(),
   JumpTargets(),
   PCReg(PCReg),
   ExitTB(nullptr),
@@ -577,6 +578,12 @@ JumpTargetManager::nameForAddress(uint64_t Address, uint64_t Size) const {
   // We don't have a symbol to use, just return the address
   Result << "0x" << std::hex << Address;
   return Result.str();
+}
+
+static std::string compareBlockName(uint64_t Address) {
+  std::ostringstream Name;
+  Name << "bb.0x" << std::hex << Address;
+  return Name.str();
 }
 
 void JumpTargetManager::harvestGlobalData() {
@@ -714,6 +721,25 @@ void JumpTargetManager::registerInstruction(uint64_t PC,
   // Never save twice a PC
   runnable_assert(!OriginalInstructionAddresses.count(PC));
   OriginalInstructionAddresses[PC] = Instruction;
+}
+
+void JumpTargetManager::registerInstructionExtent(uint64_t PC, uint64_t Size) {
+  // Original machine instructions are small. Refuse suspicious extents so a
+  // non-monotonic debug PC cannot poison static target filtering.
+  if (Size == 0 || Size > 64)
+    return;
+  OriginalInstructionSizes[PC] = Size;
+}
+
+bool JumpTargetManager::isInsideKnownInstruction(uint64_t PC) const {
+  auto It = OriginalInstructionSizes.upper_bound(PC);
+  if (It == OriginalInstructionSizes.begin())
+    return false;
+
+  --It;
+  uint64_t Start = It->first;
+  uint64_t Size = It->second;
+  return PC > Start && PC - Start < Size;
 }
 
 CallInst *JumpTargetManager::findNextExitTB(Instruction *Start) {
@@ -1275,9 +1301,7 @@ JumpTargetManager::registerJT(uint64_t PC, JTReason::Values Reason) {
 
   Unexplored.push_back(BlockWithAddress(PC, NewBlock));
 
-  std::stringstream Name;
-  Name << "bb." << nameForAddress(PC);
-  NewBlock->setName(Name.str());
+  NewBlock->setName(compareBlockName(PC));
 
   // Create a case for the address associated to the new block
   auto *PCRegType = PCReg->getType();
@@ -1728,7 +1752,6 @@ std::pair<bool, uint32_t> JumpTargetManager::islegalAddr(llvm::Value *v){
     case RAX:
       va = ptc.regs[R_EAX];
       registerName = RAX;
-      errs()<<va<<" :eax\n";
       if(!isDataSegmAddr(va))
         return std::make_pair(0,RAX);
     break;
@@ -1742,7 +1765,6 @@ std::pair<bool, uint32_t> JumpTargetManager::islegalAddr(llvm::Value *v){
     case RDX:
       va = ptc.regs[R_EDX];
       registerName = RDX;
-      errs()<<ptc.regs[R_EDX]<<" ++\n";
       if(!isDataSegmAddr(va))
         return std::make_pair(0,RDX);
     break;
@@ -1765,7 +1787,6 @@ std::pair<bool, uint32_t> JumpTargetManager::islegalAddr(llvm::Value *v){
     case RBP:
       va = ptc.regs[R_EBP];
       registerName = RBP;
-      errs()<<ptc.regs[R_EBP]<<" ++\n";
       if(!isDataSegmAddr(va))
         return std::make_pair(0,RBP);
     break;
@@ -1779,7 +1800,6 @@ std::pair<bool, uint32_t> JumpTargetManager::islegalAddr(llvm::Value *v){
     case RDI:
       va = ptc.regs[R_EDI];
       registerName = RDI;
-      errs()<<ptc.regs[R_EDI]<<" ++\n";
       if(!isDataSegmAddr(va))
         return std::make_pair(0,RDI);
     break;
@@ -2053,7 +2073,6 @@ JumpTargetManager:: getLastAssignment(llvm::Value *v,
   } 
 
 
-  errs()<<currentBB->getName()<<"               **************************************\n\n ";
   bool bar = 0;
   std::vector<llvm::Instruction *> vDefUse;
   for(User *vu : v->users()){
@@ -2113,7 +2132,6 @@ JumpTargetManager:: getLastAssignment(llvm::Value *v,
             case llvm::Instruction::Store:{
               auto lastS = dyn_cast<llvm::StoreInst>(last);
               if((lastS->getPointerOperand() - v) == 0){
-                  errs()<<*last<<"\n^--last assignment\n";
                   return std::make_pair(CurrentBlockLastAssign,last);
               }
               break;
@@ -2145,11 +2163,9 @@ JumpTargetManager:: getLastAssignment(llvm::Value *v,
           }
         }
         if(def){
-            errs()<<*def<<"\n^--many or one user, return def instruction\n";
             return std::make_pair(CurrentBlockValueDef,def);
         }
         else{
-            errs()<<"--no assignment, to explort next BasicBlock of Value's users\n";
             return std::make_pair(NextBlockOperating,nullptr);
         }
   }
@@ -2252,7 +2268,6 @@ JumpTargetManager:: getLastAssignment1(llvm::Value *v,
   } 
 
 
-  errs()<<currentBB->getName()<<"               **************************************\n\n ";
   bool bar = 0;
   std::vector<llvm::Instruction *> vDefUse;
   for(User *vu : v->users()){
@@ -2312,7 +2327,6 @@ JumpTargetManager:: getLastAssignment1(llvm::Value *v,
             case llvm::Instruction::Store:{
               auto lastS = dyn_cast<llvm::StoreInst>(last);
               if((lastS->getPointerOperand() - v) == 0){
-                  errs()<<*last<<"\n^--last assignment\n";
                   return std::make_pair(CurrentBlockLastAssign,last);
               }
               break;
@@ -2344,11 +2358,9 @@ JumpTargetManager:: getLastAssignment1(llvm::Value *v,
           }
         }
         if(def){
-            errs()<<*def<<"\n^--many or one user, return def instruction\n";
             return std::make_pair(CurrentBlockValueDef,def);
         }
         else{
-            errs()<<"--no assignment, to explort next BasicBlock of Value's users\n";
             return std::make_pair(NextBlockOperating,nullptr);
         }
   }
@@ -3061,7 +3073,6 @@ void JumpTargetManager::StaticToUnexplore(void){
    for(auto& PC : StaticAddrs){
     BlockMap::iterator TargetIt = JumpTargets.find(PC.first);
     if(TargetIt == JumpTargets.end() and !isIllegalStaticAddr(PC.first)){
-      errs()<<format_hex(PC.first,0)<<" <- static address\n";  
       UnexploreStaticAddr[PC.first] = PC.second;
     }
     // This Call-Next-Block has explored in recording branch exploration phase, 
@@ -3074,22 +3085,22 @@ void JumpTargetManager::StaticToUnexplore(void){
 
 void JumpTargetManager::CallNextToStaticAddr(uint32_t PC){
   BasicBlock * Block = obtainJTBB(PC,JTReason::DirectJump);
+  if(Block == nullptr)
+    return;
   BasicBlock::iterator it = Block->begin();
   BasicBlock::iterator end = Block->end();
   uint32_t count = 0;
-  if(Block != nullptr){
-    for(;it!=end;it++){
-      if(it->getOpcode()==llvm::Instruction::Call){
-	auto callI = dyn_cast<CallInst>(&*it);
-	auto *Callee = callI->getCalledFunction();
-	if(Callee != nullptr && Callee->getName() == "newpc"){
-	    auto addr = getLimitedValue(callI->getArgOperand(0));
-	    count++;
-	    if(count>3)
-	      return;
-	    StaticAddrs[addr] = false;
-            //errs()<<format_hex(pc,0)<<" <- No Crash point, to explore next addr.\n";
-	}
+  for(;it!=end;it++){
+    if(it->getOpcode()==llvm::Instruction::Call){
+      auto callI = dyn_cast<CallInst>(&*it);
+      auto *Callee = callI->getCalledFunction();
+      if(Callee != nullptr && Callee->getName() == "newpc"){
+        auto addr = getLimitedValue(callI->getArgOperand(0));
+        count++;
+        if(count>3)
+          return;
+        StaticAddrs[addr] = false;
+        //errs()<<format_hex(pc,0)<<" <- No Crash point, to explore next addr.\n";
       }
     }
   }
@@ -3966,9 +3977,7 @@ void JumpTargetManager::harvestBTBasicBlock(llvm::BasicBlock *thisBlock,
       /* Recording not execute branch destination relationship with current BasicBlock */
      // thisBlock = nullptr; 
       BranchTargets.push_back(std::make_tuple(destAddr,thisBlock,thisAddr)); 
-      errs()<<format_hex(destAddr,0)<<" <- Jmp target add\n";
     }
-  errs()<<"Branch targets total numbers: "<<BranchTargets.size()<<"\n";  
 }
 
 void JumpTargetManager::handleIllegalJumpAddress(llvm::BasicBlock *thisBlock,
@@ -4711,10 +4720,8 @@ void JumpTargetManager::harvestCallBasicBlock(llvm::BasicBlock *thisBlock,uint64
        * we will check splited Block. */ 
       if(!isOutOfAddrRange(*ptc.CallNext)){
         BranchTargets.push_back(std::make_tuple(*ptc.CallNext,thisBlock,thisAddr));
-        errs()<<format_hex(*ptc.CallNext,0)<<" <- Call next target add\n";
       }
     }
-  errs()<<"Branch targets total numbers: "<<BranchTargets.size()<<"\n";  
 }
 
 void JumpTargetManager::harvestbranchBasicBlock(uint64_t nextAddr,
@@ -4791,12 +4798,10 @@ void JumpTargetManager::harvestbranchBasicBlock(uint64_t nextAddr,
 				thisBlock,
 				thisAddr
 				)); 
-            errs()<<format_hex(destAddrSrcBB.first,0)<<" <- Jmp target add\n";
           }
         }  
       }
     }
-    errs()<<"Branch targets total numbers: "<<BranchTargets.size()<<" \n"; 
   }
 
 }
@@ -4824,6 +4829,8 @@ bool JumpTargetManager::haveTranslatedPC(uint64_t pc, uint64_t next){
   if(!isExecutableAddress(pc) || !isInstructionAligned(pc))
     return 1;
   if(pc == next)
+    return 1;
+  if(isInsideKnownInstruction(pc))
     return 1;
   // Do we already have a BasicBlock for this pc?
   BlockMap::iterator TargetIt = JumpTargets.find(pc);

@@ -194,34 +194,26 @@ static int ptc_evex_tail_bytes(CPUX86State *env,
                                int opcode)
 {
     int map = p0 & 0x3;
-    int pp = p1 & 0x3;
     int length = ptc_modrm_bytes(env, pc, aflag);
 
-    switch (map) {
-    case 1: /* 0f */
-        if (pp == 1 && opcode == 0xef) {
-            return length;
-        }
-        if ((opcode == 0x6f || opcode == 0x7f)
-            && (pp == 1 || pp == 2 || pp == 3)) {
-            return length;
-        }
-        break;
-    case 2: /* 0f 38 */
-        if (pp == 1 && (opcode == 0x00 || opcode == 0x1a || opcode == 0xdc)) {
-            return length;
-        }
-        break;
-    case 3: /* 0f 3a */
-        if (pp == 1 && (opcode == 0x25 || opcode == 0x39 || opcode == 0x44)) {
-            return length + 1;
-        }
-        break;
-    default:
-        break;
+    /*
+     * General EVEX instruction length calculator. We only need the byte
+     * count to advance PC — we do not execute the instruction.
+     *
+     * After the 4-byte EVEX prefix and 1-byte opcode, the tail is:
+     *   ModRM + SIB + displacement  (computed by ptc_modrm_bytes)
+     *   + 1-byte immediate          (map=3 / 0f 3a always has imm8;
+     *                                map=1 and map=2 EVEX have none)
+     *
+     * EVEX broadcast (p2 bit 4) and VSIB do not change the byte count
+     * of ModRM/SIB/displacement, so ptc_modrm_bytes is correct for all
+     * EVEX addressing modes.
+     */
+    if (map == 3) {
+        length += 1; /* imm8 */
     }
 
-    return -1;
+    return length;
 }
 
 static void gen_eob(DisasContext *s);

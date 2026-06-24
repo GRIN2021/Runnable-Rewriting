@@ -15,11 +15,13 @@
 #include <sstream>
 
 // LLVM includes
+#include "llvm/ADT/StringRef.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/CFG.h"
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Support/Casting.h"
+#include "llvm/Support/raw_ostream.h"
 
 // Local libraries includes
 #include "runnable/Support/IRHelpers.h"
@@ -35,6 +37,230 @@
 using namespace llvm;
 
 using IT = InstructionTranslator;
+
+namespace {
+
+struct OpcodeMetadata {
+  const char *Name = nullptr;
+  unsigned OutArgs = 0;
+  unsigned InArgs = 0;
+  unsigned ConstArgs = 0;
+  unsigned TotalArgs = 0;
+  bool HasDefinition = false;
+};
+
+static OpcodeMetadata getOpcodeMetadata(PTCOpcode Opcode) {
+  OpcodeMetadata Result;
+  unsigned OpcodeId = static_cast<unsigned>(Opcode);
+  if (OpcodeId >= static_cast<unsigned>(PTC_INSTRUCTION_NB_OPS)
+      || ptc.opcode_defs == nullptr)
+    return Result;
+
+  PTCOpcodeDef &Definition = ptc.opcode_defs[OpcodeId];
+  Result.Name = Definition.name;
+  Result.OutArgs = Definition.nb_oargs;
+  Result.InArgs = Definition.nb_iargs;
+  Result.ConstArgs = Definition.nb_cargs;
+  Result.TotalArgs = Definition.nb_args;
+  Result.HasDefinition = true;
+  return Result;
+}
+
+static bool isKnownScalarOpcode(PTCOpcode Opcode) {
+  switch (Opcode) {
+  case PTC_INSTRUCTION_op_add2_i32:
+  case PTC_INSTRUCTION_op_add2_i64:
+  case PTC_INSTRUCTION_op_add_i32:
+  case PTC_INSTRUCTION_op_add_i64:
+  case PTC_INSTRUCTION_op_andc_i32:
+  case PTC_INSTRUCTION_op_andc_i64:
+  case PTC_INSTRUCTION_op_and_i32:
+  case PTC_INSTRUCTION_op_and_i64:
+  case PTC_INSTRUCTION_op_br:
+  case PTC_INSTRUCTION_op_brcond2_i32:
+  case PTC_INSTRUCTION_op_brcond_i32:
+  case PTC_INSTRUCTION_op_brcond_i64:
+  case PTC_INSTRUCTION_op_bswap16_i32:
+  case PTC_INSTRUCTION_op_bswap16_i64:
+  case PTC_INSTRUCTION_op_bswap32_i32:
+  case PTC_INSTRUCTION_op_bswap32_i64:
+  case PTC_INSTRUCTION_op_bswap64_i64:
+  case PTC_INSTRUCTION_op_call:
+  case PTC_INSTRUCTION_op_debug_insn_start:
+  case PTC_INSTRUCTION_op_deposit_i32:
+  case PTC_INSTRUCTION_op_deposit_i64:
+  case PTC_INSTRUCTION_op_discard:
+  case PTC_INSTRUCTION_op_div2_i32:
+  case PTC_INSTRUCTION_op_div2_i64:
+  case PTC_INSTRUCTION_op_div_i32:
+  case PTC_INSTRUCTION_op_div_i64:
+  case PTC_INSTRUCTION_op_divu2_i32:
+  case PTC_INSTRUCTION_op_divu2_i64:
+  case PTC_INSTRUCTION_op_divu_i32:
+  case PTC_INSTRUCTION_op_divu_i64:
+  case PTC_INSTRUCTION_op_eqv_i32:
+  case PTC_INSTRUCTION_op_eqv_i64:
+  case PTC_INSTRUCTION_op_exit_tb:
+  case PTC_INSTRUCTION_op_ext16s_i32:
+  case PTC_INSTRUCTION_op_ext16s_i64:
+  case PTC_INSTRUCTION_op_ext16u_i32:
+  case PTC_INSTRUCTION_op_ext16u_i64:
+  case PTC_INSTRUCTION_op_ext32s_i64:
+  case PTC_INSTRUCTION_op_ext32u_i64:
+  case PTC_INSTRUCTION_op_ext8s_i32:
+  case PTC_INSTRUCTION_op_ext8s_i64:
+  case PTC_INSTRUCTION_op_ext8u_i32:
+  case PTC_INSTRUCTION_op_ext8u_i64:
+  case PTC_INSTRUCTION_op_goto_tb:
+  case PTC_INSTRUCTION_op_ld16s_i32:
+  case PTC_INSTRUCTION_op_ld16s_i64:
+  case PTC_INSTRUCTION_op_ld16u_i32:
+  case PTC_INSTRUCTION_op_ld16u_i64:
+  case PTC_INSTRUCTION_op_ld32s_i64:
+  case PTC_INSTRUCTION_op_ld32u_i64:
+  case PTC_INSTRUCTION_op_ld8s_i32:
+  case PTC_INSTRUCTION_op_ld8s_i64:
+  case PTC_INSTRUCTION_op_ld8u_i32:
+  case PTC_INSTRUCTION_op_ld8u_i64:
+  case PTC_INSTRUCTION_op_ld_i32:
+  case PTC_INSTRUCTION_op_ld_i64:
+  case PTC_INSTRUCTION_op_mov_i32:
+  case PTC_INSTRUCTION_op_mov_i64:
+  case PTC_INSTRUCTION_op_movcond_i32:
+  case PTC_INSTRUCTION_op_movcond_i64:
+  case PTC_INSTRUCTION_op_movi_i32:
+  case PTC_INSTRUCTION_op_movi_i64:
+  case PTC_INSTRUCTION_op_mul_i32:
+  case PTC_INSTRUCTION_op_mul_i64:
+  case PTC_INSTRUCTION_op_muls2_i32:
+  case PTC_INSTRUCTION_op_muls2_i64:
+  case PTC_INSTRUCTION_op_mulsh_i32:
+  case PTC_INSTRUCTION_op_mulsh_i64:
+  case PTC_INSTRUCTION_op_mulu2_i32:
+  case PTC_INSTRUCTION_op_mulu2_i64:
+  case PTC_INSTRUCTION_op_muluh_i32:
+  case PTC_INSTRUCTION_op_muluh_i64:
+  case PTC_INSTRUCTION_op_nand_i32:
+  case PTC_INSTRUCTION_op_nand_i64:
+  case PTC_INSTRUCTION_op_neg_i32:
+  case PTC_INSTRUCTION_op_neg_i64:
+  case PTC_INSTRUCTION_op_nor_i32:
+  case PTC_INSTRUCTION_op_nor_i64:
+  case PTC_INSTRUCTION_op_not_i32:
+  case PTC_INSTRUCTION_op_not_i64:
+  case PTC_INSTRUCTION_op_orc_i32:
+  case PTC_INSTRUCTION_op_orc_i64:
+  case PTC_INSTRUCTION_op_or_i32:
+  case PTC_INSTRUCTION_op_or_i64:
+  case PTC_INSTRUCTION_op_qemu_ld_i32:
+  case PTC_INSTRUCTION_op_qemu_ld_i64:
+  case PTC_INSTRUCTION_op_qemu_st_i32:
+  case PTC_INSTRUCTION_op_qemu_st_i64:
+  case PTC_INSTRUCTION_op_rem_i32:
+  case PTC_INSTRUCTION_op_rem_i64:
+  case PTC_INSTRUCTION_op_remu_i32:
+  case PTC_INSTRUCTION_op_remu_i64:
+  case PTC_INSTRUCTION_op_rotl_i32:
+  case PTC_INSTRUCTION_op_rotl_i64:
+  case PTC_INSTRUCTION_op_rotr_i32:
+  case PTC_INSTRUCTION_op_rotr_i64:
+  case PTC_INSTRUCTION_op_sar_i32:
+  case PTC_INSTRUCTION_op_sar_i64:
+  case PTC_INSTRUCTION_op_set_label:
+  case PTC_INSTRUCTION_op_setcond2_i32:
+  case PTC_INSTRUCTION_op_setcond_i32:
+  case PTC_INSTRUCTION_op_setcond_i64:
+  case PTC_INSTRUCTION_op_shl_i32:
+  case PTC_INSTRUCTION_op_shl_i64:
+  case PTC_INSTRUCTION_op_shr_i32:
+  case PTC_INSTRUCTION_op_shr_i64:
+  case PTC_INSTRUCTION_op_st16_i32:
+  case PTC_INSTRUCTION_op_st16_i64:
+  case PTC_INSTRUCTION_op_st32_i64:
+  case PTC_INSTRUCTION_op_st8_i32:
+  case PTC_INSTRUCTION_op_st8_i64:
+  case PTC_INSTRUCTION_op_st_i32:
+  case PTC_INSTRUCTION_op_st_i64:
+  case PTC_INSTRUCTION_op_sub2_i32:
+  case PTC_INSTRUCTION_op_sub2_i64:
+  case PTC_INSTRUCTION_op_sub_i32:
+  case PTC_INSTRUCTION_op_sub_i64:
+  case PTC_INSTRUCTION_op_trunc_shr_i32:
+  case PTC_INSTRUCTION_op_xor_i32:
+  case PTC_INSTRUCTION_op_xor_i64:
+    return true;
+  default:
+    return false;
+  }
+}
+
+static bool isUnsupportedPTCV2OpcodeName(const OpcodeMetadata &Metadata) {
+  if (Metadata.Name == nullptr)
+    return false;
+
+  StringRef Name(Metadata.Name);
+  return Name.startswith("extract")
+         || Name.startswith("qemu_ld2")
+         || Name.startswith("qemu_st2")
+         || Name.contains("_vec")
+         || Name.endswith("_vec");
+}
+
+static void reportUnsupportedOpcode(PTCOpcode Opcode,
+                                    const OpcodeMetadata &Metadata) {
+  errs() << "runnable-lift: unsupported PTC opcode";
+  errs() << " id=" << static_cast<unsigned>(Opcode);
+  errs() << " name="
+         << (Metadata.Name != nullptr ? Metadata.Name : "<unknown>");
+  if (Metadata.HasDefinition) {
+    errs() << " args={out:" << Metadata.OutArgs
+           << ",in:" << Metadata.InArgs
+           << ",const:" << Metadata.ConstArgs
+           << ",total:" << Metadata.TotalArgs << "}";
+  } else {
+    errs() << " args=<unavailable>";
+  }
+  errs() << "\n";
+  errs() << "runnable-lift: unsupported opcode/schema boundary; future PTC v2"
+         << " opcodes such as extract_i64, qemu_ld2/qemu_st2, and vector"
+         << " schemas require explicit lowering and are not implemented here\n";
+}
+
+static std::string compareAddressMarker(uint64_t Address) {
+  std::ostringstream Stream;
+  Stream << "0x" << std::hex << Address;
+  return Stream.str();
+}
+
+static std::string formatCompareAssemblyMarker(uint64_t Address,
+                                               StringRef Assembly) {
+  std::string Marker = compareAddressMarker(Address);
+  Marker += ": ";
+  Marker += Assembly.str();
+  return Marker;
+}
+
+static uint64_t canonicalizeDebugInsnStartPC(uint64_t RawPC,
+                                             const BinaryFile &Binary) {
+  if (Binary.getAddressData(RawPC))
+    return RawPC;
+
+  const uint64_t Base = Binary.baseAddress();
+  if (Base == 0 || RawPC >= Base)
+    return RawPC;
+
+  uint64_t RelocatedPC = RawPC + Base;
+  if (!Binary.getAddressData(RelocatedPC))
+    return RawPC;
+
+  errs() << "runnable-lift: canonicalized debug_insn_start pc"
+         << " raw=0x" << Twine::utohexstr(RawPC)
+         << " relocated=0x" << Twine::utohexstr(RelocatedPC)
+         << " base=0x" << Twine::utohexstr(Base) << "\n";
+  return RelocatedPC;
+}
+
+} // namespace
 
 namespace PTC {
 
@@ -149,10 +375,7 @@ public:
 
   uint64_t pc() const {
     runnable_assert(opcode() == PTC_INSTRUCTION_op_debug_insn_start);
-    uint64_t PC = ConstArguments[0];
-    if (ConstArguments.size() > 1)
-      PC |= ConstArguments[1] << 32;
-    return PC;
+    return TheInstruction->args[0];
   }
 
 private:
@@ -463,12 +686,14 @@ static Value *CreateICmp(T &Builder,
 using LBM = IT::LabeledBlocksMap;
 IT::InstructionTranslator(IRBuilder<> &Builder,
                           VariableManager &Variables,
+                          const BinaryFile &Binary,
                           JumpTargetManager &JumpTargets,
                           std::vector<BasicBlock *> Blocks,
                           const Architecture &SourceArchitecture,
                           const Architecture &TargetArchitecture) :
   Builder(Builder),
   Variables(Variables),
+  Binary(Binary),
   JumpTargets(JumpTargets),
   Blocks(Blocks),
   TheModule(*Builder.GetInsertBlock()->getParent()->getParent()),
@@ -500,6 +725,7 @@ IT::InstructionTranslator(IRBuilder<> &Builder,
 
 void IT::finalizeNewPCMarkers(std::string &CoveragePath) {
   std::ofstream Output(CoveragePath);
+  unsigned OriginalInstrMDKind = TheModule.getContext().getMDKindID("oi");
 
   Output << std::hex;
   for (User *U : NewPCMarker->users()) {
@@ -516,6 +742,11 @@ void IT::finalizeNewPCMarkers(std::string &CoveragePath) {
       unsigned ArgCount = Call->getNumArgOperands();
       Call->setArgOperand(2, Builder.getInt32(static_cast<uint32_t>(IsJT)));
 
+      auto *PCMD = ConstantAsMetadata::get(cast<Constant>(Call->getArgOperand(0)));
+      auto *TextMD = ConstantAsMetadata::get(cast<Constant>(Call->getArgOperand(3)));
+      Call->setMetadata(OriginalInstrMDKind, MDNode::get(TheModule.getContext(),
+                                                         { TextMD, PCMD }));
+
       // TODO: by default we should leave these
       for (unsigned I = 4; I < ArgCount - 1; I++)
         Call->setArgOperand(I, Call->getArgOperand(ArgCount - 1));
@@ -529,6 +760,9 @@ SmallSet<unsigned, 1> IT::preprocess(PTCInstructionList *InstructionList) {
 
   for (unsigned I = 0; I < InstructionList->instruction_count; I++) {
     PTCInstruction &Instruction = InstructionList->instructions[I];
+    if (validateOpcode(&Instruction) == Abort)
+      return Result;
+
     switch (Instruction.opc) {
     case PTC_INSTRUCTION_op_movi_i32:
     case PTC_INSTRUCTION_op_movi_i64:
@@ -540,7 +774,29 @@ SmallSet<unsigned, 1> IT::preprocess(PTCInstructionList *InstructionList) {
     }
 
     const PTC::Instruction TheInstruction(&Instruction);
+    if (TheInstruction.OutArguments.size() == 0) {
+      errs() << "runnable-lift: temp out-of-range in preprocess"
+             << " instruction_index=" << I
+             << " opcode=" << static_cast<unsigned>(Instruction.opc)
+             << " arg_index=0"
+             << " temp_id=<missing>"
+             << " total_temps=" << InstructionList->total_temps
+             << "\n";
+      return Result;
+    }
+
     unsigned OutArg = TheInstruction.OutArguments[0];
+    if (OutArg >= InstructionList->total_temps) {
+      errs() << "runnable-lift: temp out-of-range in preprocess"
+             << " instruction_index=" << I
+             << " opcode=" << static_cast<unsigned>(Instruction.opc)
+             << " arg_index=0"
+             << " temp_id=" << OutArg
+             << " total_temps=" << InstructionList->total_temps
+             << "\n";
+      return Result;
+    }
+
     PTCTemp *Temporary = ptc_temp_get(InstructionList, OutArg);
 
     if (!ptc_temp_is_global(InstructionList, OutArg))
@@ -561,6 +817,25 @@ SmallSet<unsigned, 1> IT::preprocess(PTCInstructionList *InstructionList) {
   return Result;
 }
 
+IT::TranslationResult IT::validateOpcode(PTCInstruction *Instr, bool Report) {
+  if (Instr == nullptr) {
+    if (Report)
+      errs() << "runnable-lift: null PTCInstruction pointer\n";
+    return Abort;
+  }
+
+  PTCOpcode Opcode = Instr->opc;
+  OpcodeMetadata Metadata = getOpcodeMetadata(Opcode);
+  if (!isKnownScalarOpcode(Opcode)
+      || isUnsupportedPTCV2OpcodeName(Metadata)) {
+    if (Report)
+      reportUnsupportedOpcode(Opcode, Metadata);
+    return Abort;
+  }
+
+  return Success;
+}
+
 std::tuple<IT::TranslationResult, MDNode *, uint64_t, uint64_t>
 IT::newInstruction(PTCInstruction *Instr,
                    PTCInstruction *Next,
@@ -568,19 +843,51 @@ IT::newInstruction(PTCInstruction *Instr,
                    bool IsFirst,
                    bool ForceNew) {
   using R = std::tuple<TranslationResult, MDNode *, uint64_t, uint64_t>;
-  runnable_assert(Instr != nullptr);
+  if (Instr == nullptr) {
+    errs() << "runnable-lift: null PTCInstruction pointer in newInstruction"
+           << " end_pc=0x" << Twine::utohexstr(EndPC)
+           << " is_first=" << (IsFirst ? "true" : "false")
+           << " force_new=" << (ForceNew ? "true" : "false")
+           << "\n";
+    return R{ Abort, nullptr, EndPC, EndPC };
+  }
 
   LLVMContext &Context = TheModule.getContext();
+
+  OpcodeMetadata Metadata = getOpcodeMetadata(Instr->opc);
+  if (Instr->opc != PTC_INSTRUCTION_op_debug_insn_start
+      || isUnsupportedPTCV2OpcodeName(Metadata)) {
+    reportUnsupportedOpcode(Instr->opc, Metadata);
+    return R{ Abort, nullptr, EndPC, EndPC };
+  }
 
   const PTC::Instruction TheInstruction(Instr);
   // A new original instruction, let's create a new metadata node
   // referencing it for all the next instructions to come
-  uint64_t PC = TheInstruction.pc();
-  uint64_t NextPC = Next != nullptr ? PTC::Instruction(Next).pc() : EndPC;
+  uint64_t PC = canonicalizeDebugInsnStartPC(TheInstruction.pc(), Binary);
+  uint64_t NextPC =
+    Next != nullptr
+      ? canonicalizeDebugInsnStartPC(PTC::Instruction(Next).pc(), Binary)
+      : EndPC;
+  uint32_t DisassembleMaxBytes = 0;
+  if (NextPC > PC) {
+    uint64_t Delta = NextPC - PC;
+    DisassembleMaxBytes = static_cast<uint32_t>(
+      std::min<uint64_t>(Delta, std::numeric_limits<uint32_t>::max()));
+  } else {
+    errs() << "runnable-lift: skipping disassembly metadata for non-monotonic"
+           << " pc range pc=0x" << Twine::utohexstr(PC)
+           << " next_pc=0x" << Twine::utohexstr(NextPC)
+           << " end_pc=0x" << Twine::utohexstr(EndPC)
+           << " is_first=" << (IsFirst ? "true" : "false")
+           << " force_new=" << (ForceNew ? "true" : "false")
+           << "\n";
+  }
 
   std::stringstream OriginalStringStream;
-  disassemble(OriginalStringStream, PC, NextPC - PC);
-  std::string OriginalString = OriginalStringStream.str();
+  disassemble(OriginalStringStream, PC, DisassembleMaxBytes, 4096, &Binary);
+  std::string OriginalString =
+    formatCompareAssemblyMarker(PC, OriginalStringStream.str());
 
   // We don't deduplicate this string since performing a lookup each time is
   // increasingly expensive and we should have relatively few collisions
@@ -627,6 +934,7 @@ IT::newInstruction(PTCInstruction *Instr,
     Args.push_back(Local);
 
   auto *Call = Builder.CreateCall(NewPCMarker, Args);
+  JumpTargets.registerInstructionExtent(PC, NextPC - PC);
 
   if (!IsFirst) {
     // Inform the JumpTargetManager about the new PC we met
@@ -679,6 +987,11 @@ static StoreInst *getLastUniqueWrite(BasicBlock *BB, const Value *Register) {
 }
 
 IT::TranslationResult IT::translateCall(PTCInstruction *Instr) {
+  if (Instr == nullptr) {
+    errs() << "runnable-lift: null PTCInstruction pointer in translateCall\n";
+    return Abort;
+  }
+
   const PTC::CallInstruction TheCall(Instr);
 
   std::vector<Value *> InArgs;
@@ -732,6 +1045,18 @@ IT::TranslationResult IT::translateCall(PTCInstruction *Instr) {
 
 IT::TranslationResult
 IT::translate(PTCInstruction *Instr, uint64_t PC, uint64_t NextPC) {
+  if (Instr == nullptr) {
+    errs() << "runnable-lift: null PTCInstruction pointer in translate"
+           << " pc=0x" << Twine::utohexstr(PC)
+           << " next_pc=0x" << Twine::utohexstr(NextPC)
+           << "\n";
+    return Abort;
+  }
+
+  PTCOpcode Opcode = Instr->opc;
+  if (validateOpcode(Instr) == Abort)
+    return Abort;
+
   const PTC::Instruction TheInstruction(Instr);
 
   std::vector<Value *> InArgs;
@@ -746,7 +1071,7 @@ IT::translate(PTCInstruction *Instr, uint64_t PC, uint64_t NextPC) {
 
   auto ConstArgs = TheInstruction.ConstArguments;
   LastPC = PC;
-  auto Result = translateOpcode(TheInstruction.opcode(),
+  auto Result = translateOpcode(Opcode,
                                 ConstArgs.toVector(),
                                 InArgs);
 
@@ -836,7 +1161,7 @@ IT::translateOpcode(PTCOpcode Opcode,
   case PTC_INSTRUCTION_op_qemu_st_i32:
   case PTC_INSTRUCTION_op_qemu_st_i64: {
     PTCLoadStoreArg MemoryAccess;
-    MemoryAccess = ptc.parse_load_store_arg(ConstArguments[0]);
+    MemoryAccess = ptc_compat::parseLoadStoreArg(ptc, ConstArguments[0]);
 
     // What are we supposed to do in this case?
     runnable_assert(MemoryAccess.access_type != PTC_MEMORY_ACCESS_UNKNOWN);
@@ -1281,7 +1606,7 @@ IT::translateOpcode(PTCOpcode Opcode,
     unsigned LabelId = ptc.get_arg_label_id(ConstArguments[0]);
 
     std::stringstream LabelSS;
-    LabelSS << "bb." << JumpTargets.nameForAddress(LastPC);
+    LabelSS << "bb." << compareAddressMarker(LastPC);
     LabelSS << "_L" << std::dec << LabelId;
     std::string Label = LabelSS.str();
 
@@ -1322,7 +1647,7 @@ IT::translateOpcode(PTCOpcode Opcode,
     unsigned LabelId = ptc.get_arg_label_id(ConstArguments.back());
 
     std::stringstream LabelSS;
-    LabelSS << "bb." << JumpTargets.nameForAddress(LastPC);
+    LabelSS << "bb." << compareAddressMarker(LastPC);
     LabelSS << "_L" << std::dec << LabelId;
     std::string Label = LabelSS.str();
 
@@ -1451,7 +1776,10 @@ IT::translateOpcode(PTCOpcode Opcode,
 
   case PTC_INSTRUCTION_op_trunc_shr_i32:
     runnable_unreachable("Instruction not implemented");
-  default:
-    runnable_unreachable("Unknown opcode");
+  default: {
+    OpcodeMetadata Metadata = getOpcodeMetadata(Opcode);
+    reportUnsupportedOpcode(Opcode, Metadata);
+    return std::errc::invalid_argument;
+  }
   }
 }

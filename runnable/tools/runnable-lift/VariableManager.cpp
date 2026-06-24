@@ -21,6 +21,7 @@
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Type.h"
 #include "llvm/Support/Casting.h"
+#include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/Utils/ValueMapper.h"
 
@@ -37,6 +38,113 @@
 using namespace llvm;
 
 static Logger<> VMStateLog("vm-state");
+
+namespace {
+
+static const char *ptcTypeName(PTCType Type) {
+  switch (Type) {
+  case PTC_TYPE_I32:
+    return "PTC_TYPE_I32";
+  case PTC_TYPE_I64:
+    return "PTC_TYPE_I64";
+  default:
+    return nullptr;
+  }
+}
+
+static bool isSupportedScalarPTCType(PTCType Type) {
+  return Type == PTC_TYPE_I32 || Type == PTC_TYPE_I64;
+}
+
+static void describePTCType(raw_ostream &OS,
+                            const char *FieldName,
+                            PTCType Type) {
+  unsigned RawType = static_cast<unsigned>(Type);
+  OS << FieldName << "=";
+
+  if (const char *Name = ptcTypeName(Type)) {
+    OS << Name;
+    return;
+  }
+
+  OS << "unsupported(" << RawType << ")";
+  if (RawType >= static_cast<unsigned>(PTC_TYPE_COUNT))
+    OS << "/unknown";
+}
+
+static void reportInvalidPTCTemp(PTCInstructionList *Instructions,
+                                 unsigned TemporaryId) {
+  errs() << "runnable-lift: invalid PTC temp reference"
+         << " temp_id=" << TemporaryId;
+  if (Instructions != nullptr) {
+    errs() << " total_temps=" << Instructions->total_temps
+           << " global_temps=" << Instructions->global_temps
+           << " temps="
+           << static_cast<const void *>(Instructions->temps);
+  } else {
+    errs() << " instruction_list=<null>";
+  }
+  errs() << "\n";
+}
+
+static void reportUnsupportedPTCTempSchema(unsigned TemporaryId,
+                                           const PTCTemp &Temporary,
+                                           const char *Reason) {
+  errs() << "runnable-lift: unsupported PTC temp schema"
+         << " temp_id=" << TemporaryId
+         << " name="
+         << (Temporary.name != nullptr ? Temporary.name : "<unnamed>")
+         << " reason=" << Reason << " ";
+  describePTCType(errs(), "type", Temporary.type);
+  errs() << " ";
+  describePTCType(errs(), "base_type", Temporary.base_type);
+  errs() << " val_type=" << static_cast<unsigned>(Temporary.val_type)
+         << " fixed_reg=" << Temporary.fixed_reg
+         << " temp_local=" << Temporary.temp_local
+         << " mem_offset=" << Temporary.mem_offset << "\n";
+  errs() << "runnable-lift: only legacy scalar PTC temp types PTC_TYPE_I32"
+         << " and PTC_TYPE_I64 are supported; I128/vector/future temp"
+         << " schemas require explicit lowering and will not be treated as"
+         << " i64\n";
+}
+
+static Type *typeForPTCTemp(IRBuilder<> &Builder,
+                            unsigned TemporaryId,
+                            const PTCTemp &Temporary) {
+  if (!isSupportedScalarPTCType(Temporary.type)) {
+    reportUnsupportedPTCTempSchema(TemporaryId, Temporary,
+                                   "unsupported result type");
+    return nullptr;
+  }
+
+  if (!isSupportedScalarPTCType(Temporary.base_type)) {
+    reportUnsupportedPTCTempSchema(TemporaryId, Temporary,
+                                   "unsupported base type");
+    return nullptr;
+  }
+
+  if (Temporary.type == PTC_TYPE_I32)
+    return Builder.getInt32Ty();
+
+  return Builder.getInt64Ty();
+}
+
+static bool shouldSeedAllocatedTemp(const PTCTemp &Temporary) {
+  if (!RunnablePTCAbiMetadata.HasAbiVersion || RunnablePTCAbiMetadata.AbiVersion < 2)
+    return false;
+
+  if (!Temporary.temp_allocated || Temporary.temp_local || Temporary.fixed_reg)
+    return false;
+
+  if (Temporary.val_type == PTC_TEMP_VAL_CONST)
+    return true;
+
+  // Live-sidecar replay currently approximates some TEMP_CONST entries as
+  // TEMP_VAL_DEAD while still preserving the literal in `val`.
+  return Temporary.val != 0;
+}
+
+} // namespace
 
 // TODO: rename
 cl::opt<bool> External("external",
@@ -707,15 +815,24 @@ VariableManager::getByCPUStateOffsetInternal(intptr_t Offset,
 Value *VariableManager::getOrCreate(unsigned TemporaryId, bool Reading) {
   runnable_assert(Instructions != nullptr);
 
+  if (Instructions->temps == nullptr
+      || TemporaryId >= Instructions->total_temps) {
+    reportInvalidPTCTemp(Instructions, TemporaryId);
+    return nullptr;
+  }
+
   PTCTemp *Temporary = ptc_temp_get(Instructions, TemporaryId);
-  Type *VariableType = Temporary->type == PTC_TYPE_I32 ? Builder.getInt32Ty() :
-                                                         Builder.getInt64Ty();
+  Type *VariableType = typeForPTCTemp(Builder, TemporaryId, *Temporary);
+  if (VariableType == nullptr)
+    return nullptr;
+
+  StringRef TemporaryName(Temporary->name != nullptr ? Temporary->name : "");
 
   if (ptc_temp_is_global(Instructions, TemporaryId)) {
     // Basically we use fixed_reg to detect "env"
     if (Temporary->fixed_reg == 0) {
       Value *Result = getByCPUStateOffset(EnvOffset + Temporary->mem_offset,
-                                          StringRef(Temporary->name));
+                                          TemporaryName);
       runnable_assert(Result != nullptr);
       return Result;
     } else {
@@ -730,7 +847,7 @@ Value *VariableManager::getOrCreate(unsigned TemporaryId, bool Reading) {
                                                     false,
                                                     GlobalValue::CommonLinkage,
                                                     InitialValue,
-                                                    StringRef(Temporary->name));
+                                                    TemporaryName);
 
         if (Result->getName() == "env")
           Env = Result;
@@ -755,8 +872,22 @@ Value *VariableManager::getOrCreate(unsigned TemporaryId, bool Reading) {
     } else {
       // Can't read a temporary if it has never been written, we're probably
       // translating rubbish
-      if (Reading)
-        return nullptr;
+      if (Reading) {
+        if (!shouldSeedAllocatedTemp(*Temporary))
+          return nullptr;
+
+        auto *NewTemporary = Builder.CreateAlloca(VariableType);
+        auto *InitialValue = ConstantInt::get(cast<IntegerType>(VariableType),
+                                              Temporary->val);
+        Builder.CreateStore(InitialValue, NewTemporary);
+        Temporaries[TemporaryId] = NewTemporary;
+        runnable_log(VMStateLog,
+                     "materialized v2 sidecar temp"
+                       << " temp_id=" << TemporaryId
+                       << " value=" << Temporary->val
+                       << DoLog);
+        return NewTemporary;
+      }
 
       AllocaInst *NewTemporary = Builder.CreateAlloca(VariableType);
       Temporaries[TemporaryId] = NewTemporary;

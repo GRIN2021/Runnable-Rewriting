@@ -74,7 +74,66 @@ Always include:
 - `precision`, `recall`
 - whether the result is `canonical` or `non-canonical`
 
+## Validated Re-run Recipe For A Finished Dynamic-Parallel Lift
+
+When a Runnable experiment already produced a final merged `.ll`, the most direct canonical re-check is:
+
+```bash
+python3 runnable/scripts/validate_libcrypto_ground_truth.py cmp \
+  --binary /abs/path/to/GroudTruth/.../libcrypto.so.3 \
+  --groundtruth /abs/path/to/GroudTruth/.../libcrypto.gtBlock.pb \
+  --blocks-pb2 /abs/path/to/GroudTruth/protobuf_def/blocks_pb2.py \
+  --ll /abs/path/to/final/libcrypto.dynamic.parallel.ll \
+  --run-cmp-eval /abs/path/to/Runnable-Rewriting/runnable/scripts/run_cmp_eval.py \
+  --text-start 0xcef80 \
+  --runnable-base 0x50000000 \
+  --out-dir /abs/path/to/eval-canonical-rerun \
+  --allow-low-metrics
+```
+
+Use this path when:
+
+- the lifting run itself has already completed,
+- you want to verify the metrics independently of the original run directory's bundled compare output,
+- you need to prove the result came from the canonical `GroudTruth` bundle rather than a copied or historical artifact.
+
+## Verified Example: 2026-05-13 Dynamic-Parallel Run
+
+The finished run under:
+
+```bash
+/hdd/runnable-runs/runnable-rewriting-project/runs-20260512-pre-sym21/
+  libcrypto-dyn-launch-20260513-093231/
+```
+
+was re-evaluated against the canonical `GroudTruth/groundtruth-gap-analysis-skill/results/libcrypto-artifacts/` bundle.
+
+Verification facts:
+
+- canonical `libcrypto.so.3` SHA256 matched the copied run-local binary:
+  - `2d4faaa94bb53b5f92a7d8d0b581eea1ad0446c30f34a8ddf4baef713f744d04`
+- `.text` start re-check: `0xcef80`
+- Runnable base: `0x50000000`
+- final `.ll`:
+  - `/hdd/runnable-runs/runnable-rewriting-project/runs-20260512-pre-sym21/libcrypto-dyn-launch-20260513-093231/runs/libcrypto-dyn-20260513-093231/libcrypto.dynamic.parallel.ll`
+
+Observed canonical compare result:
+
+- `hit=451313`
+- `mismatch=1233`
+- `obj_only=226960`
+- `ll_only=188009`
+- `false_negative=228193`
+- `false_positive=189242`
+- `precision=0.704566`
+- `recall=0.664178`
+
+This means that **this exact 2026-05-13 run does _not_ reproduce an expected ~0.85 precision / ~0.79 recall pair under the canonical compare contract**. If someone expects `85/79`, treat that as a different lineage until they provide the exact `.ll`, binary, rebase, and compare contract that produced it.
+
 ## Repo Notes
 
 - The canonical binary / protobuf are auto-discovered from this workspace's `GroudTruth` checkout, not from a checked-in `archives/` directory under `Runnable-Rewriting`.
 - `runnable/scripts/validate_libcrypto_ground_truth.py` still supports the legacy CSV validation mode used by existing fn/fp root-cause tests; use `csv-validate` only for that older flow.
+- The current libcrypto experiment entrypoints also enforce a host-side `/hdd`
+  free-space floor of `50GB` by default; if the filesystem backing `/hdd`
+  drops below that, the run is terminated before writing more artifacts.

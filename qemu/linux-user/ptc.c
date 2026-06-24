@@ -64,6 +64,15 @@ unsigned long guest_base = 0;
 unsigned long mmap_min_addr = 4096;
 FILE *fp = NULL;
 
+static FILE *ptc_disas_log(void)
+{
+  if (fp == NULL) {
+    fp = fopen("disassemble.log", "w+");
+  }
+
+  return fp != NULL ? fp : stderr;
+}
+
 static void ptc_do_syscall_library(void);
 static void ptc_do_syscall_loader(void);
 
@@ -79,6 +88,9 @@ abi_ulong elf_start_stack;
 
 struct sigaction act, oact;
 uint64_t illegal_AccessAddr = 0;
+static uint64_t ptc_signal_faults = 0;
+static uint64_t ptc_explore_branch_faults = 0;
+static uint64_t ptc_unknown_addr_reports = 0;
 
 struct image_info info1, *info = &info1;
 
@@ -360,8 +372,8 @@ static void add_helper(gpointer key, gpointer value, gpointer user_data) {
 }
 
 static void sig_handle(int signum, siginfo_t* siginfo, void* context){
-  printf("do segment fault %d\n",signum);
-  printf("Illegal access memory:  %p\n",siginfo->si_addr);
+  (void) signum;
+  ptc_signal_faults++;
   illegal_AccessAddr = (uint64_t)siginfo->si_addr;
   siglongjmp(cpu->jmp_env,1);
 }
@@ -548,7 +560,7 @@ void ptc_init(const char *filename, const char *exe_args){
     initialized_state = *(container_of(cpu->env_ptr, CPU_STRUCT, env));
 
     ptc_exception_syscall = &(cpu->exception_index);
-    fp = fopen("disassemble.log","w+");
+    fp = ptc_disas_log();
   }
 
   if (ptc_opcode_defs == NULL) {
@@ -767,7 +779,7 @@ static TranslationBlock *tb_gen_code3(TCGContext *s, CPUState *cpu,
     /* Force 64-bit decoding */
     flag = 2;
 #endif
-    if(!target_disas_max2(fp, cpu, /* GUEST_BASE + */ tb->pc, tb->size, flag, -1)){
+    if(!target_disas_max2(ptc_disas_log(), cpu, /* GUEST_BASE + */ tb->pc, tb->size, flag, -1)){
         /* generate machine code */
         gen_code_buf = tb->tc_ptr;
         tb->tb_next_offset[0] = 0xffff;
@@ -1145,7 +1157,7 @@ size_t ptc_translate(uint64_t virtual_address,uint32_t force, PTCInstructionList
     }
     else{
       //ptc_unlockexec();
-      printf("explore branch:  %lx\n",virtual_address);
+      ptc_explore_branch_faults++;
       cpu->exception_index = 11;
       *dymvirtual_address = virtual_address;
       return (size_t) tb->size;
@@ -1404,9 +1416,6 @@ uint32_t ptc_deletCPULINEState(void){
 
   datatmp = deletArchCPUStateQueueLine();
   *env = datatmp.cpu_data;
-  fprintf(stderr,"load......... CPU %lx\n",env->eip);
-  fprintf(stderr,"load......... rax %lx\n",env->regs[0]);
-  fprintf(stderr,"load......... rsp %lx\n",env->regs[4]);
 
   /* Load ELF data segments */
   memcpy((void *)elf_start_data,datatmp.elf_data,elf_end_data - elf_start_data);
@@ -1423,8 +1432,6 @@ uint32_t ptc_storeCPUState(void) {
   CPUArchState *new_env;
 
   new_env = cpu_copy(env);
-  fprintf(stderr,"store CPU %lx\n",new_env->eip);
-  fprintf(stderr,"store rax %lx\n",new_env->regs[0]);
 
   /* Store ELF data segments */
   void *pdata = (void *)malloc(elf_end_data - elf_start_data);
@@ -1532,7 +1539,7 @@ uint32_t ptc_is_stack_addr(uint64_t va){
   if(va<=info->start_stack && va>(info->start_stack&0xfff00000))
       return 1;
 
-  fprintf(stderr,"Unknow address access: %lx\n",va);
+  ptc_unknown_addr_reports++;
   return 0;
 }
 
@@ -1556,7 +1563,7 @@ uint32_t ptc_is_image_addr(uint64_t va){
   if(va<info->start_stack && va>(info->start_stack&0xfff00000))
       return 1;
 
-  fprintf(stderr,"Unknow address access: %lx\n",va);
+  ptc_unknown_addr_reports++;
   return 0;
 }
 

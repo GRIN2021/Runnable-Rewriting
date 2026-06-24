@@ -467,6 +467,13 @@ public:
   /// \brief Save the PC-Instruction association for future use
   void registerInstruction(uint64_t PC, llvm::Instruction *Instruction);
 
+  /// \brief Save the byte extent of an original instruction.
+  void registerInstructionExtent(uint64_t PC, uint64_t Size);
+
+  /// \brief Return true when \p PC is inside a known translated instruction,
+  ///        but not at that instruction's start address.
+  bool isInsideKnownInstruction(uint64_t PC) const;
+
   /// \brief Return the most recent instruction writing the program counter
   ///
   /// Note that the search is performed only in the current basic block.  The
@@ -784,8 +791,10 @@ private:
     runnable_assert(I->use_empty());
 
     uint64_t PC = getPCFromNewPCCall(I);
-    if (PC != 0)
+    if (PC != 0) {
       OriginalInstructionAddresses.erase(PC);
+      OriginalInstructionSizes.erase(PC);
+    }
     I->eraseFromParent();
   }
 
@@ -826,6 +835,8 @@ private:
   /// Holds the association between a PC and the last generated instruction for
   /// the previous instruction.
   InstructionMap OriginalInstructionAddresses;
+  /// Holds the byte size for every original instruction we have translated.
+  std::map<uint64_t, uint64_t> OriginalInstructionSizes;
   /// Holds the association between a PC and a BasicBlock.
   BlockMap JumpTargets;
   /// Queue of program counters we still have to translate.

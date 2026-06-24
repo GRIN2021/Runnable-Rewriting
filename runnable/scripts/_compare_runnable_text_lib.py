@@ -9,7 +9,9 @@ import subprocess
 
 OBJ_RE = re.compile(r"^\s+([0-9a-fA-F]+):\t(.*?)\t(.*)$")
 OBJ_BLANK_RE = re.compile(r"^\s+([0-9a-fA-F]+):\t(.*)$")
-LL_RE = re.compile(r"^\s*;\s*(0x[0-9a-fA-F]+):\s+(.*)$")
+LL_RE = re.compile(r"^\s*;\s*(0x[0-9a-fA-F]+):(?:\s+(.*))?$")
+LL_BB_RE = re.compile(r"^\s*bb\.(0x[0-9a-fA-F]+)\w*:\s*(?:;.*)?$")
+LL_ASM_ADDR_PREFIX_RE = re.compile(r"^0x[0-9a-fA-F]+:\s*")
 IGNORE_TOKENS = ("nop", "data", "xchg")
 ADV_MAP = {
     "cqto": "cqo",
@@ -18,6 +20,7 @@ ADV_MAP = {
     "cbtw": "cbw",
     "cwtl": "cwde",
 }
+LL_OPCODE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9.]*$")
 
 
 def adv_cmp(op1, op2):
@@ -35,7 +38,35 @@ def op_match(op1, op2):
     )
 
 
-def parse_objdump(binary_path, text_start):
+def extract_ll_instruction(asm):
+    asm = asm.strip()
+    asm = LL_ASM_ADDR_PREFIX_RE.sub("", asm, count=1)
+    if not asm:
+        return None
+    op_matcher = re.match(r"^(\S+)\s*(\S*)", asm)
+    ins = op_matcher.group(1) if op_matcher else None
+    if not ins:
+        return None
+    if ins.startswith("<"):
+        return None
+    if not LL_OPCODE_RE.match(ins):
+        return None
+    if any(token in ins for token in IGNORE_TOKENS):
+        return None
+    return ins
+
+
+def should_include_address(addr, text_start, text_end=None, include_pcs=None):
+    if addr < text_start:
+        return False
+    if text_end is not None and addr >= text_end:
+        return False
+    if include_pcs is not None and addr not in include_pcs:
+        return False
+    return True
+
+
+def parse_objdump(binary_path, text_start, text_end=None, include_pcs=None):
     out = subprocess.check_output(["objdump", "-d", str(binary_path)], universal_newlines=True)
     instructions = collections.OrderedDict()
 
@@ -43,7 +74,7 @@ def parse_objdump(binary_path, text_start):
         match = OBJ_RE.match(line)
         if match is not None:
             addr = int(match.group(1), 16)
-            if addr < text_start:
+            if not should_include_address(addr, text_start, text_end=text_end, include_pcs=include_pcs):
                 continue
             asm = match.group(3)
             op_matcher = re.match(r"^(\S+)\s*(.*)$", asm)
@@ -55,33 +86,50 @@ def parse_objdump(binary_path, text_start):
         match = OBJ_BLANK_RE.match(line)
         if match is not None:
             addr = int(match.group(1), 16)
-            if addr < text_start:
-                continue
 
     return instructions
 
 
-def parse_ll_raw(ll_path):
+def parse_ll_raw(ll_path, include_address_markers=False):
     instructions = collections.OrderedDict()
+    saw_comment_addresses = False
+    marker_addrs = collections.OrderedDict()
+    bb_addrs = collections.OrderedDict()
     with open(ll_path, "r", errors="ignore") as handle:
         for line in handle:
             match = LL_RE.match(line)
+            if match is not None:
+                saw_comment_addresses = True
+                raw_addr = int(match.group(1), 16)
+                asm = (match.group(2) or "").strip()
+                ins = extract_ll_instruction(asm) if asm else None
+                if ins:
+                    instructions[raw_addr] = ins
+                elif include_address_markers:
+                    marker_addrs.setdefault(raw_addr, "marker")
+                continue
+            match = LL_BB_RE.match(line)
             if match is None:
+                if saw_comment_addresses:
+                    continue
                 continue
             raw_addr = int(match.group(1), 16)
-            asm = match.group(2).strip()
-            op_matcher = re.match(r"^(\S+)\s*(\S*)", asm)
-            ins = op_matcher.group(1) if op_matcher else asm.split()[0]
-            if ins and not any(token in ins for token in IGNORE_TOKENS):
-                instructions[raw_addr] = ins
+            bb_addrs.setdefault(raw_addr, "bb")
+            if not saw_comment_addresses:
+                instructions.setdefault(raw_addr, "bb")
+    if include_address_markers:
+        for raw_addr, marker in bb_addrs.items():
+            instructions.setdefault(raw_addr, marker)
+        for raw_addr, marker in marker_addrs.items():
+            instructions.setdefault(raw_addr, marker)
     return instructions
 
 
-def normalize_ll_addresses(raw_instructions, text_start, base):
+def normalize_ll_addresses(raw_instructions, text_start, base, text_end=None, include_pcs=None):
     instructions = collections.OrderedDict()
     for raw_addr, ins in raw_instructions.items():
         addr = raw_addr - base if raw_addr >= base else raw_addr
-        if addr < text_start:
+        if not should_include_address(addr, text_start, text_end=text_end, include_pcs=include_pcs):
             continue
         instructions[addr] = ins
     return instructions

@@ -488,6 +488,9 @@ public:
     return NeededLibraryNames;
   }
 
+  const std::string &inputPath() const { return FilePath; }
+  uint64_t baseAddress() const { return BaseAddress; }
+
   const std::map<llvm::StringRef, uint64_t> &canonicalValues() const {
     return CanonicalValues;
   }
@@ -608,6 +611,7 @@ private:
   }
 
 private:
+  std::string FilePath;
   llvm::object::OwningBinary<llvm::object::Binary> BinaryHandle;
   Architecture TheArchitecture;
   std::vector<SegmentInfo> Segments;

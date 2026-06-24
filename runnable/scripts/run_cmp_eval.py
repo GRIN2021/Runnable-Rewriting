@@ -34,6 +34,30 @@ def parse_int(value: str):
     return int(value, 0)
 
 
+def parse_optional_int(value):
+    if value in (None, "auto"):
+        return None
+    return parse_int(value)
+
+
+def load_include_pcs(path: Path):
+    pcs = set()
+    for raw_line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        line = raw_line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        pcs.add(parse_int(line))
+    return pcs
+
+
+def describe_scope(text_end, include_pcs):
+    if include_pcs is not None:
+        return "pc_whitelist"
+    if text_end is not None:
+        return "text_range"
+    return "full_text"
+
+
 def resolve_paths(args):
     sample_base = Path(args.base).resolve() if args.base else None
     binary = Path(args.binary).resolve() if args.binary else sample_base
@@ -175,8 +199,11 @@ def write_text_summary(path: Path, payload: dict):
         f"binary={payload['binary']}",
         f"ll={payload['ll']}",
         f"source={payload['source']}",
+        f"scope_kind={payload['scope_kind']}",
         f"text_start=0x{payload['text_start']:x}",
+        f"text_end={hex(payload['text_end']) if payload['text_end'] is not None else 'None'}",
         f"runnable_base=0x{payload['runnable_base']:x}",
+        f"include_pc_count={payload['include_pc_count']}",
         f"obj_count={payload['obj_count']}",
         f"ll_count={payload['ll_count']}",
         f"hit={payload['hit']}",
@@ -191,14 +218,17 @@ def write_text_summary(path: Path, payload: dict):
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def build_payload(sample_base, binary, ll, text_start, runnable_base, examples, result):
+def build_payload(sample_base, binary, ll, text_start, text_end, runnable_base, include_pcs, examples, result):
     return {
         "sample_base": str(sample_base) if sample_base is not None else None,
         "binary": str(binary),
         "ll": str(ll),
         "source": "fresh_compare_runnable_text",
+        "scope_kind": describe_scope(text_end, include_pcs),
         "text_start": text_start,
+        "text_end": text_end,
         "runnable_base": runnable_base,
+        "include_pc_count": len(include_pcs) if include_pcs is not None else 0,
         "example_limit": examples,
         "obj_count": result["obj_count"],
         "ll_count": result["ll_count"],
@@ -227,9 +257,17 @@ def main():
         help="First binary virtual address to include. Use 'auto' or an integer like 0xcf000.",
     )
     ap.add_argument(
+        "--text-end",
+        help="Exclusive upper bound for binary virtual addresses to include. Omit to compare through the end of .text.",
+    )
+    ap.add_argument(
         "--runnable-base",
         default="auto",
         help="Base to subtract from ll addresses. Use 'auto' or an integer like 0x50000000.",
+    )
+    ap.add_argument(
+        "--include-pc-file",
+        help="Optional newline-delimited exact guest PC whitelist. Accepts decimal or 0x-prefixed integers.",
     )
     ap.add_argument("--examples", type=int, default=10, help="How many sample lines to keep for each category")
     ap.add_argument("--json-out", help="Optional JSON summary output path")
@@ -251,18 +289,46 @@ def main():
         text_start = detect_text_start(binary)
     else:
         text_start = parse_int(args.text_start)
+    text_end = parse_optional_int(args.text_end)
+    if text_end is not None and text_end <= text_start:
+        print("--text-end must be greater than --text-start", file=sys.stderr)
+        return 2
+
+    include_pcs = None
+    if args.include_pc_file:
+        include_pc_file = Path(args.include_pc_file).resolve()
+        if not include_pc_file.exists():
+            print(str(include_pc_file), file=sys.stderr)
+            return 2
+        include_pcs = load_include_pcs(include_pc_file)
 
     if args.runnable_base == "auto":
         runnable_base = detect_runnable_base(binary, ll, text_start)
     else:
         runnable_base = parse_int(args.runnable_base)
 
-    obj_instructions = compare_text.parse_objdump(binary, text_start)
-    ll_raw = compare_text.parse_ll_raw(ll)
-    ll_instructions = compare_text.normalize_ll_addresses(ll_raw, text_start, runnable_base)
+    obj_instructions = compare_text.parse_objdump(binary, text_start, text_end=text_end, include_pcs=include_pcs)
+    ll_raw = compare_text.parse_ll_raw(ll, include_address_markers=include_pcs is not None)
+    ll_instructions = compare_text.normalize_ll_addresses(
+        ll_raw,
+        text_start,
+        runnable_base,
+        text_end=text_end,
+        include_pcs=include_pcs,
+    )
     result = compare_text.compare(obj_instructions, ll_instructions, args.examples)
 
-    payload = build_payload(sample_base, binary, ll, text_start, runnable_base, args.examples, result)
+    payload = build_payload(
+        sample_base,
+        binary,
+        ll,
+        text_start,
+        text_end,
+        runnable_base,
+        include_pcs,
+        args.examples,
+        result,
+    )
 
     if args.json_out:
         json_path = Path(args.json_out).resolve()
@@ -275,8 +341,11 @@ def main():
     print(f"binary={payload['binary']}")
     print(f"ll={payload['ll']}")
     print(f"source={payload['source']}")
+    print(f"scope_kind={payload['scope_kind']}")
     print(f"text_start=0x{payload['text_start']:x}")
+    print(f"text_end={hex(payload['text_end']) if payload['text_end'] is not None else 'None'}")
     print(f"runnable_base=0x{payload['runnable_base']:x}")
+    print(f"include_pc_count={payload['include_pc_count']}")
     print(f"obj_count={payload['obj_count']}")
     print(f"ll_count={payload['ll_count']}")
     print(f"hit={payload['hit']}")

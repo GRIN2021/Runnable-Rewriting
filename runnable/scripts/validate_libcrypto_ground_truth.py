@@ -354,6 +354,7 @@ def run_cmp(
     run_cmp_eval: Path,
     text_start: int | None,
     runnable_base: int,
+    include_pc_file: Path | None,
     min_precision: float,
     min_recall: float,
     examples: int,
@@ -384,6 +385,9 @@ def run_cmp(
         "--text-out",
         str(text_out),
     ]
+    if include_pc_file is not None:
+        ensure_file(include_pc_file, "include_pc_file")
+        cmd.extend(["--include-pc-file", str(include_pc_file)])
     result = run_cmd(cmd, check=False)
     if result.returncode != 0:
         raise RuntimeError(
@@ -522,6 +526,7 @@ def build_parser() -> argparse.ArgumentParser:
     cmp_parser.add_argument("--run-cmp-eval", type=Path, default=DEFAULT_RUN_CMP_EVAL)
     cmp_parser.add_argument("--text-start", default="elf")
     cmp_parser.add_argument("--runnable-base", default=hex(DEFAULT_RUNNABLE_BASE))
+    cmp_parser.add_argument("--include-pc-file", type=Path)
     cmp_parser.add_argument("--min-precision", type=float, default=DEFAULT_MIN_PRECISION)
     cmp_parser.add_argument("--min-recall", type=float, default=DEFAULT_MIN_RECALL)
     cmp_parser.add_argument("--examples", type=int, default=10)
@@ -533,6 +538,7 @@ def build_parser() -> argparse.ArgumentParser:
     all_parser.add_argument("--run-cmp-eval", type=Path, default=DEFAULT_RUN_CMP_EVAL)
     all_parser.add_argument("--text-start", default="elf")
     all_parser.add_argument("--runnable-base", default=hex(DEFAULT_RUNNABLE_BASE))
+    all_parser.add_argument("--include-pc-file", type=Path)
     all_parser.add_argument("--min-precision", type=float, default=DEFAULT_MIN_PRECISION)
     all_parser.add_argument("--min-recall", type=float, default=DEFAULT_MIN_RECALL)
     all_parser.add_argument("--examples", type=int, default=10)
@@ -576,6 +582,7 @@ def cmd_cmp(args: argparse.Namespace) -> int:
         run_cmp_eval=args.run_cmp_eval.resolve(),
         text_start=parse_text_start_arg(args.text_start),
         runnable_base=parse_int(args.runnable_base),
+        include_pc_file=args.include_pc_file.resolve() if args.include_pc_file else None,
         min_precision=args.min_precision,
         min_recall=args.min_recall,
         examples=args.examples,

@@ -12,6 +12,8 @@
 // Local includes
 #include "ptc.h"
 
+class BinaryFile;
+
 /// Write to a stream the string representation of the PTC instruction with the
 /// specified index within the instruction list.
 ///
@@ -42,6 +44,7 @@ int dumpTranslation(std::ostream &Result, PTCInstructionList *Instructions);
 void disassemble(std::ostream &Result,
                  uint64_t PC,
                  uint32_t MaxBytes = 4096,
-                 uint32_t InstructionCount = 4096);
+                 uint32_t InstructionCount = 4096,
+                 const BinaryFile *Binary = nullptr);
 
 #endif // PTCDUMP_H

@@ -76,6 +76,50 @@ static std::string hexValue(uint64_t Value) {
   return Stream.str();
 }
 
+static void printPTCAbiMetadataBoundary() {
+  const bool EmptyStub = RunnablePTCAbiMetadata.HasStubKind
+                         && RunnablePTCAbiMetadata.StubKind == "empty_stub";
+  const bool RealTranslationMissing =
+    RunnablePTCAbiMetadata.HasRealTranslation
+    && !RunnablePTCAbiMetadata.RealTranslation;
+
+  if (!RunnablePTCAbiMetadata.Present
+      || (!EmptyStub && !RealTranslationMissing))
+    return;
+
+  errs() << "runnable-lift: PTC ABI metadata confirms empty stub / "
+         << "real translation not migrated";
+  if (RunnablePTCAbiMetadata.HasAbiVersion)
+    errs() << " abi_version=" << RunnablePTCAbiMetadata.AbiVersion;
+  if (RunnablePTCAbiMetadata.HasStubKind)
+    errs() << " stub_kind=" << RunnablePTCAbiMetadata.StubKind;
+  if (RunnablePTCAbiMetadata.HasRealTranslation)
+    errs() << " real_translation="
+           << (RunnablePTCAbiMetadata.RealTranslation ? "true" : "false");
+  if (RunnablePTCAbiMetadata.HasVectorSchema)
+    errs() << " vector_schema="
+           << (RunnablePTCAbiMetadata.VectorSchema ? "true" : "false");
+  errs() << "\n";
+}
+
+static void failInvalidPTCInstructionList(uint64_t VirtualAddress,
+                                          size_t ConsumedSize,
+                                          uint64_t DynamicVirtualAddress,
+                                          const PTCInstructionList &Instructions) {
+  errs() << "runnable-lift: unsupported empty PTCInstructionList at pc=0x"
+         << Twine::utohexstr(VirtualAddress)
+         << " consumed-size=" << ConsumedSize
+         << " dynamic-pc=0x" << Twine::utohexstr(DynamicVirtualAddress)
+         << " instruction-count=" << Instructions.instruction_count
+         << " instructions="
+         << (Instructions.instructions == nullptr ? "null" : "non-null")
+         << "\n";
+  errs() << "runnable-lift: PTC returned no usable legacy instructions; "
+         << "current QEMU v2 empty stubs are an unsupported boundary\n";
+  printPTCAbiMetadataBoundary();
+  std::exit(EXIT_FAILURE);
+}
+
 static std::string findRepoRootFromCwd() {
   char Buffer[4096];
   if (getcwd(Buffer, sizeof(Buffer)) == nullptr)
@@ -780,6 +824,7 @@ void CodeGenerator::translate(uint64_t VirtualAddress) {
   // Create the first basic block and create a placeholder for variable
   // allocations
   BasicBlock *Entry = BasicBlock::Create(Context, "entrypoint", MainFunction);
+  BasicBlock *EntryBlock = Entry;
   Builder.SetInsertPoint(Entry);
 
   QuickMetadata QMD(Context);
@@ -840,6 +885,7 @@ void CodeGenerator::translate(uint64_t VirtualAddress) {
                                    VirtualAddress);
   // Use this instruction as the delimiter for local variables
   auto *Delimiter = Builder.CreateStore(StartPC, PCReg);
+  MDNode *FirstOriginalInstrSeed = nullptr;
 
   // We need to remember this instruction so we can later insert a call here.
   // The problem is that up until now we don't know where our CPUState structure
@@ -875,8 +921,6 @@ void CodeGenerator::translate(uint64_t VirtualAddress) {
         Builder.CreateStore(ConstantInt::get(Ty, ParallelConfig.SeedRegs[i]),
                             RegGV);
       }
-      errs() << "parallel worker seed-reg IR defs injected seed=0x"
-             << Twine::utohexstr(ParallelConfig.SeedPC) << "\n";
     }
   }
 
@@ -893,6 +937,7 @@ void CodeGenerator::translate(uint64_t VirtualAddress) {
 
   InstructionTranslator Translator(Builder,
                                    Variables,
+                                   Binary,
                                    JumpTargets,
                                    Blocks,
                                    Binary.architecture(),
@@ -928,10 +973,6 @@ void CodeGenerator::translate(uint64_t VirtualAddress) {
       && ptc.regs != nullptr) {
     for (int i = 0; i < 16; i++)
       ptc.regs[i] = ParallelConfig.SeedRegs[i];
-    errs() << "parallel worker seed regs restored seed=0x"
-           << Twine::utohexstr(ParallelConfig.SeedPC) << " rsp=0x"
-           << Twine::utohexstr(ParallelConfig.SeedRegs[R_ESP]) << " rbx=0x"
-           << Twine::utohexstr(ParallelConfig.SeedRegs[R_EBX]) << "\n";
   }
   while (Entry != nullptr) {
     jjj++;
@@ -947,16 +988,17 @@ void CodeGenerator::translate(uint64_t VirtualAddress) {
     }
 
     // TODO: rename this type
-    PTCInstructionListPtr InstructionList(new PTCInstructionList);
+    PTCInstructionListPtr InstructionList(new PTCInstructionList());
     size_t ConsumedSize = 0; 
+    bool TranslatedThisBlock = false;
 
     if(traverseFLAG && !JumpTargets.haveBB){
       ConsumedSize = ptc.translate(VirtualAddress,1,InstructionList.get(),&DynamicVirtualAddress);
+      TranslatedThisBlock = true;
       tmpVA = VirtualAddress;
     }
     if(traverseFLAG && JumpTargets.haveBB){
       ptc_instruction_list_malloc(InstructionList.get()); 
-      errs()<<"Nop execute!\n";
       if (ParallelConfig.DynamicParallel) {
         if (LastHaveBBVA == VirtualAddress)
           RepeatedHaveBBCount++;
@@ -986,12 +1028,31 @@ void CodeGenerator::translate(uint64_t VirtualAddress) {
     } 
 
     if(!JumpTargets.haveBB){
+    if ((TranslatedThisBlock && ConsumedSize == 0)
+        || InstructionList->instruction_count == 0
+        || InstructionList->instructions == nullptr)
+      failInvalidPTCInstructionList(VirtualAddress,
+                                    ConsumedSize,
+                                    DynamicVirtualAddress,
+                                    *InstructionList);
+
     JumpTargets.haveBaseDatainRegs(BaseData);    
 
     SmallSet<unsigned, 1> ToIgnore;
     ToIgnore = Translator.preprocess(InstructionList.get());
 
+    bool CanDumpPTC = true;
     if (PTCLog.isEnabled()) {
+      for (unsigned k = 0; k < InstructionList->instruction_count; k++) {
+        if (Translator.validateOpcode(&InstructionList->instructions[k],
+                                      false) == InstructionTranslator::Abort) {
+          CanDumpPTC = false;
+          break;
+        }
+      }
+    }
+
+    if (PTCLog.isEnabled() && CanDumpPTC) {
       std::stringstream Stream;
       dumpTranslation(Stream, InstructionList.get());
       PTCLog << Stream.str() << DoLog;
@@ -1029,6 +1090,13 @@ void CodeGenerator::translate(uint64_t VirtualAddress) {
                                                    EndPC,
                                                    true,
                                                    false);
+      if (Result != IT::Abort && FirstOriginalInstrSeed == nullptr)
+        FirstOriginalInstrSeed = MDOriginalInstr;
+      if (Result == IT::Abort) {
+        Builder.CreateCall(AbortFunction);
+        Builder.CreateUnreachable();
+        StopTranslation = true;
+      }
       j++;
       BlockPCs.push_back(PC);
     }
@@ -1043,6 +1111,14 @@ void CodeGenerator::translate(uint64_t VirtualAddress) {
 
       Blocks.clear();
       Blocks.push_back(Builder.GetInsertBlock());
+
+      Result = Translator.validateOpcode(&Instruction);
+      if (Result == IT::Abort) {
+        Builder.CreateCall(AbortFunction);
+        Builder.CreateUnreachable();
+        StopTranslation = true;
+        continue;
+      }
 
       switch (Opcode) {
       case PTC_INSTRUCTION_op_discard:
@@ -1098,7 +1174,7 @@ void CodeGenerator::translate(uint64_t VirtualAddress) {
         Builder.CreateCall(AbortFunction);
         Builder.CreateUnreachable();
         StopTranslation = true;
-        break;
+        continue;
       case IT::Stop:
         StopTranslation = true;
         break;
@@ -1145,7 +1221,6 @@ void CodeGenerator::translate(uint64_t VirtualAddress) {
     if(*ptc.isIllegal)
       DynamicVirtualAddress = tmpVA + ConsumedSize;
  
-    errs()<<EntryFlag<<"\n"; 
     if(EntryFlag){
       EntryFlag = JumpTargets.handleEntryBlock(BlockBRs, tmpVA, SuspectEntryAddr, Translator.branchcontent(), getPath());
       if(EntryFlag){
@@ -1188,8 +1263,6 @@ void CodeGenerator::translate(uint64_t VirtualAddress) {
       }
       //if(!JumpTargets.isDataSegmAddr(ptc.regs[R_ESP]))
       //  ptc.regs[R_ESP] = ptc.regs[R_EBP];
-      errs()<<*((unsigned long *)ptc.regs[4])<<"<--store callnext\n";
-      errs()<<*ptc.CallNext<<"\n";
       JumpTargets.harvestCallBasicBlock(BlockBRs,tmpVA);
       if (ParallelConfig.WorkerMode)
         JumpTargets.BranchTargets.clear();
@@ -1222,7 +1295,6 @@ void CodeGenerator::translate(uint64_t VirtualAddress) {
             DynamicVirtualAddress = jtVirtualAddress;
             PreferBranchFrontier = true;
           }
-          errs()<<"syscall--------------------\n";        
         }
       }
       if(BlockBRs and !JumpTargets.haveBB and *ptc.exception_syscall == 11){
@@ -1255,8 +1327,6 @@ void CodeGenerator::translate(uint64_t VirtualAddress) {
     if(!JumpTargets.isExecutableAddress(DynamicVirtualAddress) 
        and !JumpTargets.haveBB)
     {
-      outs()<<"occure invalid address: "<<format_hex(DynamicVirtualAddress,0)
-            <<"  explore branch: "<<format_hex(tmpVA,0)<<"\n";
 //      JumpTargets.handleIllegalJumpAddress(BlockBRs,tmpVA);
       DynamicVirtualAddress = 0;
    
@@ -1269,7 +1339,6 @@ void CodeGenerator::translate(uint64_t VirtualAddress) {
 	      BlockBRs = nullptr;
 	      // if occure a translated BB, traversing next branch
 	      std::tie(jtVirtualAddress, srcBB, srcAddr) = JumpTargets.BranchTargets.front();
-	      errs()<<"--------------------\n";
               if (trySpawnBranchWorker(jtVirtualAddress, JumpTargets.BranchTargets)) {
                 JumpTargets.haveBB = 0;
                 DynamicVirtualAddress = 0;
@@ -1313,7 +1382,6 @@ void CodeGenerator::translate(uint64_t VirtualAddress) {
                 if (ParallelConfig.WorkerMode)
                   JumpTargets.BranchTargets.clear();
 	      }
-      std::cerr<<std::hex<<VirtualAddress<<" \n";
     }
 
     if(JumpTargets.BranchTargets.empty() and !EntryFlag) {
@@ -1336,7 +1404,6 @@ void CodeGenerator::translate(uint64_t VirtualAddress) {
       StaticAddrFlag = true; 
       std::tie(VirtualAddress, Entry) = JumpTargets.peek();
       SuspectEntryAddr = EntryFlag ? VirtualAddress:0;
-      std::cerr<<std::hex<<VirtualAddress<<" \n";
     }
 
 	  } // End translations loop
@@ -1498,6 +1565,10 @@ void CodeGenerator::translate(uint64_t VirtualAddress) {
   JumpTargets.noReturn().cleanup();
 
   Translator.finalizeNewPCMarkers(CoveragePath);
+  if (FirstOriginalInstrSeed != nullptr && !EntryBlock->empty()) {
+    Instruction &Anchor = *EntryBlock->getFirstNonPHI();
+    Anchor.setMetadata(OriginalInstrMDKind, FirstOriginalInstrSeed);
+  }
 
   Variables.finalize();
 
@@ -1548,8 +1619,22 @@ void CodeGenerator::embeddedData(){
     // Get data and size
     auto *DataType = ArrayType::get(Uint8Ty, embedded.second);
     Constant *TheData = nullptr;
-    const uint8_t* addr = (uint8_t *)embedded.first;
-    llvm::ArrayRef<uint8_t> Data = ArrayRef<uint8_t>(addr,embedded.second);
+    const SegmentInfo *Segment = nullptr;
+    for (const SegmentInfo &Candidate : Binary.segments()) {
+      if (Candidate.contains(embedded.first, embedded.second)) {
+        Segment = &Candidate;
+        break;
+      }
+    }
+    if (Segment == nullptr || !Segment->IsReadable) {
+      errs() << "runnable-lift: skipping embedded data for pc=0x"
+             << Twine::utohexstr(embedded.first)
+             << " size=" << embedded.second
+             << " because no readable binary segment covers that range\n";
+      continue;
+    }
+    size_t Offset = embedded.first - Segment->StartVirtualAddress;
+    llvm::ArrayRef<uint8_t> Data = Segment->Data.slice(Offset, embedded.second);
     TheData = ConstantDataArray::get(Context, Data);
     // Create a new global variable
     auto Variable = new GlobalVariable(*TheModule,
@@ -1615,11 +1700,7 @@ int CodeGenerator::runFreshBranchWorker(uint64_t SeedPC) {
   ::setenv("RUNNABLE_PARALLEL_WORKER_MODE", "1", 1);
   uint32_t QueueDepth = ptc_compat::queueDepth(ptc);
   bool LegacyQueueAssumed = !ptc_compat::supportsQueueDepth();
-  errs() << "parallel worker seed=0x" << Twine::utohexstr(SeedPC)
-         << " inherited-qdepth=" << QueueDepth << "\n";
   if (LegacyQueueAssumed && PendingWorkerStateDrops != 0) {
-    errs() << "parallel worker seed=0x" << Twine::utohexstr(SeedPC)
-           << " skip-inherited-stale-states=" << PendingWorkerStateDrops << "\n";
     while (PendingWorkerStateDrops != 0) {
       ptc.deletCPULINEState();
       PendingWorkerStateDrops--;
@@ -1627,9 +1708,6 @@ int CodeGenerator::runFreshBranchWorker(uint64_t SeedPC) {
   }
   if (QueueDepth != 0 || LegacyQueueAssumed) {
     ptc.deletCPULINEState();
-  } else {
-    errs() << "parallel worker seed=0x" << Twine::utohexstr(SeedPC)
-           << " inherited queue empty, continuing without saved state\n";
   }
 
   if (!ParallelConfig.FragmentDir.empty()) {
@@ -1743,13 +1821,9 @@ bool CodeGenerator::trySpawnBranchWorker(
   runnable_assert(PID >= 0, "failed to fork branch worker");
   if (PID == 0) {
     int Result = runFreshBranchWorker(SeedPC);
-    errs() << "parallel worker seed=0x" << Twine::utohexstr(SeedPC)
-           << " exit=" << Result << "\n";
     ::_exit(Result);
   }
 
-  errs() << "parallel parent spawn seed=0x" << Twine::utohexstr(SeedPC)
-         << " qdepth-before-drop=" << ptc_compat::queueDepth(ptc) << "\n";
   BranchTargets.erase(BranchTargets.begin());
   if (ptc_compat::supportsDropCPUState()) {
     ptc_compat::dropCPUState(ptc);

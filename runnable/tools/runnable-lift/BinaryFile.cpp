@@ -44,8 +44,9 @@ static Logger<> LabelsLog("labels");
 const unsigned char R_MIPS_IMPLICIT_RELATIVE = 255;
 
 BinaryFile::BinaryFile(std::string FilePath, uint64_t BaseAddress) :
+  FilePath(std::move(FilePath)),
   BaseAddress(0) {
-  auto BinaryOrErr = object::createBinary(FilePath);
+  auto BinaryOrErr = object::createBinary(this->FilePath);
   runnable_assert(BinaryOrErr, "Couldn't open the input file");
 
   BinaryHandle = std::move(BinaryOrErr.get());

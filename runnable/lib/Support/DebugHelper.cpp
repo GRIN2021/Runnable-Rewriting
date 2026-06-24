@@ -98,6 +98,30 @@ static void writeMetadataIfNew(const Instruction *TheInstruction,
   }
 }
 
+static StringRef getInstructionAddressText(const Instruction *Instr,
+                                           unsigned MDKind) {
+  Metadata *MD = Instr->getMetadata(MDKind);
+  if (MD == nullptr)
+    return StringRef();
+
+  auto *Node = dyn_cast<MDNode>(MD);
+  if (Node == nullptr || Node->getNumOperands() < 2)
+    return StringRef();
+
+  auto *Operand = Node->getOperand(1).get();
+  auto *CAM = dyn_cast_or_null<ConstantAsMetadata>(Operand);
+  if (CAM == nullptr)
+    return StringRef();
+
+  auto *CI = dyn_cast<ConstantInt>(CAM->getValue());
+  if (CI == nullptr)
+    return StringRef();
+
+  static thread_local std::string Text;
+  Text = "0x" + CI->getValue().toString(16, false);
+  return Text;
+}
+
 /// Add a module flag, if not already present, using name and value provided.
 /// Used for creating the Dwarf compliant debug info.
 static void addModuleFlag(Module *TheModule, StringRef Flag, uint32_t Value) {
@@ -118,18 +142,20 @@ DAW::DebugAnnotationWriter(LLVMContext &Context, bool DebugInfo) :
 
 void DAW::emitInstructionAnnot(const Instruction *Instr,
                                formatted_raw_ostream &Output) {
-  DISubprogram *Subprogram = Instr->getParent()->getParent()->getSubprogram();
-
   // Ignore whatever is outside the root and the isolated functions
   StringRef FunctionName = Instr->getParent()->getParent()->getName();
-  if (Subprogram == nullptr
-      or not(FunctionName == "root" or FunctionName.startswith("bb.")))
+  if (not(FunctionName == "root" or FunctionName.startswith("bb.")))
     return;
 
+  StringRef Address = getInstructionAddressText(Instr, OriginalInstrMDKind);
+  if (Address.size())
+    Output << "\n  ; " << Address << ":\n";
   writeMetadataIfNew(Instr, OriginalInstrMDKind, Output, "\n  ; ");
   writeMetadataIfNew(Instr, PTCInstrMDKind, Output, "\n  ; ");
 
   if (DebugInfo) {
+    DISubprogram *Subprogram = Instr->getParent()->getParent()->getSubprogram();
+
     // If DebugInfo is activated the generated LLVM IR textual representation
     // will contain some reference to dangling pointers. So ignore the output
     // stream if you're using the annotator to generate debug info about the IR

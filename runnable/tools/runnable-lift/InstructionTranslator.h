@@ -34,6 +34,7 @@ class Module;
 
 class JumpTargetManager;
 class VariableManager;
+class BinaryFile;
 
 /// \brief Expands a PTC instruction to LLVM IR
 class InstructionTranslator {
@@ -51,6 +52,7 @@ public:
   /// \param TargetArchitecture the output architecture.
   InstructionTranslator(llvm::IRBuilder<> &Builder,
                         VariableManager &Variables,
+                        const BinaryFile &Binary,
                         JumpTargetManager &JumpTargets,
                         std::vector<llvm::BasicBlock *> Blocks,
                         const Architecture &SourceArchitecture,
@@ -102,6 +104,10 @@ public:
   TranslationResult
   translate(PTCInstruction *Instr, uint64_t PC, uint64_t NextPC);
 
+  /// \brief Validate that \p Instr uses the legacy scalar opcode schema that
+  ///        runnable-lift can currently translate.
+  TranslationResult validateOpcode(PTCInstruction *Instr, bool Report = true);
+
   /// \brief Translate a call to an helper
   ///
   /// \param Instr the PTCInstruction of the call to the helper.
@@ -139,6 +145,7 @@ private:
 private:
   llvm::IRBuilder<> &Builder;
   VariableManager &Variables;
+  const BinaryFile &Binary;
   JumpTargetManager &JumpTargets;
   std::map<std::string, llvm::BasicBlock *> LabeledBasicBlocks;
   std::vector<llvm::BasicBlock *> Blocks;
