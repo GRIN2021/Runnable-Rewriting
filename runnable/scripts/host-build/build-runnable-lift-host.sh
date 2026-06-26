@@ -5,17 +5,18 @@
 #
 # This is a thin host-side wrapper around the existing
 # runnable/scripts/build_runnable_lift_v2.sh --no-docker, which is the single
-# source of truth for the CMake flags, LLVM directory resolution, and the
-# canonical artifact path. This wrapper adds:
+# source of truth for the CMake configure/build and the canonical artifact path.
+# This wrapper adds:
 #
-#   * a hard pre-check that the non-git dependency tree `root/` is present;
+#   * Ubuntu 24.04 host defaults that use the system llvm-config/LLVM package;
 #   * a friendly reminder that the libtinycode runtime artifacts must be staged
 #     for runnable-lift to actually lift anything;
 #   * sane host defaults (build dir, jobs).
 #
 # Usage:
 #   bash runnable/scripts/host-build/build-runnable-lift-host.sh [--verify]
-#        [--llvm-dir DIR] [--build-dir DIR] [--jobs N] [--build-type TYPE]
+#        [--llvm-dir DIR] [--llvm-root DIR] [--build-dir DIR] [--jobs N]
+#        [--build-type TYPE]
 #
 # See BUILD-HOST-UBUNTU-24.04.md for the full walkthrough.
 #
@@ -28,6 +29,7 @@ V2_BUILD="$RR_DIR/runnable/scripts/build_runnable_lift_v2.sh"
 
 BUILD_DIR="build-codex-dynamic-current"
 LLVM_DIR_OVERRIDE=""
+LLVM_ROOT_OVERRIDE=""
 JOBS="$(nproc)"
 BUILD_TYPE="Debug"
 RUN_VERIFY=0
@@ -41,7 +43,10 @@ Options:
   --build-dir DIR    Build directory (relative to repo root or absolute).
                      Default: build-codex-dynamic-current
   --llvm-dir DIR     Exact directory containing LLVMConfig.cmake. Overrides the
-                     default root/lib/cmake/llvm auto-detection.
+                     default system llvm-config --cmakedir detection.
+  --llvm-root DIR    LLVM/Clang prefix with lib/cmake/llvm. Compatibility path
+                     for legacy repo-local root/ or explicit /usr/lib/llvm-18.
+                     Not required on Ubuntu 24.04 with llvm-dev installed.
   --build-type TYPE  CMake build type. Default: Debug
   --jobs N, -j N     Parallel build jobs. Default: $(nproc)
   --verify           After build, run ldd and runnable-lift --help smoke.
@@ -55,10 +60,77 @@ EOF
 die() { echo "error: $*" >&2; exit 1; }
 note() { printf '\n== %s ==\n' "$*"; }
 
+abs_path() {
+  local input="$1"
+  if [[ "$input" = /* ]]; then
+    printf '%s\n' "$input"
+  else
+    printf '%s/%s\n' "$RR_DIR" "$input"
+  fi
+}
+
+find_system_llvm_config() {
+  if command -v llvm-config >/dev/null 2>&1; then
+    command -v llvm-config
+    return 0
+  fi
+  if command -v llvm-config-18 >/dev/null 2>&1; then
+    command -v llvm-config-18
+    return 0
+  fi
+  return 1
+}
+
+resolve_llvm_dir_from_root() {
+  local llvm_root="$1"
+  local candidate
+  local -a candidates=(
+    "$llvm_root/lib/cmake/llvm"
+    "$llvm_root/share/llvm/cmake"
+  )
+
+  for candidate in "${candidates[@]}"; do
+    if [[ -f "$candidate/LLVMConfig.cmake" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+
+  {
+    echo "LLVM CMake directory not found under --llvm-root: $llvm_root"
+    echo "Checked:"
+    for candidate in "${candidates[@]}"; do
+      echo "  $candidate"
+    done
+  } >&2
+  return 1
+}
+
+infer_llvm_root_from_dir() {
+  local llvm_dir="$1"
+  case "$llvm_dir" in
+    */lib/cmake/llvm)
+      printf '%s\n' "${llvm_dir%/lib/cmake/llvm}"
+      ;;
+    */share/llvm/cmake)
+      printf '%s\n' "${llvm_dir%/share/llvm/cmake}"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+join_by_colon() {
+  local IFS=:
+  printf '%s\n' "$*"
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --build-dir)    BUILD_DIR="${2:?missing value for --build-dir}"; shift 2 ;;
     --llvm-dir)     LLVM_DIR_OVERRIDE="${2:?missing value for --llvm-dir}"; shift 2 ;;
+    --llvm-root)    LLVM_ROOT_OVERRIDE="${2:?missing value for --llvm-root}"; shift 2 ;;
     --build-type)   BUILD_TYPE="${2:?missing value for --build-type}"; shift 2 ;;
     --jobs|-j)      JOBS="${2:?missing value for --jobs}"; shift 2 ;;
     --verify)       RUN_VERIFY=1; shift ;;
@@ -70,39 +142,66 @@ done
 [[ -f "$V2_BUILD" ]] || die "underlying build wrapper not found: $V2_BUILD"
 [[ -f "$RR_DIR/runnable/CMakeLists.txt" ]] || die "not a Runnable-Rewriting checkout: $RR_DIR"
 
-# --- Pre-check 1: root/ (prebuilt LLVM 7) -----------------------------------
-# root/ is the prebuilt LLVM/Clang dependency tree. It is NOT in git
-# (.gitignore excludes /root/), so a fresh clone does not have it. CMake's
-# find_package(LLVM) resolves against root/lib/cmake/llvm, and the
-# early-linked-*.ll / support-*.ll modules are generated with root/bin/clang.
-note "Check dependency tree root/"
-LLVM_CONFIG="$RR_DIR/root/bin/llvm-config"
-LLVM_CMAKE_DEFAULT="$RR_DIR/root/lib/cmake/llvm/LLVMConfig.cmake"
-if [[ ! -x "$LLVM_CONFIG" ]] && [[ -z "$LLVM_DIR_OVERRIDE" ]]; then
-  cat >&2 <<EOF
-error: prebuilt LLVM dependency tree not found at: $RR_DIR/root
+# --- Pre-check 1: LLVM -------------------------------------------------------
+# Ubuntu 24.04 host builds default to the distro LLVM package (usually LLVM 18).
+# Legacy repo-local root/ is still available, but only when explicitly selected
+# with --llvm-root root or --llvm-dir root/lib/cmake/llvm.
+note "Resolve LLVM"
+LLVM_DIR_EFFECTIVE=""
+LLVM_ROOT_EFFECTIVE=""
+LLVM_LIBDIR=""
 
-  root/ is NOT in git and must be staged from an existing environment that has
-  already built runnable (e.g. the rr_bionic_exportfs Docker image, or another
-  machine with a working checkout). Copy the whole root/ directory to:
+if [[ -n "$LLVM_ROOT_OVERRIDE" ]]; then
+  LLVM_ROOT_EFFECTIVE="$(abs_path "$LLVM_ROOT_OVERRIDE")"
+fi
 
-      $RR_DIR/root
+if [[ -n "$LLVM_DIR_OVERRIDE" ]]; then
+  LLVM_DIR_EFFECTIVE="$(abs_path "$LLVM_DIR_OVERRIDE")"
+  [[ -f "$LLVM_DIR_EFFECTIVE/LLVMConfig.cmake" ]] || die "LLVMConfig.cmake not found in --llvm-dir: $LLVM_DIR_EFFECTIVE"
+  if [[ -z "$LLVM_ROOT_EFFECTIVE" ]]; then
+    LLVM_ROOT_EFFECTIVE="$(infer_llvm_root_from_dir "$LLVM_DIR_EFFECTIVE" || true)"
+  fi
+  echo "  using explicit --llvm-dir: $LLVM_DIR_EFFECTIVE"
+elif [[ -n "$LLVM_ROOT_EFFECTIVE" ]]; then
+  LLVM_DIR_EFFECTIVE="$(resolve_llvm_dir_from_root "$LLVM_ROOT_EFFECTIVE")"
+  echo "  using explicit --llvm-root: $LLVM_ROOT_EFFECTIVE"
+else
+  LLVM_CONFIG="$(find_system_llvm_config)" || {
+    cat >&2 <<EOF
+error: system llvm-config not found.
 
-  Expected contents:
-      root/bin/llvm-config            (executable)
-      root/bin/clang                  (used to generate early-linked-*.ll)
-      root/lib/cmake/llvm/LLVMConfig.cmake
+  Install the Ubuntu 24.04 host dependencies:
 
-  If your LLVM install lives elsewhere, point at its CMake dir directly:
+      sudo bash runnable/scripts/host-build/install-host-deps.sh
+
+  Or point at a specific LLVM install:
 
       bash $(basename "${BASH_SOURCE[0]}") --llvm-dir /path/to/dir-with-LLVMConfig.cmake
+      bash $(basename "${BASH_SOURCE[0]}") --llvm-root /usr/lib/llvm-18
+
+  Legacy repo-local root/ is supported only when explicitly selected:
+
+      bash $(basename "${BASH_SOURCE[0]}") --llvm-root root
 EOF
-  exit 1
+    exit 1
+  }
+  LLVM_DIR_EFFECTIVE="$("$LLVM_CONFIG" --cmakedir)"
+  [[ -f "$LLVM_DIR_EFFECTIVE/LLVMConfig.cmake" ]] || die "$LLVM_CONFIG --cmakedir did not point at LLVMConfig.cmake: $LLVM_DIR_EFFECTIVE"
+  LLVM_ROOT_EFFECTIVE="$("$LLVM_CONFIG" --prefix)"
+  LLVM_LIBDIR="$("$LLVM_CONFIG" --libdir)"
+  echo "  llvm-config : $LLVM_CONFIG"
+  echo "  version     : $("$LLVM_CONFIG" --version)"
 fi
-if [[ -z "$LLVM_DIR_OVERRIDE" ]]; then
-  echo "  ok: $RR_DIR/root (llvm-config + cmake/llvm present)"
-else
-  echo "  using explicit --llvm-dir: $LLVM_DIR_OVERRIDE"
+
+if [[ -n "$LLVM_ROOT_EFFECTIVE" && -z "$LLVM_LIBDIR" ]]; then
+  LLVM_LIBDIR="$LLVM_ROOT_EFFECTIVE/lib"
+fi
+echo "  LLVM_DIR    : $LLVM_DIR_EFFECTIVE"
+if [[ -n "$LLVM_ROOT_EFFECTIVE" ]]; then
+  echo "  LLVM root   : $LLVM_ROOT_EFFECTIVE"
+fi
+if [[ -n "$LLVM_LIBDIR" ]]; then
+  echo "  LLVM libdir : $LLVM_LIBDIR"
 fi
 
 # --- Pre-check 2 (advisory): libtinycode runtime artifacts ------------------
@@ -127,7 +226,7 @@ warning: libtinycode runtime artifacts missing under:
   staged alongside the binary:
       libtinycode-x86_64.so
       libtinycode-helpers-x86_64.ll
-      early-linked-x86_64.ll   (auto-generated by the build from root/bin/clang)
+      early-linked-x86_64.ll   (auto-generated by the build from LLVM's clang)
 
   These come from a QEMU build (out of scope here). See BUILD-HOST-UBUNTU-24.04.md.
 EOF
@@ -140,8 +239,9 @@ ARGS=(
   --build-type "$BUILD_TYPE"
   --jobs "$JOBS"
   --no-docker
+  --llvm-dir "$LLVM_DIR_EFFECTIVE"
 )
-[[ -n "$LLVM_DIR_OVERRIDE" ]] && ARGS+=(--llvm-dir "$LLVM_DIR_OVERRIDE")
+[[ -n "$LLVM_ROOT_EFFECTIVE" ]] && ARGS+=(--llvm-root "$LLVM_ROOT_EFFECTIVE")
 [[ "$RUN_VERIFY" -eq 1 ]] && ARGS+=(--verify)
 
 bash "$V2_BUILD" "${ARGS[@]}"
@@ -154,7 +254,13 @@ else
   BUILD_DIR_ABS="$RR_DIR/$BUILD_DIR"
 fi
 ARTIFACT="$BUILD_DIR_ABS/tools/runnable-lift/runnable-lift"
-LD_PATH="$BUILD_DIR_ABS/lib/StackAnalysis:$BUILD_DIR_ABS/lib/BasicAnalyses:$BUILD_DIR_ABS/lib/Support:$RR_DIR/root/lib"
+LD_PARTS=(
+  "$BUILD_DIR_ABS/lib/StackAnalysis"
+  "$BUILD_DIR_ABS/lib/BasicAnalyses"
+  "$BUILD_DIR_ABS/lib/Support"
+)
+[[ -n "$LLVM_LIBDIR" ]] && LD_PARTS+=("$LLVM_LIBDIR")
+LD_PATH="$(join_by_colon "${LD_PARTS[@]}")"
 
 note "Host summary"
 cat <<EOF

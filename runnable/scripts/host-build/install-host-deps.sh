@@ -30,10 +30,11 @@ echo "== apt-get update =="
 apt-get update
 
 echo "== install build dependencies =="
-# Package set mirrors docker/qemu-v2-runtime/Dockerfile, with python2 and the
-# QEMU-only libs dropped (runnable-lift itself only needs LLVM + headers).
+# Package set mirrors the LLVM/build subset of docker/qemu-v2-runtime/Dockerfile,
+# with QEMU-only libs dropped (runnable-lift itself only needs LLVM + headers).
 # clang is required because runnable/CMakeLists.txt generates early-linked-*.ll
-# and support-*.ll by invoking clang at build time.
+# and support-*.ll by invoking clang at build time. llvm-dev provides the
+# system llvm-config --cmakedir / LLVMConfig.cmake path used by the host build.
 apt-get install -y --no-install-recommends \
   build-essential \
   ca-certificates \
@@ -44,14 +45,19 @@ apt-get install -y --no-install-recommends \
   gawk \
   gdb \
   git \
+  libboost-dev \
   libglib2.0-dev \
+  lld \
   libtool \
+  llvm \
+  llvm-dev \
   ninja-build \
   patch \
   perl \
   pkg-config \
   python3 \
   python3-pip \
+  python3-pygraphviz \
   python3-setuptools \
   python3-venv \
   rsync \

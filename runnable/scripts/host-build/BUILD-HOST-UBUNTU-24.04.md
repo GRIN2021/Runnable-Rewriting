@@ -1,38 +1,35 @@
 # Building runnable-lift on Ubuntu 24.04 (No Docker)
 
-This guide lets a collaborator build and run the QEMU-v2-line `runnable-lift`
-**directly on an Ubuntu 24.04 host**, without entering or building any Docker
-image.
+This guide builds and runs the QEMU-v2-line `runnable-lift` directly on an
+Ubuntu 24.04 host. The default LLVM is the Ubuntu 24.04 apt LLVM package
+(usually LLVM 18), resolved with `llvm-config --cmakedir`.
 
 The helper scripts live under `runnable/scripts/host-build/`.
 
 ## Why this works without Docker
 
-The QEMU-v2 runtime Docker image exists for exactly one reason: to keep the
-`runnable-lift` binary and the environment it runs in on the **same glibc /
-libstdc++**, so the binary actually loads. A binary built against a newer glibc
-than the runtime fails with errors like:
+The QEMU-v2 runtime Docker image keeps the `runnable-lift` binary and the
+environment it runs in on the same glibc/libstdc++. A binary built against a
+newer glibc than the runtime fails with errors like:
 
-```
+```text
 runnable-lift: /lib/x86_64-linux-gnu/libc.so.6: version `GLIBC_2.34' not found
 runnable-lift: .../libstdc++.so.6: version `GLIBCXX_3.4.32' not found
 ```
 
-On **Ubuntu 24.04 → Ubuntu 24.04** the build host and the run host are the
-same, so glibc matches by construction and the container buys you nothing. The
-existing `build_runnable_lift_v2.sh` already supports a native
-(`--no-docker`) mode; the scripts here just stage the dependencies and wire it
-up.
+On Ubuntu 24.04 build host to Ubuntu 24.04 run host, glibc matches by
+construction. The existing `build_runnable_lift_v2.sh` already supports native
+`--no-docker` mode; the host wrapper here just installs the apt dependencies,
+resolves LLVM, and delegates to that build.
 
 ## Scope
 
-This builds **`runnable-lift` only** (the QEMU-v2 migration line, artifact under
-`build-codex-dynamic-current/`). It does **not** build QEMU 10.2.3, the
-libcrypto canonical evaluation, or the classic `make install-runnable`
-toolchain. `runnable-lift --help` and a tiny-ELF lift both work at the end.
+This builds `runnable-lift` only (the QEMU-v2 migration line, artifact under
+`build-codex-dynamic-current/`). It does not build QEMU 10.2.3, the libcrypto
+canonical evaluation, or the classic `make install-runnable` toolchain.
 
-There are **two dependencies that are not in git** and must be staged from an
-existing environment — see [Dependencies that are not in git](#dependencies-that-are-not-in-git).
+`runnable-lift --help` should work after the build. An actual lift additionally
+needs the libtinycode runtime artifacts described below.
 
 ## Prerequisites
 
@@ -46,74 +43,84 @@ existing environment — see [Dependencies that are not in git](#dependencies-th
   git checkout codex/qemu-upgrade-v2
   ```
 
-## Dependencies that are not in git
+## LLVM model
 
-Two things a fresh `git clone` does **not** give you. Both must be staged from
-an existing runnable environment (e.g. the `rr_bionic_exportfs` Docker image,
-or another machine that already builds runnable). They are git-ignored or
-simply untracked.
-
-### 1. `root/` — prebuilt LLVM 7 / Clang dependency tree
-
-`root/` provides the LLVM that `runnable-lift` links against and the `clang`
-that CMake uses to generate `early-linked-*.ll` and `support-*.ll`. It is
-excluded from git (`.gitignore` has `/root/`).
-
-Copy the whole `root/` directory into the repo root:
+The default path is the Ubuntu apt LLVM:
 
 ```bash
-# from the machine that already has root/, e.g. via rsync:
-rsync -a <existing>/Runnable-Rewriting/root/ ./root/
+sudo bash runnable/scripts/host-build/install-host-deps.sh
+llvm-config --version
+llvm-config --cmakedir
 ```
 
-Verify it:
+On Ubuntu 24.04 this is normally LLVM 18, with CMake files under:
+
+```text
+/usr/lib/llvm-18/lib/cmake/llvm
+```
+
+The host build wrapper resolves LLVM in this order:
+
+1. `--llvm-dir DIR`: exact directory containing `LLVMConfig.cmake`.
+2. `--llvm-root DIR`: LLVM/Clang prefix containing `lib/cmake/llvm`.
+3. System `llvm-config --cmakedir`: the default after installing `llvm-dev`.
+
+The old repo-local `root/` LLVM 7 tree is only a legacy fallback. Use it only
+when you explicitly want that toolchain:
 
 ```bash
-test -x root/bin/llvm-config && echo "llvm-config: ok"
-test -f root/lib/cmake/llvm/LLVMConfig.cmake && echo "LLVMConfig.cmake: ok"
-test -x root/bin/clang && echo "clang: ok"
+bash runnable/scripts/host-build/build-runnable-lift-host.sh \
+  --llvm-root root \
+  --verify
 ```
 
-If your LLVM install lives in a non-default layout, point at its CMake dir
-directly with `--llvm-dir` below instead of staging `root/`.
+or:
 
-### 2. libtinycode runtime artifacts — `libtinycode-x86_64.so` + helpers
+```bash
+bash runnable/scripts/host-build/build-runnable-lift-host.sh \
+  --llvm-dir root/lib/cmake/llvm \
+  --verify
+```
 
-`runnable-lift` **dlopen**s `libtinycode-<arch>.so` at runtime (see
-`runnable/tools/runnable-lift/Main.cpp`, function `findFiles`). These are:
+A fresh Ubuntu 24.04 host build does not require copying `root/`.
+
+## Runtime artifacts not in git
+
+`runnable-lift` dlopens `libtinycode-<arch>.so` at runtime (see
+`runnable/tools/runnable-lift/Main.cpp`, function `findFiles`). These files are
+not produced by runnable's CMake build and are not git-tracked:
 
 | File | Produced by |
 |---|---|
 | `libtinycode-x86_64.so` | classic QEMU build (`support/components/qemu.mk`, target `x86_64-libtinycode`) |
 | `libtinycode-helpers-x86_64.ll` | classic QEMU build |
-| `early-linked-x86_64.ll` | runnable's own CMake (auto-generated from `root/bin/clang`) |
+| `early-linked-x86_64.ll` | runnable's CMake build, generated with LLVM's `clang` |
 
-The first two are **not** produced by runnable's CMake and are **not**
-git-tracked. `early-linked-x86_64.ll` *is* generated by the build, so you only
-need to stage the first two. Copy them next to where the binary will land:
+You only need to stage the first two before running an actual lift:
 
 ```bash
 mkdir -p build-codex-dynamic-current/tools/runnable-lift
-cp <existing>/libtinycode-x86_64.so        build-codex-dynamic-current/tools/runnable-lift/
+cp <existing>/libtinycode-x86_64.so         build-codex-dynamic-current/tools/runnable-lift/
 cp <existing>/libtinycode-helpers-x86_64.ll build-codex-dynamic-current/tools/runnable-lift/
 ```
 
-(`runnable-lift --help` works without these; an actual lift does not — it aborts
-with `Couldn't find libtinycode and the helpers`. The smoke script checks for
-them up front so you get a clear message instead.)
+`runnable-lift --help` works without these. A real lift aborts with
+`Couldn't find libtinycode and the helpers` until they are staged. The smoke
+script checks this up front and prints a clearer message.
 
-## Step 1 — install build dependencies
+## Step 1 - install build dependencies
 
 ```bash
 sudo bash runnable/scripts/host-build/install-host-deps.sh
 ```
 
-This installs (idempotent): `build-essential`, `clang`, `cmake`, `ninja-build`,
-`pkg-config`, `ccache`, `git`, `zlib1g-dev`, `libglib2.0-dev`, `python3`, and a
-few more. The set mirrors `docker/qemu-v2-runtime/Dockerfile`, minus the
-python2 and QEMU-only packages runnable-lift itself does not need.
+This installs the Ubuntu 24.04 host package set for runnable-lift, including
+`clang`, `lld`, `llvm`, `llvm-dev`, `cmake`, `ninja-build`, `pkg-config`,
+`ccache`, `git`, `zlib1g-dev`, `libboost-dev`, `libglib2.0-dev`, `python3`,
+`python3-pygraphviz`, and supporting build tools. `llvm-dev` provides the
+default `llvm-config --cmakedir` path used by the host wrapper.
 
-## Step 2 — build runnable-lift
+## Step 2 - build runnable-lift
 
 ```bash
 bash runnable/scripts/host-build/build-runnable-lift-host.sh --verify
@@ -121,37 +128,40 @@ bash runnable/scripts/host-build/build-runnable-lift-host.sh --verify
 
 This wrapper:
 
-1. Hard-checks that `root/` is present (clear error with the fix if not).
+1. Resolves `LLVM_DIR` from system `llvm-config --cmakedir` by default.
 2. Advises whether the libtinycode artifacts are staged.
-3. Delegates to the existing native build
-   `runnable/scripts/build_runnable_lift_v2.sh --no-docker`, which runs the
-   real CMake configure + build (single source of truth for flags).
-4. With `--verify`, runs `ldd` and `runnable-lift --help` to confirm the binary
-   loads (no GLIBC errors).
+3. Delegates to `runnable/scripts/build_runnable_lift_v2.sh --no-docker`.
+4. With `--verify`, runs `ldd` and `runnable-lift --help`.
 
-The canonical artifact is the **build-tree** binary:
+The canonical artifact is the build-tree binary:
 
-```
+```text
 build-codex-dynamic-current/tools/runnable-lift/runnable-lift
 ```
 
-(`cmake --install` does not install `runnable-lift`; the build-tree binary is
-what everything uses.)
+`cmake --install` does not install `runnable-lift`; the build-tree binary is
+what the QEMU-v2 scripts use.
 
 ### Options
 
 | Flag | Default | Purpose |
 |---|---|---|
 | `--build-dir DIR` | `build-codex-dynamic-current` | build directory |
-| `--llvm-dir DIR` | auto (`root/lib/cmake/llvm`) | exact dir containing `LLVMConfig.cmake` |
+| `--llvm-dir DIR` | system `llvm-config --cmakedir` | exact dir containing `LLVMConfig.cmake` |
+| `--llvm-root DIR` | unset | LLVM prefix, including legacy `root/` |
 | `--build-type TYPE` | `Debug` | CMake build type |
 | `--jobs N` / `-j N` | `nproc` | parallel jobs |
-| `--verify` | off | ldd + `--help` after build |
+| `--verify` | off | `ldd` plus `runnable-lift --help` after build |
 
-A full clean build is ~1–2 min on a many-core host (only runnable compiles;
-~91 TUs; LLVM/QEMU deps are prebuilt in `root/`).
+Example explicit apt LLVM path:
 
-## Step 3 — smoke test (tiny ELF lift)
+```bash
+bash runnable/scripts/host-build/build-runnable-lift-host.sh \
+  --llvm-dir /usr/lib/llvm-18/lib/cmake/llvm \
+  --verify
+```
+
+## Step 3 - smoke test (tiny ELF lift)
 
 ```bash
 bash runnable/scripts/host-build/smoke-tiny-elf-host.sh
@@ -161,83 +171,128 @@ This compiles a tiny static ELF (a single `exit(0)` syscall), lifts it to LLVM
 IR with the freshly built `runnable-lift`, and asserts the `.ll` is non-empty
 and the lift reports `Rewrite Successful`. On success it prints:
 
-```
+```text
 TINY_ELF_LIFT_SMOKE=pass
 ```
 
 If the libtinycode runtime artifacts are missing, it fails up front with the
-exact `cp` commands to run (see [Dependencies that are not in git](#dependencies-that-are-not-in-git)).
+exact `cp` commands to run.
 
 ## Running the binary by hand
 
-The build-tree binary needs `LD_LIBRARY_PATH` to find its own analysis libraries
-plus LLVM:
+The build-tree binary needs its analysis libraries on `LD_LIBRARY_PATH`. Add
+the LLVM libdir too when using a non-system LLVM:
 
 ```bash
 B=build-codex-dynamic-current
-export LD_LIBRARY_PATH="$PWD/$B/lib/StackAnalysis:$PWD/$B/lib/BasicAnalyses:$PWD/$B/lib/Support:$PWD/root/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+LLVM_LIBDIR="$(llvm-config --libdir)"
+export LD_LIBRARY_PATH="$PWD/$B/lib/StackAnalysis:$PWD/$B/lib/BasicAnalyses:$PWD/$B/lib/Support:$LLVM_LIBDIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
 ./$B/tools/runnable-lift/runnable-lift --help
 ```
 
+For legacy `root/`, replace `LLVM_LIBDIR` with `$PWD/root/lib`.
+
 ## FAQ
 
-### `error: prebuilt LLVM dependency tree not found at: .../root`
+### `error: system llvm-config not found`
 
-You skipped [Dependencies that are not in git](#dependencies-that-are-not-in-git).
-Stage `root/` from an existing runnable environment, or pass `--llvm-dir
-/path/to/dir-with-LLVMConfig.cmake` if your LLVM install is elsewhere.
-
-### `LLVM CMake directory not found`
-
-CMake could not find `LLVMConfig.cmake`. Locate it:
+Install the host dependencies:
 
 ```bash
-find root -path '*LLVMConfig.cmake' -print
+sudo bash runnable/scripts/host-build/install-host-deps.sh
 ```
 
-then pass `--llvm-dir <that dir>` to `build-runnable-lift-host.sh`.
+Or pass an explicit LLVM:
+
+```bash
+bash runnable/scripts/host-build/build-runnable-lift-host.sh \
+  --llvm-dir /usr/lib/llvm-18/lib/cmake/llvm
+```
+
+### `LLVMConfig.cmake not found`
+
+Confirm the apt LLVM CMake directory:
+
+```bash
+llvm-config --cmakedir
+test -f "$(llvm-config --cmakedir)/LLVMConfig.cmake"
+```
+
+Then pass that directory with `--llvm-dir`.
+
+### `Cannot find the pygraphviz module`
+
+Install the host dependencies again; `python3-pygraphviz` is required during
+CMake configure to generate `ABIDataFlows.h`:
+
+```bash
+sudo bash runnable/scripts/host-build/install-host-deps.sh
+```
+
+### `boost/...: No such file or directory`
+
+Install the host dependencies again; `libboost-dev` provides the Boost headers
+used by `runnable-lift` (`boost/icl/*`, `boost/variant.hpp`):
+
+```bash
+sudo bash runnable/scripts/host-build/install-host-deps.sh
+```
+
+### I still need the old `root/` LLVM 7 tree
+
+Stage it only for that legacy path:
+
+```bash
+rsync -a <existing>/Runnable-Rewriting/root/ ./root/
+bash runnable/scripts/host-build/build-runnable-lift-host.sh --llvm-root root --verify
+```
+
+Expected legacy contents:
+
+```text
+root/bin/llvm-config
+root/bin/clang
+root/lib/cmake/llvm/LLVMConfig.cmake
+```
 
 ### `Couldn't find libtinycode and the helpers`
 
 `runnable-lift` runs but cannot lift: the libtinycode runtime artifacts are not
-next to the binary. Stage them per [Dependencies that are not in
-git](#dependencies-that-are-not-in-git). `--help` works without them; an actual
-lift does not.
+next to the binary. Stage `libtinycode-x86_64.so` and
+`libtinycode-helpers-x86_64.ll` as described above. `--help` works without
+them; an actual lift does not.
 
 ### `GLIBC_2.34 not found` / `GLIBCXX_3.4.32 not found` at load
 
-This should **not** happen when you build and run on the same Ubuntu 24.04
-host. If you see it, you likely copied a binary built on a different distro —
-rebuild on this host with `build-runnable-lift-host.sh --verify`.
+This should not happen when you build and run on the same Ubuntu 24.04 host.
+If you see it, you likely copied a binary built on a different distro. Rebuild
+on this host with `build-runnable-lift-host.sh --verify`.
 
-### `ld`/analysis-library errors at runtime
+### `ld` or analysis-library errors at runtime
 
 Confirm `LD_LIBRARY_PATH` includes all of:
 
-```
+```text
 build-codex-dynamic-current/lib/StackAnalysis
 build-codex-dynamic-current/lib/BasicAnalyses
 build-codex-dynamic-current/lib/Support
-root/lib
+$(llvm-config --libdir)
 ```
 
-The build and smoke scripts set this for you; the recipe above is for manual
-runs.
+For legacy `root/`, use `root/lib` instead of `$(llvm-config --libdir)`.
 
 ## Script index
 
 | Script | Purpose |
 |---|---|
 | `install-host-deps.sh` | apt install the Ubuntu 24.04 build packages |
-| `build-runnable-lift-host.sh` | native build wrapper (root/ check + `--no-docker` build + verify) |
+| `build-runnable-lift-host.sh` | native build wrapper using apt LLVM by default |
 | `smoke-tiny-elf-host.sh` | tiny static ELF lift smoke test on the host |
 
 ## See also
 
-- `runnable/scripts/build_runnable_lift_v2.sh` — the underlying native/container
+- `runnable/scripts/build_runnable_lift_v2.sh` - the underlying native/container
   build wrapper (`--no-docker` mode is what this guide uses).
-- `docs/qemu-v2-runnable-reproduce.md` — the container-based reproduction guide
+- `docs/qemu-v2-runnable-reproduce.md` - the container-based reproduction guide
   (use this instead if your host is not Ubuntu 24.04).
-- `.codex/skills/runnable-build/SKILL.md` — why the Docker image is mandatory
-  for the bionic libcrypto pipeline, and the glibc-drift trap.

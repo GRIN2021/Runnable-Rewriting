@@ -1,71 +1,73 @@
 #!/usr/bin/env bash
 #
-# build_runnable_lift.sh — rebuild runnable-lift INSIDE the bionic image.
+# Compatibility wrapper for the old runnable-lift build entrypoint.
 #
-# runnable-lift must be compiled inside the Ubuntu-18.04 image
-# (rr_bionic_exportfs:2026-04-14). A host-native build links against the
-# host glibc/libstdc++ (GLIBC_2.34, GLIBCXX_3.4.32) and FAILS to load inside
-# the bionic container that the lift pipeline actually runs in.
-#
-# Prebuilt LLVM/QEMU/Boost dependencies live at /root/Runnable-Rewriting/root
-# inside the image. The workspace is bind-mounted at /workspace so build output
-# lands on the host.
-#
-# The canonical artifact is the BUILD-TREE binary:
-#   <build-dir>/runnable-lift
-# `cmake --install` does not install the runnable-lift target; the libcrypto
-# orchestrator (probe_build_tree_runnable_lift) reads it straight from the
-# build tree.
-#
-# Usage:
-#   runnable/scripts/build_runnable_lift.sh [build-dir-name]
-#
-# Defaults:
-#   build-dir-name = build-bionic   (relative to Runnable-Rewriting/)
+# The default build path now uses the QEMU V2 Ubuntu 24.04 runtime image and
+# the system LLVM package discovered by build_runnable_lift_v2.sh. Set
+# RUNNABLE_BUILD_IMAGE explicitly if you need to point this wrapper at a custom
+# or legacy image.
 #
 set -euo pipefail
 
-# Resolve Runnable-Rewriting/ from this script's location.
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-RR_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"          # .../Runnable-Rewriting
-WORKSPACE_ROOT="$(cd "$RR_DIR/.." && pwd)"          # parent that gets mounted at /workspace
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 
-IMAGE="${RUNNABLE_BUILD_IMAGE:-rr_bionic_exportfs:2026-04-14}"
-BUILD_NAME="${1:-build-bionic}"
-JOBS="${RUNNABLE_BUILD_JOBS:-$(nproc)}"
+IMAGE="${RUNNABLE_BUILD_IMAGE:-${RUNNABLE_QEMU_V2_IMAGE:-rr_qemu_v2_runtime:latest}}"
+BUILD_NAME="${RUNNABLE_BUILD_DIR:-build-qemu-v2}"
+JOBS="${RUNNABLE_BUILD_JOBS:-}"
 
-echo "Runnable-Rewriting : $RR_DIR"
-echo "mounted workspace  : $WORKSPACE_ROOT -> /workspace"
-echo "image              : $IMAGE"
-echo "build dir          : $RR_DIR/$BUILD_NAME"
-echo "parallel jobs      : $JOBS"
+FORWARD_ARGS=()
 
-docker run --rm \
-  -v "$WORKSPACE_ROOT":/workspace \
-  -w /workspace/Runnable-Rewriting \
-  "$IMAGE" bash -lc '
-set -euo pipefail
-BUILD=/workspace/Runnable-Rewriting/'"$BUILD_NAME"'
-DEPS=/root/Runnable-Rewriting/root
-mkdir -p "$BUILD"
-cd "$BUILD"
-cmake /workspace/Runnable-Rewriting/runnable \
-  -DCMAKE_BUILD_TYPE=Debug \
-  -DCMAKE_INSTALL_PREFIX="$BUILD/install" \
-  -DQEMU_INSTALL_PATH="$DEPS" \
-  -DLLVM_DIR="$DEPS/lib/cmake/llvm" \
-  -DBOOST_ROOT="$DEPS" \
-  -DBoost_NO_SYSTEM_PATHS=On \
-  -DCMAKE_CXX_LINK_FLAGS="-static-libgcc -static-libstdc++" \
-  -DCMAKE_C_LINK_FLAGS="-static-libgcc"
-# cmake 3.10 does not accept "cmake --build -j"; pass jobs to the native tool.
-cmake --build . -- -j'"$JOBS"'
-echo "BUILD_OK -> $BUILD/runnable-lift"
-'
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --build-dir)
+      BUILD_NAME="${2:?missing value for --build-dir}"
+      shift 2
+      ;;
+    --image)
+      IMAGE="${2:?missing value for --image}"
+      shift 2
+      ;;
+    --jobs|-j)
+      JOBS="${2:?missing value for --jobs}"
+      shift 2
+      ;;
+    --llvm-root|--llvm-dir|--qemu-install-path|--build-type)
+      FORWARD_ARGS+=("$1" "${2:?missing value for $1}")
+      shift 2
+      ;;
+    --no-docker|--skip-image-build|--verify|-h|--help)
+      FORWARD_ARGS+=("$1")
+      shift
+      ;;
+    --)
+      shift
+      while [[ $# -gt 0 ]]; do
+        if [[ "$1" == -* ]]; then
+          FORWARD_ARGS+=("$1")
+        else
+          BUILD_NAME="$1"
+        fi
+        shift
+      done
+      ;;
+    -*)
+      FORWARD_ARGS+=("$1")
+      shift
+      ;;
+    *)
+      BUILD_NAME="$1"
+      shift
+      ;;
+  esac
+done
 
-echo
-echo "Built binary: $RR_DIR/$BUILD_NAME/runnable-lift"
-echo "Canonical runnable-lift artifact: $RR_DIR/$BUILD_NAME/runnable-lift"
-echo "Do not default to source-tree runnable/tools/runnable-lift/runnable-lift; that binary may be stale."
-echo "Verify inside the container with:"
-echo "  runnable/scripts/build_runnable_lift.sh --verify $BUILD_NAME   # (see SKILL.md)"
+ARGS=()
+
+ARGS+=(--build-dir "$BUILD_NAME")
+ARGS+=(--image "$IMAGE")
+
+if [[ -n "$JOBS" ]]; then
+  ARGS+=(--jobs "$JOBS")
+fi
+
+exec "$SCRIPT_DIR/build_runnable_lift_v2.sh" "${ARGS[@]}" "${FORWARD_ARGS[@]}"

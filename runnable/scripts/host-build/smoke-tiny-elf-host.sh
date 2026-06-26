@@ -43,6 +43,17 @@ EOF
 die() { echo "error: $*" >&2; exit 1; }
 note() { printf '\n== %s ==\n' "$*"; }
 
+find_llvm_config_tool() {
+  local tool
+  for tool in llvm-config llvm-config-18 llvm-config-17 llvm-config-16; do
+    if command -v "$tool" >/dev/null 2>&1; then
+      printf '%s\n' "$tool"
+      return 0
+    fi
+  done
+  return 1
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --binary) RUNNABLE_LIFT="${2:?missing value for --binary}"; shift 2 ;;
@@ -63,7 +74,16 @@ fi
 # Compute LD_LIBRARY_PATH from the binary's build tree (parent of the lift dir).
 LIFT_DIR="$(cd "$(dirname "$RUNNABLE_LIFT")" && pwd -P)"
 BUILD_ROOT="$(cd "$LIFT_DIR/.." && pwd -P)"
-LD_PATH="$BUILD_ROOT/lib/StackAnalysis:$BUILD_ROOT/lib/BasicAnalyses:$BUILD_ROOT/lib/Support:$RR_DIR/root/lib"
+LD_PATH="$BUILD_ROOT/lib/StackAnalysis:$BUILD_ROOT/lib/BasicAnalyses:$BUILD_ROOT/lib/Support"
+if LLVM_CONFIG_TOOL="$(find_llvm_config_tool)"; then
+  LLVM_LIBDIR="$("$LLVM_CONFIG_TOOL" --libdir)"
+  if [[ -d "$LLVM_LIBDIR" ]]; then
+    LD_PATH="$LD_PATH:$LLVM_LIBDIR"
+  fi
+fi
+if [[ -d "$RR_DIR/root/lib" ]]; then
+  LD_PATH="$LD_PATH:$RR_DIR/root/lib"
+fi
 
 # Confirm the libtinycode runtime artifacts are next to the binary, otherwise
 # the lift will abort with "Couldn't find libtinycode and the helpers".

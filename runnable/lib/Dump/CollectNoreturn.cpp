@@ -15,6 +15,7 @@
 // Local libraries includes
 #include "runnable/Dump/CollectNoreturn.h"
 #include "runnable/Support/CommandLine.h"
+#include "runnable/Support/LLVMCompat.h"
 
 using namespace llvm;
 using namespace llvm::cl;
