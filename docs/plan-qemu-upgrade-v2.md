@@ -15,12 +15,17 @@ filter. Tombstone markers and FP filters are useful as diagnostics or temporary
 guardrails, but the V2 success criterion is that the lifted IR is produced from
 real QEMU/TCG semantics for the problematic instruction families.
 
+Concrete long-term execution plan:
+`docs/plan-qemu-v2-avx512-real-semantics.md`. That plan is the current
+real-semantics route for recovering raw no-fallback libcrypto recall; fallback,
+exclusion, and tombstone metrics remain diagnostics only.
+
 ## 2. Current Evidence
 
-The current repository uses QEMU `2.4.50` (`qemu/VERSION`) with a custom
-`x86_64-libtinycode` target and a PTC bridge implemented mainly in
-`qemu/linux-user/ptc.c`, `qemu/linux-user/ptc.h`, and
-`qemu/target-i386/translate.c`.
+The legacy backend is QEMU `2.4.50`, now archived at
+`archive/qemu-legacy-2.4.50/`, with a custom `x86_64-libtinycode` target and a
+PTC bridge implemented mainly in `linux-user/ptc.c`, `linux-user/ptc.h`, and
+`target-i386/translate.c`.
 
 The experimental reports under `docs/exp/` show the main failure modes:
 
@@ -34,7 +39,8 @@ The experimental reports under `docs/exp/` show the main failure modes:
 
 The AVX-512 root cause is already visible in the patched translator:
 
-- `0x62` EVEX prefixes are partially decoded in `qemu/target-i386/translate.c`.
+- `0x62` EVEX prefixes are partially decoded in the archived
+  `target-i386/translate.c`.
 - `case 0x200 ... 0x2ff` calls `ptc_evex_tail_bytes(...)`.
 - Supported EVEX instructions are only consumed by advancing `s->pc`.
 - No TCG operations are emitted for those instructions.

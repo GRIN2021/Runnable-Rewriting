@@ -8,6 +8,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 RR_DIR="$(cd "$SCRIPT_DIR/../.." && pwd -P)"
+LEGACY_QEMU_DIR="${RUNNABLE_QEMU_LEGACY_SRC:-$RR_DIR/archive/qemu-legacy-2.4.50}"
 
 SCRATCH_ROOT="${RUNNABLE_QEMU_V2_PTC_CSIDE_SCALAR_ROOT:-/tmp/rr-qemu-v2-upstream-probes/ptc-cside-scalar-list-smoke}"
 SCALAR_SMOKE_ROOT="${RUNNABLE_QEMU_V2_PTC_REAL_SCALAR_ROOT:-/tmp/rr-qemu-v2-upstream-probes/ptc-real-translate-scalar-smoke}"
@@ -535,8 +536,8 @@ PY
 log "Compiling the generated C harness against the repo ptc.h ABI"
 cc -std=c11 -O2 -g -Wall -Wextra -Werror \
   -Wno-unused-parameter \
-  -I"$RR_DIR/qemu/linux-user" \
-  -I"$RR_DIR/qemu/tcg" \
+  -I"$LEGACY_QEMU_DIR/linux-user" \
+  -I"$LEGACY_QEMU_DIR/tcg" \
   -o "$HARNESS_BIN" \
   "$HARNESS_C"
 

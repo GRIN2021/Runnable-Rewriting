@@ -64,6 +64,7 @@ ROOT_DROP_METADATA_RE = re.compile(
     r", !(?:alias\.scope|noalias|oi|pi) !\d+"
 )
 LOCAL_VALUE_RE = re.compile(r"%(\d+)\b")
+GLOBAL_STORE_RE = re.compile(r"^\s*store\b.*\*\s*@")
 DISAM_ADDR_RE = re.compile(r"0x([0-9a-fA-F]+):")
 NEWPC_ADDR_RE = re.compile(r"@newpc\(i64\s+(\d+),")
 PC_STORE_ADDR_RE = re.compile(r"store i64\s+(\d+), i64\* @pc")
@@ -828,12 +829,18 @@ def extract_root(raw_ll: Path) -> ParsedRoot:
     entry_label = entry_segment[0]
     entry_allocas: List[str] = []
     entry_rest: List[str] = []
-    seen_non_alloca = False
+    seen_entry_rest = False
     for line in entry_segment[1:]:
-        if not seen_non_alloca and " alloca " in line:
+        stripped = line.lstrip()
+        if (
+            not seen_entry_rest
+            and not stripped.startswith("switch ")
+            and not stripped.startswith("br ")
+            and not GLOBAL_STORE_RE.match(line)
+        ):
             entry_allocas.append(line)
             continue
-        seen_non_alloca = True
+        seen_entry_rest = True
         entry_rest.append(line)
 
     dispatcher_segment = [
@@ -1092,8 +1099,22 @@ def import_root_segment_refs(
             imported_extra_globals[global_ref] = sanitize_imported_symbol([definition])
 
 
+def _is_numeric_type_ref(line: str, match: re.Match[str]) -> bool:
+    end = match.end()
+    if end < len(line) and line[end] == "*":
+        return True
+
+    before = line[: match.start()]
+    return re.search(r"\bx\s+$", before) is not None
+
+
 def rename_local_values(lines: List[str], prefix: str) -> List[str]:
-    return [LOCAL_VALUE_RE.sub(lambda match: f"%{prefix}_{match.group(1)}", line) for line in lines]
+    def replace(match: re.Match[str]) -> str:
+        if _is_numeric_type_ref(match.string, match):
+            return match.group(0)
+        return f"%{prefix}_{match.group(1)}"
+
+    return [LOCAL_VALUE_RE.sub(replace, line) for line in lines]
 
 
 def normalize_root_local_values(lines: List[str]) -> List[str]:

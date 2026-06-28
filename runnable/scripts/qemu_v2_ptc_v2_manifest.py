@@ -22,7 +22,7 @@ DEFAULT_WALKER_JSONL = Path(
 )
 DEFAULT_TMP_DIR = Path("/tmp/rr-qemu-v2-ptc-v2-manifest")
 DEFAULT_INVENTORY_TOOL = REPO_ROOT / "runnable" / "scripts" / "qemu_v2_tcg_dump_ptc_inventory.py"
-DEFAULT_LEGACY_OPC = REPO_ROOT / "qemu" / "tcg" / "tcg-opc.h"
+DEFAULT_LEGACY_OPC = REPO_ROOT / "archive" / "qemu-legacy-2.4.50" / "tcg" / "tcg-opc.h"
 
 MANIFEST_SCHEMA = "qemu-v2-ptc-v2-opcode-schema-manifest-v1"
 INVENTORY_SCHEMA = "qemu-v2-tcg-ptc-inventory-v3"
@@ -83,6 +83,39 @@ V2_OPCODE_PROPOSALS = {
         "note": (
             "Modern walker reports raw opcode extract with TCG_TYPE_I64 in param1; "
             "the manifest canonicalizes that to extract_i64 for the PTC v2 ABI."
+        ),
+    },
+    "sextract_i64": {
+        "ptc_v2_opcode": "PTC_OP_SEXTRACT_I64",
+        "def_name": "sextract_i64",
+        "fallback_def": (1, 1, 2, "TCG_OPF_INT"),
+        "operands": [
+            {"index": 0, "role": "dst", "kind": "tcg-temp", "type": "i64"},
+            {"index": 1, "role": "src", "kind": "tcg-temp", "type": "i64"},
+            {"index": 2, "role": "offset", "kind": "constant", "unit": "bit"},
+            {"index": 3, "role": "length", "kind": "constant", "unit": "bit"},
+        ],
+        "note": (
+            "Modern walker reports raw opcode sextract with TCG_TYPE_I64 in "
+            "param1; the manifest canonicalizes that to sextract_i64 for the "
+            "PTC v2 ABI. Offset-zero slices are lowered by the materializer to "
+            "legacy signed-extension ops."
+        ),
+    },
+    "sextract_i32": {
+        "ptc_v2_opcode": "PTC_OP_SEXTRACT_I32",
+        "def_name": "sextract_i32",
+        "fallback_def": (1, 1, 2, "TCG_OPF_INT"),
+        "operands": [
+            {"index": 0, "role": "dst", "kind": "tcg-temp", "type": "i32"},
+            {"index": 1, "role": "src", "kind": "tcg-temp", "type": "i32"},
+            {"index": 2, "role": "offset", "kind": "constant", "unit": "bit"},
+            {"index": 3, "role": "length", "kind": "constant", "unit": "bit"},
+        ],
+        "note": (
+            "Modern walker reports raw opcode sextract with TCG_TYPE_I32 in "
+            "param1; offset-zero slices are lowered by the materializer to "
+            "legacy signed-extension ops when a matching legacy opcode exists."
         ),
     },
     "qemu_ld2": {
@@ -362,10 +395,10 @@ def decode_flags(value: Any) -> dict[str, Any]:
 
 
 def canonical_name(raw_name: str, record: dict[str, Any] | None) -> str:
-    if raw_name == "extract" and record:
+    if raw_name in {"extract", "sextract"} and record:
         tcg_type = decode_tcg_type(record.get("param1"))
         if tcg_type.get("abi") in {"i32", "i64", "i128"}:
-            return f"extract_{tcg_type['abi']}"
+            return f"{raw_name}_{tcg_type['abi']}"
     return raw_name
 
 

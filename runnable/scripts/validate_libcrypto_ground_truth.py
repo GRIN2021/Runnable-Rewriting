@@ -338,6 +338,20 @@ def write_cmp_verdict(out_dir: Path, payload: Dict[str, object], verdict: CmpVer
         f"recall: {float(payload.get('recall', 0.0)):.6f}",
         f"ok: {str(verdict.ok).lower()}",
     ]
+    static_fallback = payload.get("static_fallback")
+    if isinstance(static_fallback, dict) and static_fallback.get("enabled"):
+        lines.extend(
+            [
+                "static_fallback: true",
+                "static_fallback_profiles: "
+                + ",".join(str(item) for item in static_fallback.get("profiles", [])),
+                "static_fallback_symbol_regexes: "
+                + ",".join(str(item) for item in static_fallback.get("symbol_regexes", [])),
+                f"static_fallback_range_count: {int(static_fallback.get('range_count', 0))}",
+                f"static_fallback_covered_obj: {int(static_fallback.get('covered_obj', 0))}",
+                f"static_fallback_added: {int(static_fallback.get('added', 0))}",
+            ]
+        )
     if verdict.reasons:
         lines.append("")
         lines.append("[reasons]")
@@ -358,6 +372,8 @@ def run_cmp(
     min_precision: float,
     min_recall: float,
     examples: int,
+    static_fallback_profiles: Sequence[str] = (),
+    static_fallback_symbol_regexes: Sequence[str] = (),
 ) -> Tuple[Dict[str, object], CmpVerdict, Path, Path, Path]:
     ensure_file(binary, "binary")
     ensure_file(ll_path, "ll")
@@ -388,6 +404,10 @@ def run_cmp(
     if include_pc_file is not None:
         ensure_file(include_pc_file, "include_pc_file")
         cmd.extend(["--include-pc-file", str(include_pc_file)])
+    for profile in static_fallback_profiles:
+        cmd.extend(["--static-fallback-profile", profile])
+    for regex in static_fallback_symbol_regexes:
+        cmd.extend(["--static-fallback-symbol-regex", regex])
     result = run_cmd(cmd, check=False)
     if result.returncode != 0:
         raise RuntimeError(
@@ -428,6 +448,16 @@ def print_cmp_summary(
         f"text_start=0x{int(payload.get('text_start', 0)):x} "
         f"runnable_base=0x{int(payload.get('runnable_base', 0)):x}"
     )
+    static_fallback = payload.get("static_fallback")
+    if isinstance(static_fallback, dict) and static_fallback.get("enabled"):
+        print(
+            "static_fallback="
+            f"profiles={','.join(str(item) for item in static_fallback.get('profiles', []))} "
+            f"regexes={','.join(str(item) for item in static_fallback.get('symbol_regexes', []))} "
+            f"ranges={int(static_fallback.get('range_count', 0))} "
+            f"covered_obj={int(static_fallback.get('covered_obj', 0))} "
+            f"added={int(static_fallback.get('added', 0))}"
+        )
     if verdict.reasons:
         for reason in verdict.reasons:
             print(f"cmp_reason={reason}", file=sys.stderr)
@@ -530,6 +560,19 @@ def build_parser() -> argparse.ArgumentParser:
     cmp_parser.add_argument("--min-precision", type=float, default=DEFAULT_MIN_PRECISION)
     cmp_parser.add_argument("--min-recall", type=float, default=DEFAULT_MIN_RECALL)
     cmp_parser.add_argument("--examples", type=int, default=10)
+    cmp_parser.add_argument(
+        "--static-fallback-symbol-regex",
+        action="append",
+        default=[],
+        help="Forwarded to run_cmp_eval.py; opt-in static mnemonic fallback for matching ELF FUNC symbols.",
+    )
+    cmp_parser.add_argument(
+        "--static-fallback-profile",
+        action="append",
+        choices=("avx512", "simd-heavy", "all-functions", "all-text"),
+        default=[],
+        help="Forwarded to run_cmp_eval.py; named opt-in static mnemonic fallback profile.",
+    )
     cmp_parser.add_argument("--allow-low-metrics", action="store_true")
 
     all_parser = subparsers.add_parser("all", help="Run gap audit and then compare a lift")
@@ -542,6 +585,19 @@ def build_parser() -> argparse.ArgumentParser:
     all_parser.add_argument("--min-precision", type=float, default=DEFAULT_MIN_PRECISION)
     all_parser.add_argument("--min-recall", type=float, default=DEFAULT_MIN_RECALL)
     all_parser.add_argument("--examples", type=int, default=10)
+    all_parser.add_argument(
+        "--static-fallback-symbol-regex",
+        action="append",
+        default=[],
+        help="Forwarded to run_cmp_eval.py; opt-in static mnemonic fallback for matching ELF FUNC symbols.",
+    )
+    all_parser.add_argument(
+        "--static-fallback-profile",
+        action="append",
+        choices=("avx512", "simd-heavy", "all-functions", "all-text"),
+        default=[],
+        help="Forwarded to run_cmp_eval.py; named opt-in static mnemonic fallback profile.",
+    )
     all_parser.add_argument("--allow-low-metrics", action="store_true")
 
     return parser
@@ -586,6 +642,8 @@ def cmd_cmp(args: argparse.Namespace) -> int:
         min_precision=args.min_precision,
         min_recall=args.min_recall,
         examples=args.examples,
+        static_fallback_profiles=args.static_fallback_profile,
+        static_fallback_symbol_regexes=args.static_fallback_symbol_regex,
     )
     print_cmp_summary(payload, verdict, verdict_path)
     if verdict.ok or args.allow_low_metrics:

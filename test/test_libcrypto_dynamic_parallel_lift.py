@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import os
 import tempfile
 import sys
 import unittest
@@ -30,12 +31,13 @@ def load_module():
 class LibcryptoDynamicParallelLiftTests(unittest.TestCase):
     def test_parser_defaults_to_hdd_and_dynamic_image(self):
         module = load_module()
-        parser = module.build_parser()
 
-        args = parser.parse_args([])
+        with mock.patch.dict(os.environ, {}, clear=True):
+            parser = module.build_parser()
+            args = parser.parse_args([])
 
         self.assertEqual(args.hdd_root, Path("/hdd/runnable-libcrypto-dynamic-parallel"))
-        self.assertEqual(args.docker_image, "rr_bionic_exportfs:2026-04-14")
+        self.assertEqual(args.docker_image, module.DEFAULT_RUNNABLE_IMAGE)
         self.assertEqual(args.runnable_base, 0x50000000)
         self.assertIsNone(args.seed_start)
         self.assertEqual(args.execution_model, "single-container-shards")
@@ -45,6 +47,63 @@ class LibcryptoDynamicParallelLiftTests(unittest.TestCase):
         self.assertEqual(args.hdd_min_free_gb, 50.0)
         self.assertIsNone(args.libtinycode_path)
         self.assertIsNone(args.libtinycode_helpers_path)
+        self.assertEqual(args.static_fallback_profile, [])
+        self.assertEqual(args.static_fallback_symbol_regex, [])
+
+    def test_parser_default_image_uses_qemu_v2_env_override(self):
+        with mock.patch.dict(os.environ, {"RUNNABLE_QEMU_V2_IMAGE": "rr_qemu_v2_runtime:test"}):
+            module = load_module()
+            parser = module.build_parser()
+
+        args = parser.parse_args([])
+
+        self.assertEqual(args.docker_image, "rr_qemu_v2_runtime:test")
+
+    def test_build_defaults_use_system_llvm_contract(self):
+        content = SCRIPT_PATH.read_text(encoding="utf-8")
+
+        self.assertIn("llvm-config --cmakedir", content)
+        self.assertIn('-DLLVM_DIR="$LLVM_DIR"', content)
+        self.assertIn('"/usr/lib/llvm-18/lib"', content)
+        self.assertNotIn("-DLLVM_DIR=/root/Runnable-Rewriting/root/lib/cmake/llvm", content)
+        self.assertNotIn(":/root/Runnable-Rewriting/root/bin:", content)
+
+    def test_static_fallback_cli_options_are_repeatable_and_saved_in_config(self):
+        module = load_module()
+        parser = module.build_parser()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            args = parser.parse_args(
+                [
+                    "--hdd-root",
+                    tmp,
+                    "--run-label",
+                    "demo",
+                    "--static-fallback-profile",
+                    "avx512",
+                    "--static-fallback-profile",
+                    "simd-heavy",
+                    "--static-fallback-profile",
+                    "all-functions",
+                    "--static-fallback-profile",
+                    "all-text",
+                    "--static-fallback-symbol-regex",
+                    "^OPENSSL_",
+                    "--static-fallback-symbol-regex",
+                    "sha512",
+                ]
+            )
+            with mock.patch.object(module, "detect_total_memory_gb", return_value=64.0):
+                config = module.load_config(args)
+
+        self.assertEqual(
+            config.static_fallback_profiles,
+            ("avx512", "simd-heavy", "all-functions", "all-text"),
+        )
+        self.assertEqual(
+            config.static_fallback_symbol_regexes,
+            ("^OPENSSL_", "sha512"),
+        )
 
     def test_memory_budget_limits_workers_per_coordinator(self):
         module = load_module()
@@ -68,7 +127,7 @@ class LibcryptoDynamicParallelLiftTests(unittest.TestCase):
             repo_root=Path("/repo/workspace/Runnable-Rewriting"),
             groudtruth_repo_root=Path("/repo/workspace/GroudTruth"),
             layout=layout,
-            docker_image="rr_bionic_exportfs:2026-04-14",
+            docker_image=module.DEFAULT_RUNNABLE_IMAGE,
             gt_x86_image="bin2415/x86_gt:0.1",
             gt_py_image="bin2415/py_gt",
             runnable_base=0x50000000,
@@ -130,7 +189,7 @@ class LibcryptoDynamicParallelLiftTests(unittest.TestCase):
                 repo_root=Path("/repo/workspace/Runnable-Rewriting"),
                 groudtruth_repo_root=Path("/repo/workspace/GroudTruth"),
                 layout=layout,
-                docker_image="rr_bionic_exportfs:2026-04-14",
+                docker_image=module.DEFAULT_RUNNABLE_IMAGE,
                 gt_x86_image="bin2415/x86_gt:0.1",
                 gt_py_image="bin2415/py_gt",
                 runnable_base=0x50000000,
@@ -187,6 +246,129 @@ class LibcryptoDynamicParallelLiftTests(unittest.TestCase):
                 (layout.install_dir / "lib" / "libtinycode-helpers-x86_64.ll").read_text(encoding="utf-8"),
                 "ll\n",
             )
+            self.assertEqual(
+                (layout.install_dir / "bin" / "libtinycode-x86_64.so").read_text(encoding="utf-8"),
+                "so\n",
+            )
+            self.assertEqual(
+                (layout.install_dir / "bin" / "libtinycode-helpers-x86_64.ll").read_text(encoding="utf-8"),
+                "ll\n",
+            )
+
+    def test_stage_libtinycode_runtime_assets_auto_discovers_repo_runtime(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo_root = root / "repo"
+            runtime_dir = repo_root / "build-codex-dynamic-current" / "tools" / "runnable-lift"
+            runtime_dir.mkdir(parents=True)
+            (runtime_dir / "libtinycode-x86_64.so").write_text("so\n", encoding="utf-8")
+            (runtime_dir / "libtinycode-helpers-x86_64.ll").write_text("ll\n", encoding="utf-8")
+            layout = module.build_layout(root / "hdd", "demo")
+            module.materialize_layout(layout)
+            config = module.LiftConfig(
+                workspace_root=Path("/repo/workspace"),
+                repo_root=repo_root,
+                groudtruth_repo_root=Path("/repo/workspace/GroudTruth"),
+                layout=layout,
+                docker_image=module.DEFAULT_RUNNABLE_IMAGE,
+                gt_x86_image="bin2415/x86_gt:0.1",
+                gt_py_image="bin2415/py_gt",
+                runnable_base=0x50000000,
+                min_function_size=64,
+                max_seeds=0,
+                seed_start=None,
+                requested_parallel_workers=4,
+                max_concurrent_coordinators=2,
+                worker_memory_gb=3.0,
+                build_memory_gb=16.0,
+                memory_headroom_gb=8.0,
+                container_memory_limit_gb=24.0,
+                rebuild_lift=True,
+                ensure_groundtruth=True,
+                dry_run=True,
+                lift_timeout_sec=1800,
+                skip_cmp=False,
+                groundtruth_version="canonical",
+                groundtruth_openssl_version="3.4.4",
+                run_label="demo",
+                coordinator_flags=tuple(module.DEFAULT_COORDINATOR_EXTRA_FLAGS),
+                execution_model="single-container-shards",
+                shard_byte_budget=4096,
+                shard_max_seeds=64,
+                shard_concurrency=2,
+                container_cpus=30.0,
+                preserve_success_seed_logs=False,
+                streaming_merge=True,
+                merge_workers=2,
+                merge_batch_size=64,
+                merge_poll_interval_sec=1.0,
+            )
+
+            staged_install = module.stage_libtinycode_runtime_assets(config, layout.install_dir)
+
+            self.assertEqual(staged_install, layout.install_dir / "lib")
+            self.assertEqual(
+                (layout.install_dir / "lib" / "libtinycode-x86_64.so").read_text(encoding="utf-8"),
+                "so\n",
+            )
+            self.assertEqual(
+                (layout.install_dir / "bin" / "libtinycode-helpers-x86_64.ll").read_text(encoding="utf-8"),
+                "ll\n",
+            )
+
+    def test_stage_libtinycode_runtime_assets_ignores_source_tree_stub(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo_root = root / "repo"
+            runtime_dir = repo_root / "runnable" / "tools" / "runnable-lift"
+            runtime_dir.mkdir(parents=True)
+            (runtime_dir / "libtinycode-x86_64.so").write_text("stub\n", encoding="utf-8")
+            (runtime_dir / "libtinycode-helpers-x86_64.ll").write_text("ll\n", encoding="utf-8")
+            layout = module.build_layout(root / "hdd", "demo")
+            module.materialize_layout(layout)
+            config = module.LiftConfig(
+                workspace_root=Path("/repo/workspace"),
+                repo_root=repo_root,
+                groudtruth_repo_root=Path("/repo/workspace/GroudTruth"),
+                layout=layout,
+                docker_image=module.DEFAULT_RUNNABLE_IMAGE,
+                gt_x86_image="bin2415/x86_gt:0.1",
+                gt_py_image="bin2415/py_gt",
+                runnable_base=0x50000000,
+                min_function_size=64,
+                max_seeds=0,
+                seed_start=None,
+                requested_parallel_workers=4,
+                max_concurrent_coordinators=2,
+                worker_memory_gb=3.0,
+                build_memory_gb=16.0,
+                memory_headroom_gb=8.0,
+                container_memory_limit_gb=24.0,
+                rebuild_lift=True,
+                ensure_groundtruth=True,
+                dry_run=False,
+                lift_timeout_sec=1800,
+                skip_cmp=False,
+                groundtruth_version="canonical",
+                groundtruth_openssl_version="3.4.4",
+                run_label="demo",
+                coordinator_flags=tuple(module.DEFAULT_COORDINATOR_EXTRA_FLAGS),
+                execution_model="single-container-shards",
+                shard_byte_budget=4096,
+                shard_max_seeds=64,
+                shard_concurrency=2,
+                container_cpus=30.0,
+                preserve_success_seed_logs=False,
+                streaming_merge=True,
+                merge_workers=2,
+                merge_batch_size=64,
+                merge_poll_interval_sec=1.0,
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "missing libtinycode runtime assets"):
+                module.stage_libtinycode_runtime_assets(config, layout.install_dir)
 
     def test_plan_shards_groups_small_adjacent_and_keeps_large_seed(self):
         module = load_module()
@@ -196,7 +378,7 @@ class LibcryptoDynamicParallelLiftTests(unittest.TestCase):
             repo_root=Path("/repo/workspace/Runnable-Rewriting"),
             groudtruth_repo_root=Path("/repo/workspace/GroudTruth"),
             layout=layout,
-            docker_image="rr_bionic_exportfs:2026-04-14",
+            docker_image=module.DEFAULT_RUNNABLE_IMAGE,
             gt_x86_image="bin2415/x86_gt:0.1",
             gt_py_image="bin2415/py_gt",
             runnable_base=0x50000000,
@@ -425,6 +607,72 @@ class LibcryptoDynamicParallelLiftTests(unittest.TestCase):
                 module.render_summary(second),
             )
 
+    def test_measure_tree_bytes_accepts_du_size_when_du_exits_nonzero(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            result = module.subprocess.CompletedProcess(
+                args=["du", "-sb", str(root)],
+                returncode=1,
+                stdout=f"123\t{root}\n",
+                stderr="du: cannot access 'gone.ll': No such file or directory\n",
+            )
+
+            with mock.patch.object(module, "run_cmd", return_value=result) as run_cmd:
+                size = module.measure_tree_bytes(root)
+
+            self.assertEqual(size, 123)
+            run_cmd.assert_called_once_with(
+                ["du", "-sb", str(root)],
+                capture_output=True,
+                check=False,
+            )
+
+    def test_measure_tree_bytes_raises_when_du_has_no_parseable_size(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            result = module.subprocess.CompletedProcess(
+                args=["du", "-sb", str(root)],
+                returncode=1,
+                stdout="",
+                stderr="du: cannot access root: No such file or directory\n",
+            )
+
+            with (
+                mock.patch.object(module, "run_cmd", return_value=result),
+                mock.patch.object(module.time, "sleep"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "du -sb failed"):
+                    module.measure_tree_bytes(root)
+
+    def test_measure_tree_bytes_retries_deleted_file_race_without_stdout(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            transient = module.subprocess.CompletedProcess(
+                args=["du", "-sb", str(root)],
+                returncode=1,
+                stdout="",
+                stderr="du: cannot access 'gone.ll': No such file or directory\n",
+            )
+            success = module.subprocess.CompletedProcess(
+                args=["du", "-sb", str(root)],
+                returncode=0,
+                stdout=f"456\t{root}\n",
+                stderr="",
+            )
+
+            with (
+                mock.patch.object(module, "run_cmd", side_effect=[transient, success]) as run_cmd,
+                mock.patch.object(module.time, "sleep") as sleep,
+            ):
+                size = module.measure_tree_bytes(root)
+
+            self.assertEqual(size, 456)
+            self.assertEqual(run_cmd.call_count, 2)
+            sleep.assert_called_once_with(module.DU_TRANSIENT_RETRY_DELAY_SEC)
+
     def test_collect_disk_budget_snapshot_flags_low_free_space(self):
         module = load_module()
         with tempfile.TemporaryDirectory() as tmp:
@@ -435,7 +683,7 @@ class LibcryptoDynamicParallelLiftTests(unittest.TestCase):
                 repo_root=Path("/repo/workspace/Runnable-Rewriting"),
                 groudtruth_repo_root=Path("/repo/workspace/GroudTruth"),
                 layout=layout,
-                docker_image="rr_bionic_exportfs:2026-04-14",
+                docker_image=module.DEFAULT_RUNNABLE_IMAGE,
                 gt_x86_image="bin2415/x86_gt:0.1",
                 gt_py_image="bin2415/py_gt",
                 runnable_base=0x50000000,
@@ -494,7 +742,7 @@ class LibcryptoDynamicParallelLiftTests(unittest.TestCase):
                 repo_root=Path("/repo/workspace/Runnable-Rewriting"),
                 groudtruth_repo_root=Path("/repo/workspace/GroudTruth"),
                 layout=layout,
-                docker_image="rr_bionic_exportfs:2026-04-14",
+                docker_image=module.DEFAULT_RUNNABLE_IMAGE,
                 gt_x86_image="bin2415/x86_gt:0.1",
                 gt_py_image="bin2415/py_gt",
                 runnable_base=0x50000000,
@@ -555,7 +803,7 @@ class LibcryptoDynamicParallelLiftTests(unittest.TestCase):
             repo_root=Path("/repo/workspace/Runnable-Rewriting"),
             groudtruth_repo_root=Path("/repo/workspace/GroudTruth"),
             layout=layout,
-            docker_image="rr_bionic_exportfs:2026-04-14",
+            docker_image=module.DEFAULT_RUNNABLE_IMAGE,
             gt_x86_image="bin2415/x86_gt:0.1",
             gt_py_image="bin2415/py_gt",
             runnable_base=0x50000000,
@@ -604,6 +852,65 @@ class LibcryptoDynamicParallelLiftTests(unittest.TestCase):
 
         self.assertFalse(args.streaming_merge)
 
+    def test_run_canonical_cmp_dry_run_forwards_static_fallback_flags(self):
+        module = load_module()
+        parser = module.build_parser()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            args = parser.parse_args(
+                [
+                    "--hdd-root",
+                    str(root),
+                    "--run-label",
+                    "demo",
+                    "--repo-root",
+                    str(root / "repo"),
+                    "--dry-run",
+                    "--static-fallback-profile",
+                    "avx512",
+                    "--static-fallback-profile",
+                    "simd-heavy",
+                    "--static-fallback-profile",
+                    "all-functions",
+                    "--static-fallback-profile",
+                    "all-text",
+                    "--static-fallback-symbol-regex",
+                    "custom_avx",
+                ]
+            )
+            with mock.patch.object(module, "detect_total_memory_gb", return_value=64.0):
+                config = module.load_config(args)
+
+            with mock.patch.object(module, "detect_text_start", return_value=0xCEF80):
+                payload = module.run_canonical_cmp(
+                    config=config,
+                    binary=root / "libcrypto.so.3",
+                    groundtruth_pb=root / "libcrypto.gtBlock.pb",
+                    ll_path=root / "libcrypto.ll",
+                    cmp_tool=root / "run_cmp_eval.py",
+                    blocks_pb2=root / "blocks_pb2.py",
+                )
+
+            cmd = payload["cmd"]
+            self.assertEqual(payload["status"], "dry-run")
+            self.assertEqual(
+                [
+                    cmd[index + 1]
+                    for index, token in enumerate(cmd)
+                    if token == "--static-fallback-profile"
+                ],
+                ["avx512", "simd-heavy", "all-functions", "all-text"],
+            )
+            self.assertEqual(
+                [
+                    cmd[index + 1]
+                    for index, token in enumerate(cmd)
+                    if token == "--static-fallback-symbol-regex"
+                ],
+                ["custom_avx"],
+            )
+
     def test_plan_merge_batches_returns_root_for_multi_level_tree(self):
         module = load_module()
         with tempfile.TemporaryDirectory() as tmp:
@@ -614,7 +921,7 @@ class LibcryptoDynamicParallelLiftTests(unittest.TestCase):
                 repo_root=Path("/repo/workspace/Runnable-Rewriting"),
                 groudtruth_repo_root=Path("/repo/workspace/GroudTruth"),
                 layout=layout,
-                docker_image="rr_bionic_exportfs:2026-04-14",
+                docker_image=module.DEFAULT_RUNNABLE_IMAGE,
                 gt_x86_image="bin2415/x86_gt:0.1",
                 gt_py_image="bin2415/py_gt",
                 runnable_base=0x50000000,
@@ -676,7 +983,7 @@ class LibcryptoDynamicParallelLiftTests(unittest.TestCase):
                 repo_root=Path("/repo/workspace/Runnable-Rewriting"),
                 groudtruth_repo_root=Path("/repo/workspace/GroudTruth"),
                 layout=layout,
-                docker_image="rr_bionic_exportfs:2026-04-14",
+                docker_image=module.DEFAULT_RUNNABLE_IMAGE,
                 gt_x86_image="bin2415/x86_gt:0.1",
                 gt_py_image="bin2415/py_gt",
                 runnable_base=0x50000000,
@@ -750,7 +1057,7 @@ class LibcryptoDynamicParallelLiftTests(unittest.TestCase):
                 repo_root=Path("/repo/workspace/Runnable-Rewriting"),
                 groudtruth_repo_root=Path("/repo/workspace/GroudTruth"),
                 layout=layout,
-                docker_image="rr_bionic_exportfs:2026-04-14",
+                docker_image=module.DEFAULT_RUNNABLE_IMAGE,
                 gt_x86_image="bin2415/x86_gt:0.1",
                 gt_py_image="bin2415/py_gt",
                 runnable_base=0x50000000,
@@ -843,7 +1150,7 @@ class LibcryptoDynamicParallelLiftTests(unittest.TestCase):
                 repo_root=Path("/repo/workspace/Runnable-Rewriting"),
                 groudtruth_repo_root=Path("/repo/workspace/GroudTruth"),
                 layout=layout,
-                docker_image="rr_bionic_exportfs:2026-04-14",
+                docker_image=module.DEFAULT_RUNNABLE_IMAGE,
                 gt_x86_image="bin2415/x86_gt:0.1",
                 gt_py_image="bin2415/py_gt",
                 runnable_base=0x50000000,
@@ -1013,7 +1320,7 @@ class LibcryptoDynamicParallelLiftTests(unittest.TestCase):
                 repo_root=Path("/repo/workspace/Runnable-Rewriting"),
                 groudtruth_repo_root=Path("/repo/workspace/GroudTruth"),
                 layout=layout,
-                docker_image="rr_bionic_exportfs:2026-04-14",
+                docker_image=module.DEFAULT_RUNNABLE_IMAGE,
                 gt_x86_image="bin2415/x86_gt:0.1",
                 gt_py_image="bin2415/py_gt",
                 runnable_base=0x50000000,

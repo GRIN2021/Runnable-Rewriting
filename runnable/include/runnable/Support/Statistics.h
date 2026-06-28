@@ -6,6 +6,7 @@
 //
 
 // Standard includes
+#include <cmath>
 #include <csignal>
 #include <cstdlib>
 #include <map>
@@ -153,7 +154,7 @@ public:
 
   double variance() const { return ((N > 1) ? NewS / (N - 1) : 0.0); }
 
-  double standardDeviation() const { return sqrt(variance()); }
+  double standardDeviation() const { return std::sqrt(variance()); }
 
   template<typename T>
   void dump(T &Output) {

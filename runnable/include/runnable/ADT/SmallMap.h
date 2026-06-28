@@ -9,13 +9,73 @@
 #include <array>
 #include <map>
 
-// Boost includes
+#if defined(__has_include)
+#if __has_include(<boost/variant.hpp>)
+#define RUNNABLE_HAS_BOOST_VARIANT 1
+#endif
+#else
+#define RUNNABLE_HAS_BOOST_VARIANT 1
+#endif
+
+#if RUNNABLE_HAS_BOOST_VARIANT
 #include <boost/variant.hpp>
+#else
+#include <variant>
+#endif
 
 // Local libraries includes
 #include "runnable/Support/Assert.h"
 
 // TODO: test SmallMap
+
+namespace smallmap_detail {
+
+#if RUNNABLE_HAS_BOOST_VARIANT
+template<typename R>
+using StaticVisitor = boost::static_visitor<R>;
+
+template<typename... Ts>
+using Variant = boost::variant<Ts...>;
+
+template<typename Visitor, typename VariantT>
+auto applyVisitor(Visitor &&V, VariantT &&Variant)
+  -> decltype(boost::apply_visitor(std::forward<Visitor>(V),
+                                   std::forward<VariantT>(Variant))) {
+  return boost::apply_visitor(std::forward<Visitor>(V),
+                              std::forward<VariantT>(Variant));
+}
+
+template<typename Visitor, typename VariantT, typename OtherVariantT>
+auto applyVisitor(Visitor &&V, VariantT &&Variant, OtherVariantT &&Other)
+  -> decltype(boost::apply_visitor(std::forward<Visitor>(V),
+                                   std::forward<VariantT>(Variant),
+                                   std::forward<OtherVariantT>(Other))) {
+  return boost::apply_visitor(std::forward<Visitor>(V),
+                              std::forward<VariantT>(Variant),
+                              std::forward<OtherVariantT>(Other));
+}
+#else
+template<typename R>
+struct StaticVisitor {};
+
+template<typename... Ts>
+using Variant = std::variant<Ts...>;
+
+template<typename Visitor, typename VariantT>
+decltype(auto) applyVisitor(Visitor &&V, VariantT &&Variant) {
+  return std::visit(std::forward<Visitor>(V), std::forward<VariantT>(Variant));
+}
+
+template<typename Visitor, typename VariantT, typename OtherVariantT>
+decltype(auto) applyVisitor(Visitor &&V, VariantT &&Variant,
+                            OtherVariantT &&Other) {
+  return std::visit(std::forward<Visitor>(V),
+                    std::forward<VariantT>(Variant),
+                    std::forward<OtherVariantT>(Other));
+}
+#endif
+
+} // namespace smallmap_detail
 
 /// \brief Type-safe wrapper for different iterators sharing value_type
 template<typename... Ts>
@@ -54,63 +114,67 @@ public:
   Iteratall(T I) : Iterator(I) {}
 
 private:
-  struct PostincrementVisitor : public boost::static_visitor<Iteratall> {
+  struct PostincrementVisitor
+    : public smallmap_detail::StaticVisitor<Iteratall> {
     template<typename T>
     Iteratall operator()(T &It) const {
       return Iteratall(It++);
     }
   };
 
-  struct PreincrementVisitor : public boost::static_visitor<Iteratall> {
+  struct PreincrementVisitor
+    : public smallmap_detail::StaticVisitor<Iteratall> {
     template<typename T>
     Iteratall operator()(T &It) const {
       return Iteratall(++It);
     }
   };
 
-  struct DereferenceVisitor : public boost::static_visitor<reference> {
+  struct DereferenceVisitor : public smallmap_detail::StaticVisitor<reference> {
     template<typename T>
-    reference operator()(T &It) const {
+    reference operator()(const T &It) const {
       return *It;
     }
   };
 
-  struct CompareVisitor : public boost::static_visitor<bool> {
+  struct CompareVisitor : public smallmap_detail::StaticVisitor<bool> {
     template<typename T, typename R>
-    bool operator()(T &, R &) const {
+    bool operator()(const T &, const R &) const {
       // The compared type should always be the same
       runnable_abort();
     }
 
     template<typename T>
-    bool operator()(T &It, T &Other) const {
+    bool operator()(const T &It, const T &Other) const {
       return It == Other;
     }
   };
 
 public:
   Iteratall operator++(int) {
-    return boost::apply_visitor(PostincrementVisitor(), Iterator);
+    return smallmap_detail::applyVisitor(PostincrementVisitor(), Iterator);
   }
 
   Iteratall operator++() {
-    return boost::apply_visitor(PreincrementVisitor(), Iterator);
+    return smallmap_detail::applyVisitor(PreincrementVisitor(), Iterator);
   }
 
   bool operator==(const Iteratall &Other) const {
-    return boost::apply_visitor(CompareVisitor(), Iterator, Other.Iterator);
+    return smallmap_detail::applyVisitor(CompareVisitor(),
+                                         Iterator,
+                                         Other.Iterator);
   }
 
   bool operator!=(const Iteratall &Other) const { return !(*this == Other); }
 
   reference operator*() const {
-    return boost::apply_visitor(DereferenceVisitor(), Iterator);
+    return smallmap_detail::applyVisitor(DereferenceVisitor(), Iterator);
   }
 
   pointer operator->() const { return &**this; }
 
 private:
-  boost::variant<Ts...> Iterator;
+  smallmap_detail::Variant<Ts...> Iterator;
 };
 
 /// \brief map that usually contains less than N elements

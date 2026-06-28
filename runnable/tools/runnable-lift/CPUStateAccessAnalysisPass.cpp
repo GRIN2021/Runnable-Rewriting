@@ -7,12 +7,14 @@
 //
 
 // Standard includes
+#include <iterator>
 #include <sstream>
 #include <stack>
 #include <string>
 #include <vector>
 
 // LLVM includes
+#include "llvm/ADT/Optional.h"
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Module.h"
@@ -296,7 +298,8 @@ forwardTaintAnalysis(GlobalVariable *CPUStatePtr,
       } break;
       case Instruction::Store: {
         TaintLog << "STORE" << DoLog;
-        runnable_assert(OperandNo == StoreInst::getPointerOperandIndex());
+        if (OperandNo != StoreInst::getPointerOperandIndex())
+          break;
         auto *S = cast<StoreInst>(TheUser);
         if (TheUse->get() == S->getPointerOperand()) {
           if (TaintLog.isEnabled()) {
@@ -477,7 +480,7 @@ forwardTaintAnalysis(GlobalVariable *CPUStatePtr,
           if (TaintLog.isEnabled()) {
             TaintLog << "TAINT: " << CSInfo.CallSite << DoLog;
             TaintLog << dumpToString(CallSiteInfos.top().CallSite) << DoLog;
-            std::string Name = getCallee(CSInfo.CallSite)->getName();
+            std::string Name = getCallee(CSInfo.CallSite)->getName().str();
             TaintLog << "pair: < " << Name << ", " << CSInfo.ArgNo << " > "
                      << DoLog;
           }
@@ -972,7 +975,7 @@ public:
 
         bool Valid;
         CSVOffsets::Kind ResKind;
-        SmallVector<Optional<CSVOffsets>, 4> UpdatedOffsetTuple(NumSrcs);
+        SmallVector<OptCSVOffsets, 4> UpdatedOffsetTuple(NumSrcs);
         runnable_assert(not UpdatedOffsetTuple[0].hasValue());
         std::tie(Valid,
                  ResKind) = T::checkOffsetTupleIsValid(OffsetTuple,
@@ -1132,8 +1135,12 @@ private:
       return { false, GEPOp0Kind };
 
     auto *GEP = cast<GetElementPtrInst>(I);
+#if LLVM_VERSION_MAJOR >= 15
+    Type *PointeeTy = GEP->getSourceElementType();
+#else
     auto *PtrTy = cast<PointerType>(GEP->getPointerOperandType());
     Type *PointeeTy = PtrTy->getElementType();
+#endif
 
     if (GEP->hasIndices() and PointeeTy->isArrayTy()) {
 
@@ -1380,7 +1387,7 @@ public:
     LoadOffsets(LoadOff),
     StoreOffsets(StoreOff),
     CallSiteLoadOffsets(CallSiteLoadOff),
-    CallSiteStoreOffsets(CallSiteLoadOff),
+    CallSiteStoreOffsets(CallSiteStoreOff),
     ValueCallSiteOffsets(),
     LoadCallSiteOffsets(),
     StoreCallSiteOffsets(),
@@ -1703,7 +1710,7 @@ void CPUSAOA::computeOffsetsFromSources(const WorkItem &Item, bool IsLoad) {
       // combines all of the `CSVOffsets` to compute the new `CSVOffsets` of the
       // node that we're popping.
       for (const auto &CallSrc : CallSiteSrcIds) {
-        Optional<CSVOffsets> New;
+        OptCSVOffsets New;
         CallInst *TheCall = CallSrc.first;
         for (const auto i : CallSrc.second) {
           CSVAccessLog << "AT: " << TheCall << DoLog;
@@ -2054,13 +2061,11 @@ void CPUSAOA::computeAggregatedOffsets() {
       AccessSize = SizeParam->getSExtValue();
     } else if (IsLoad) {
       auto *Load = cast<LoadInst>(Instr);
-      auto *PtrTy = cast<PointerType>(Load->getPointerOperand()->getType());
-      Type *LoadedType = PtrTy->getElementType();
+      Type *LoadedType = Load->getType();
       AccessSize = DL.getTypeAllocSize(LoadedType);
     } else {
       auto Store = cast<StoreInst>(Instr);
-      auto *PtrTy = cast<PointerType>(Store->getPointerOperand()->getType());
-      Type *StoredType = PtrTy->getElementType();
+      Type *StoredType = Store->getValueOperand()->getType();
       AccessSize = DL.getTypeAllocSize(StoredType);
     }
     runnable_assert(AccessSize != 0);
@@ -2107,12 +2112,20 @@ void CPUSAOA::computeAggregatedOffsets() {
                        InternalOffset) = Variables->getByEnvOffset(Refined);
               int64_t SizeAtOffset = 0;
               if (AccessedVar != nullptr) {
-                Type *AccessedTy = AccessedVar->getType();
+                Type *AccessedTy = AccessedVar->getValueType();
                 SizeAtOffset = DL.getTypeAllocSize(AccessedTy) - InternalOffset;
-                runnable_assert(SizeAtOffset > 0);
-                FineGrainedOffsets.insert(Refined - InternalOffset);
-                CSVAccessLog << "Value: " << I << DoLog;
-                CSVAccessLog << "Insert Refined: " << Refined << DoLog;
+                if (SizeAtOffset > 0) {
+                  FineGrainedOffsets.insert(Refined - InternalOffset);
+                  CSVAccessLog << "Value: " << I << DoLog;
+                  CSVAccessLog << "Insert Refined: " << Refined << DoLog;
+                } else {
+                  CSVAccessLog << "Skip invalid CPUState access boundary: "
+                               << "refined=" << Refined
+                               << " internal-offset=" << InternalOffset
+                               << " var=" << AccessedVar->getName().str()
+                               << DoLog;
+                  SizeAtOffset = 1;
+                }
               } else {
                 // Skip padding one byte at a time, without adding offsets
                 SizeAtOffset = 1;
@@ -2126,7 +2139,8 @@ void CPUSAOA::computeAggregatedOffsets() {
         // Finally insert them or combine them
         CallSiteOffsetMap::iterator CallOffsetIt;
         std::tie(CallOffsetIt,
-                 Inserted) = CallSiteOffsets.insert({ Call, New.getValue() });
+                 Inserted) = CallSiteOffsets.insert(
+                   std::make_pair(Call, New.getValue()));
         if (not Inserted)
           CallOffsetIt->second.combine(New.getValue());
       }
@@ -2281,7 +2295,7 @@ static void addAccessMetadata(const CallSiteOffsetMap &OffsetMap,
         CSVAccessLog << "CallSite: " << CallSite << DoLog;
         CSVAccessLog << "Refined: " << O << DoLog;
         GlobalVariable *AccessedVar = Variables->getByEnvOffset(O).first;
-        std::string VarName = AccessedVar->getName();
+        std::string VarName = AccessedVar->getName().str();
         MDString *VarNameMD = QMD.get(VarName);
         bool NewlyInserted = AccessedVarNames.insert(VarName).second;
         if (NewlyInserted) {
@@ -2323,8 +2337,7 @@ static Value *getLoadAddressValue(Instruction *I) {
 
 static Type *getLoadedType(Instruction *I) {
   if (auto Load = dyn_cast<LoadInst>(I)) {
-    auto *PtrTy = cast<PointerType>(Load->getPointerOperand()->getType());
-    return PtrTy->getElementType();
+    return Load->getType();
   }
   return nullptr;
 }
@@ -2353,8 +2366,7 @@ static Value *getStoreAddressValue(Instruction *I) {
 
 static Type *getStoredType(Instruction *I) {
   if (auto Store = dyn_cast<StoreInst>(I)) {
-    auto *PtrTy = cast<PointerType>(Store->getPointerOperand()->getType());
-    return PtrTy->getElementType();
+    return Store->getValueOperand()->getType();
   }
   return nullptr;
 }
@@ -2387,19 +2399,26 @@ static void fixEnv2EnvMemCopies(const Module &M,
       Function *F = Instr->getParent()->getParent();
       Builder.SetInsertPoint(&*F->getEntryBlock().begin());
       AllocaInst *TmpBuffer = Builder.CreateAlloca(CharTy, MemcpySize);
+#if LLVM_VERSION_MAJOR >= 10
+      auto TmpBufferAlignment = TmpBuffer->getAlign();
+      MaybeAlign OneAlignment = Align(1);
+#else
+      auto TmpBufferAlignment = TmpBuffer->getAlignment();
+      auto OneAlignment = 1;
+#endif
 
       Builder.SetInsertPoint(Instr);
       CallInst *MemcpyLoad = Builder.CreateMemCpy(TmpBuffer,
-                                                  TmpBuffer->getAlignment(),
+                                                  TmpBufferAlignment,
                                                   MemcpySrc,
-                                                  1,
+                                                  OneAlignment,
                                                   MemcpySize);
       NewLoadCSOffsets.insert({ MemcpyLoad, InstCSOffset.second });
 
       CallInst *MemcpyStore = Builder.CreateMemCpy(MemcpyDst,
-                                                   1,
+                                                   OneAlignment,
                                                    TmpBuffer,
-                                                   TmpBuffer->getAlignment(),
+                                                   TmpBufferAlignment,
                                                    MemcpySize);
       NewStoreCSOffsets.insert({ MemcpyStore, It->second });
 
@@ -2421,11 +2440,12 @@ static ConstantInt *getConstantOffset(Type *Int64Ty, int64_t O) {
   return cast<ConstantInt>(EnvOffsetConst);
 }
 
-static Value *buildEnvOffsetValue(IRBuilder<> Builder,
+static Value *buildEnvOffsetValue(IRBuilder<> &Builder,
                                   GlobalVariable *CPUStatePtr,
                                   Value *Address,
                                   Type *OffsetTy) {
-  LoadInst *LoadEnv = Builder.CreateLoad(CPUStatePtr);
+  LoadInst *LoadEnv = Builder.CreateLoad(CPUStatePtr->getValueType(),
+                                         CPUStatePtr);
   Value *EnvAsInt64 = Builder.CreateZExtOrBitCast(LoadEnv, OffsetTy);
   Value *AddressAsInt64 = Builder.CreatePtrToInt(Address, OffsetTy);
   return Builder.CreateSub(AddressAsInt64, EnvAsInt64);
@@ -2447,7 +2467,7 @@ CPUStateAccessAnalysis::setupOutEnvAccess(Instruction *AccessToFix) {
   NextBB->getInstList().splice(NextBB->end(),
                                AccessToFixBB->getInstList(),
                                std::next(InstrIt),
-                               AccessToFixBB->getInstList().end());
+                               AccessToFixBB->end());
   runnable_assert(not NextBB->empty());
 
   // Create a new block OutAccessBB only for accesses outside env, and
@@ -2482,7 +2502,7 @@ CPUStateAccessAnalysis::setupOutEnvAccess(Instruction *AccessToFix) {
                                            Int64Ty);
   Value *GEZero = Builder.CreateICmpSGE(OffsetValue, Zero);
   Value *LTSizeOf = Builder.CreateICmpSLT(OffsetValue, SizeOfEnv);
-  Value *IsInCSV = Builder.CreateOr(GEZero, LTSizeOf);
+  Value *IsInCSV = Builder.CreateAnd(GEZero, LTSizeOf);
   Builder.CreateCondBr(IsInCSV, InAccessBB, OutAccessBB);
 
   if (IsLoad) {
@@ -2507,7 +2527,7 @@ void CPUStateAccessAnalysis::setupLoadInEnv(Instruction *LoadToFix,
   LLVMContext &Context = M.getContext();
   Function *F = LoadToFix->getParent()->getParent();
   auto *OffsetConstInt = getConstantOffset(Int64Ty, EnvOffset);
-  BasicBlock *CaseBlock = BasicBlock::Create(Context, "CaseInLoad");
+  BasicBlock *CaseBlock = BasicBlock::Create(Context, "CaseInLoad", F);
   Builder.SetInsertPoint(CaseBlock);
   BranchInst *Break = Builder.CreateBr(NextBB);
 
@@ -2532,7 +2552,6 @@ void CPUStateAccessAnalysis::setupLoadInEnv(Instruction *LoadToFix,
         runnable_assert(LoadedSize == Size);
         Loaded = Builder.CreateIntToPtr(Loaded, OriginalLoadedType);
       }
-      CaseBlock->insertInto(F);
       Switch->addCase(OffsetConstInt, CaseBlock);
       // Add an incoming edge for the PHI after the switch if necessary.
       if (Phi != nullptr)
@@ -2540,7 +2559,7 @@ void CPUStateAccessAnalysis::setupLoadInEnv(Instruction *LoadToFix,
       Clone->replaceAllUsesWith(Loaded);
       Clone->eraseFromParent();
     } else {
-      delete CaseBlock;
+      CaseBlock->eraseFromParent();
       CaseBlock = nullptr; // Prevent this from being used
     }
 
@@ -2551,10 +2570,9 @@ void CPUStateAccessAnalysis::setupLoadInEnv(Instruction *LoadToFix,
     Ok = Variables->memcpyAtEnvOffset(Builder, Call, EnvOffset, true);
     Clone->eraseFromParent();
     if (Ok) {
-      CaseBlock->insertInto(F);
       Switch->addCase(OffsetConstInt, CaseBlock);
     } else {
-      delete CaseBlock;
+      CaseBlock->eraseFromParent();
       CaseBlock = nullptr; // Prevent this from being used
     }
 
@@ -2572,7 +2590,7 @@ void CPUStateAccessAnalysis::setupStoreInEnv(Instruction *StoreToFix,
   LLVMContext &Context = M.getContext();
   Function *F = StoreToFix->getParent()->getParent();
   auto *OffsetConstInt = getConstantOffset(Int64Ty, EnvOffset);
-  BasicBlock *CaseBlock = BasicBlock::Create(Context, "CaseInStore");
+  BasicBlock *CaseBlock = BasicBlock::Create(Context, "CaseInStore", F);
   Builder.SetInsertPoint(CaseBlock);
   BranchInst *Break = Builder.CreateBr(NextBB);
 
@@ -2602,10 +2620,9 @@ void CPUStateAccessAnalysis::setupStoreInEnv(Instruction *StoreToFix,
 
   Clone->eraseFromParent();
   if (Ok) {
-    CaseBlock->insertInto(F);
     Switch->addCase(OffsetConstInt, CaseBlock);
   } else {
-    delete CaseBlock;
+    CaseBlock->eraseFromParent();
   }
 }
 
@@ -2765,7 +2782,7 @@ void CPUStateAccessAnalysis::correctCPUStateAccesses() {
       NextBB->getInstList().splice(NextBB->end(),
                                    AccessToFixBB->getInstList(),
                                    std::next(InstrIt),
-                                   AccessToFixBB->getInstList().end());
+                                   AccessToFixBB->end());
       runnable_assert(not NextBB->empty());
       runnable_assert(std::next(InstrIt) == AccessToFixBB->end());
       // If we're processing loads, add a PHI in NextBB if necessary
@@ -2800,8 +2817,9 @@ void CPUStateAccessAnalysis::correctCPUStateAccesses() {
 
         if (FixAccessLog.isEnabled()) {
           ++NumUnknown;
-          FunToNumUnknown[F->getName()]++;
-          FunToUnknowns[F->getName()].insert(dumpToString(AccessToFix));
+          std::string FunctionName = F->getName().str();
+          FunToNumUnknown[FunctionName]++;
+          FunToUnknowns[FunctionName].insert(dumpToString(AccessToFix));
         }
 
         SwitchInst *SwitchOffset = Builder.CreateSwitch(OffsetValue,
@@ -2890,21 +2908,21 @@ bool CPUStateAccessAnalysis::run() {
     for (const Instruction *I : TaintResults.TaintedLoads) {
       TaintLog << I << DoLog;
       TaintLog << dumpToString(I) << DoLog;
-      std::string Name = I->getParent()->getParent()->getName();
+      std::string Name = I->getParent()->getParent()->getName().str();
       TaintLog << "In Function: " << Name << DoLog;
     }
     TaintLog << "==== Tainted Stores ====\n";
     for (const Instruction *I : TaintResults.TaintedStores) {
       TaintLog << I << DoLog;
       TaintLog << dumpToString(I) << DoLog;
-      std::string Name = I->getParent()->getParent()->getName();
+      std::string Name = I->getParent()->getParent()->getName().str();
       TaintLog << "In Function: " << Name << DoLog;
     }
     TaintLog << "==== Illegal Calls =====\n";
     for (const Instruction *I : TaintResults.IllegalCalls) {
       TaintLog << I << DoLog;
       TaintLog << dumpToString(I) << DoLog;
-      std::string Name = I->getParent()->getParent()->getName();
+      std::string Name = I->getParent()->getParent()->getName().str();
       TaintLog << "In Function: " << Name << DoLog;
     }
     TaintLog << "========================" << DoLog;

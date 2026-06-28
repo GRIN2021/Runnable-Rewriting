@@ -119,7 +119,15 @@ write_patch() {
 diff --git a/accel/tcg/translate-all.c b/accel/tcg/translate-all.c
 --- a/accel/tcg/translate-all.c
 +++ b/accel/tcg/translate-all.c
-@@ -232,6 +232,330 @@ static uint8_t *encode_search(TranslationBlock *tb, uint8_t *block)
+@@ -22,6 +22,7 @@
+ #include "trace.h"
+ #include "disas/disas.h"
+ #include "tcg/tcg.h"
++#include "tcg/helper-info.h"
+ #include "exec/mmap-lock.h"
+ #include "tb-internal.h"
+ #include "exec/tb-flush.h"
+@@ -232,6 +232,353 @@ static uint8_t *encode_search(TranslationBlock *tb, uint8_t *block)
      return p;
  }
 
@@ -440,8 +448,31 @@ diff --git a/accel/tcg/translate-all.c b/accel/tcg/translate-all.c
 +                fputs("null", f);
 +            }
 +        }
-+        fprintf(f, "],\"args_truncated\":%s}\n",
++        fprintf(f, "],\"args_truncated\":%s",
 +                arg_count > dump_count ? "true" : "false");
++        if (op->opc == INDEX_op_call) {
++            unsigned func_index = TCGOP_CALLO(op) + TCGOP_CALLI(op);
++            unsigned info_index = func_index + 1;
++
++            if (info_index < dump_count) {
++                uintptr_t func_ptr = (uintptr_t)op->args[func_index];
++                const TCGHelperInfo *helper_info =
++                    (const TCGHelperInfo *)(uintptr_t)op->args[info_index];
++
++                fprintf(f,
++                        ",\"call_helper\":{\"func\":\"0x%" PRIxPTR "\","
++                        "\"info\":\"0x%" PRIxPTR "\",\"flags\":%u,\"name\":",
++                        func_ptr, (uintptr_t)helper_info,
++                        helper_info ? (unsigned)helper_info->flags : 0);
++                if (helper_info && helper_info->name) {
++                    rr_ptc_op_walk_dump_json_string(f, helper_info->name);
++                } else {
++                    fputs("null", f);
++                }
++                fputc('}', f);
++            }
++        }
++        fputs("}\n", f);
 +        op_index++;
 +    }
 +    fflush(f);
@@ -471,6 +502,103 @@ diff --git a/accel/tcg/translate-all.c b/accel/tcg/translate-all.c
      assert(tb->size != 0);
      tcg_ctx->cpu = NULL;
      *max_insns = tb->icount;
+diff --git a/accel/tcg/cpu-exec.c b/accel/tcg/cpu-exec.c
+--- a/accel/tcg/cpu-exec.c
++++ b/accel/tcg/cpu-exec.c
+@@ -150,6 +150,84 @@ static void init_delay_params(SyncClocks *sc, const CPUState *cpu)
+ }
+ #endif /* CONFIG USER ONLY */
+
++static bool rr_ptc_op_walk_force_pc(vaddr *pc)
++{
++    const char *force = getenv("RR_PTC_OP_WALK_FORCE_PC");
++    const char *value;
++    unsigned long long wanted;
++
++    if (!force || !force[0] || g_strcmp0(force, "0") == 0) {
++        return false;
++    }
++
++    if (g_strcmp0(force, "1") == 0 ||
++        g_strcmp0(force, "true") == 0 ||
++        g_strcmp0(force, "yes") == 0) {
++        value = getenv("RR_PTC_OP_WALK_PC");
++    } else {
++        value = force;
++    }
++
++    if (!value || !value[0] || sscanf(value, "%llx", &wanted) != 1) {
++        fprintf(stderr,
++                "RR_PTC_OP_WALK_FORCE_PC: invalid requested pc '%s'\n",
++                value ? value : "");
++        exit(2);
++    }
++
++    *pc = (vaddr)wanted;
++    return true;
++}
++
++static void rr_ptc_op_walk_force_translate_once(CPUState *cpu)
++{
++    static bool done;
++    vaddr requested_pc;
++    TCGTBCPUState s;
++    TranslationBlock *tb;
++
++    if (done) {
++        return;
++    }
++    done = true;
++
++    if (!rr_ptc_op_walk_force_pc(&requested_pc)) {
++        return;
++    }
++
++    s = cpu->cc->tcg_ops->get_tb_cpu_state(cpu);
++    s.pc = requested_pc;
++    s.cflags = curr_cflags(cpu);
++    s.cflags = (s.cflags & ~CF_COUNT_MASK) |
++        CF_NO_GOTO_TB | CF_NO_GOTO_PTR;
++
++    mmap_lock();
++    tb = tb_gen_code(cpu, s);
++    mmap_unlock();
++
++    if (tb) {
++        fprintf(stderr,
++                "RR_PTC_OP_WALK_FORCE_PC: translated pc=0x%llx "
++                "tb_pc=0x%llx size=%u icount=%u\n",
++                (unsigned long long)requested_pc,
++                (unsigned long long)tb->pc,
++                (unsigned)tb->size,
++                (unsigned)tb->icount);
++    } else {
++        fprintf(stderr,
++                "RR_PTC_OP_WALK_FORCE_PC: tb_gen_code returned null "
++                "for pc=0x%llx\n",
++                (unsigned long long)requested_pc);
++        exit(1);
++    }
++
++    /*
++     * This QEMU binary is a metadata probe.  Once the requested TB has been
++     * generated, translate-all.c has already emitted the walker JSONL.
++     */
++    exit(0);
++}
++
+ struct tb_desc {
+     TCGTBCPUState s;
+     CPUArchState *env;
+@@ -933,6 +1009,8 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
+ {
+     int ret;
+
++    rr_ptc_op_walk_force_translate_once(cpu);
++
+     /* if an exception is pending, we execute it here */
+     while (!cpu_handle_exception(cpu, &ret)) {
+         TranslationBlock *last_tb = NULL;
 PATCH
   echo "$patch_file"
 }
@@ -702,6 +830,7 @@ run_external_binary() {
     ulimit -c 0
     RR_PTC_OP_WALK_DUMP="$dump_file" \
     RR_PTC_OP_WALK_PC="$pc" \
+    RR_PTC_OP_WALK_FORCE_PC=1 \
       "$BUILD_DIR/qemu-x86_64" -cpu "$QEMU_CPU_MODEL" ${QEMU_GUEST_BASE:+-B "$QEMU_GUEST_BASE"} "$binary"
   ) >"$run_log" 2>&1
   local rc=$?

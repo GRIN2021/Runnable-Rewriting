@@ -498,7 +498,7 @@ Interrupt Analysis::transfer(BasicBlock *BB) {
 
     case Instruction::Br:
     case Instruction::Switch: {
-      auto *T = cast<TerminatorInst>(&I);
+      auto *T = runnable_llvm::castTerminator(&I);
 
       // We're at the end of the basic block, handleTerminator will provide us
       // an Interrupt to forward back
@@ -573,7 +573,7 @@ Interrupt Analysis::handleTerminator(TerminatorInst *T,
   bool IsIndirect = false;
   bool IsUnresolvedIndirect = false;
 
-  for (BasicBlock *Successor : T->successors()) {
+  for (BasicBlock *Successor : runnable_llvm::successors(T)) {
     BlockType SuccessorType = GCBI->getType(Successor->getTerminator());
 
     // TODO: this is not very clean
@@ -615,7 +615,7 @@ Interrupt Analysis::handleTerminator(TerminatorInst *T,
   if (IsInstructionLocal) {
     SaTerminator << " IsInstructionLocal";
     SmallVector<BasicBlock *, 2> Successors;
-    for (BasicBlock *Successor : T->successors())
+    for (BasicBlock *Successor : runnable_llvm::successors(T))
       Successors.push_back(Successor);
 
     return AI::createWithSuccessors(std::move(Result),
@@ -766,7 +766,7 @@ Interrupt Analysis::handleTerminator(TerminatorInst *T,
   // The branch is direct and has nothing else special, consider it
   // function-local
   SmallVector<BasicBlock *, 2> Successors;
-  for (BasicBlock *Successor : T->successors()) {
+  for (BasicBlock *Successor : runnable_llvm::successors(T)) {
     BlockType SuccessorType = GCBI->getType(Successor);
     if (SuccessorType != UnexpectedPCBlock and SuccessorType != AnyPCBlock)
       Successors.push_back(Successor);

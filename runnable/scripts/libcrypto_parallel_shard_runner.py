@@ -37,6 +37,21 @@ def shell_join(parts: Sequence[str]) -> str:
     return " ".join(shlex.quote(part) for part in parts)
 
 
+def has_addr_range_flags(flags: Sequence[str]) -> bool:
+    return any(flag.startswith("-addr-range-min") for flag in flags) or any(
+        flag.startswith("-addr-range-max") for flag in flags
+    )
+
+
+def seed_addr_range_flags(args: argparse.Namespace, start: int, end_exclusive: int) -> List[str]:
+    if has_addr_range_flags(args.coordinator_flag):
+        return []
+    return [
+        f"-addr-range-min={hex(args.runnable_base + start)}",
+        f"-addr-range-max={hex(args.runnable_base + end_exclusive)}",
+    ]
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run libcrypto dynamic lift shards inside one container.")
     parser.add_argument("--manifest", required=True, type=Path)
@@ -109,6 +124,7 @@ def run_seed(
         "-dynamic-parallel",
         f"-parallel-workers={args.parallel_workers}",
         f"-parallel-fragment-dir={fragment_dir}",
+        *seed_addr_range_flags(args, start, end_exclusive),
         *args.coordinator_flag,
         str(args.binary),
         str(raw_ll),

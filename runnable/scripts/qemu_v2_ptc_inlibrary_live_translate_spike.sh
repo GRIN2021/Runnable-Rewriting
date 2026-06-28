@@ -12,6 +12,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 RR_DIR="$(cd "$SCRIPT_DIR/../.." && pwd -P)"
+LEGACY_QEMU_DIR="${RUNNABLE_QEMU_LEGACY_SRC:-$RR_DIR/archive/qemu-legacy-2.4.50}"
 
 SCRATCH_ROOT="${RUNNABLE_QEMU_V2_PTC_INLIBRARY_ROOT:-/tmp/rr-qemu-v2-upstream-probes/ptc-inlibrary-live-translate-spike}"
 QEMU_BUILD="${RUNNABLE_QEMU_V2_UPSTREAM_BUILD:-/tmp/rr-qemu-v2-upstream-probes/build-10.2.3}"
@@ -115,7 +116,7 @@ SCRATCH_ROOT="$(abs_path "$SCRATCH_ROOT")"
 QEMU_BUILD="$(abs_path "$QEMU_BUILD")"
 QEMU_SRC="$(abs_path "$QEMU_SRC")"
 
-PTC_HEADER="$RR_DIR/qemu/linux-user/ptc.h"
+PTC_HEADER="$LEGACY_QEMU_DIR/linux-user/ptc.h"
 CANDIDATE_C="$SCRATCH_ROOT/qemu_v2_ptc_inlibrary_live_translate_candidate.c"
 CANDIDATE_O="$SCRATCH_ROOT/qemu_v2_ptc_inlibrary_live_translate_candidate.o"
 COMPILE_LOG="$SCRATCH_ROOT/compile.log"
@@ -305,7 +306,7 @@ C
 
 log "Compiling candidate object"
 set +e
-cc -fPIC -Wall -Wextra -I"$RR_DIR/qemu/linux-user" -I"$RR_DIR/qemu/tcg" -c "$CANDIDATE_C" -o "$CANDIDATE_O" >"$COMPILE_LOG" 2>&1
+cc -fPIC -Wall -Wextra -I"$LEGACY_QEMU_DIR/linux-user" -I"$LEGACY_QEMU_DIR/tcg" -c "$CANDIDATE_C" -o "$CANDIDATE_O" >"$COMPILE_LOG" 2>&1
 compile_rc=$?
 set -e
 if [[ "$compile_rc" -ne 0 ]]; then
@@ -395,7 +396,7 @@ summary = {
     "blocker": {
         "summary": "Existing QEMU linux-user build artifacts do not expose a small reusable in-process translate/walker library for ptc_translate.",
         "details": [
-            "The candidate compiles against the exact repo qemu/linux-user/ptc.h.",
+            "The candidate compiles against the archived legacy ptc.h ABI.",
             "Linking the candidate with translator_loop and target/i386 translate objects requires the full QEMU linux-user dependency closure.",
             "The current walker hook is inside QEMU's initialized translate-all path after CPUState, TranslationBlock, TCGContext, page/mmap, and target CPU setup exist.",
             "A correct strong bridge needs a QEMU-owned translate-only helper or shared library that performs linux-user CPU/page/TCG initialization before filling PTCInstructionList.",

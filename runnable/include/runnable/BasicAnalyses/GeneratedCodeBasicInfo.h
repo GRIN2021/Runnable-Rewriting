@@ -197,7 +197,8 @@ public:
   bool isJump(llvm::TerminatorInst *T) const {
     runnable_assert(T != nullptr);
 
-    for (llvm::BasicBlock *Successor : T->successors()) {
+    for (unsigned I = 0; I < T->getNumSuccessors(); ++I) {
+      llvm::BasicBlock *Successor = T->getSuccessor(I);
       if (not(Successor->empty() or Successor == Dispatcher
               or Successor == DispatcherFail or Successor == AnyPC
               or Successor == UnexpectedPC or isJumpTarget(Successor)))

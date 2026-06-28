@@ -15,12 +15,13 @@ Serial lift 在 libcrypto.so.3 上的实测 recall 为 0.78。分析发现：
 
 ### QEMU 版本
 
-容器内 QEMU：**2.4.50**（2015 年），用于 runnable-lift 动态执行的是其中的
+Legacy QEMU：**2.4.50**（2015 年），源码已归档到
+`archive/qemu-legacy-2.4.50/`；旧版 runnable-lift 动态执行依赖的是其中构建出的
 `libtinycode-x86_64.so`（patched TCG）。
 
 ### 现有 EVEX 处理逻辑
 
-`qemu/target-i386/translate.c` 中有两处定制改动：
+`archive/qemu-legacy-2.4.50/target-i386/translate.c` 中有两处定制改动：
 
 **1. EVEX 前缀解码（line 4645）**
 

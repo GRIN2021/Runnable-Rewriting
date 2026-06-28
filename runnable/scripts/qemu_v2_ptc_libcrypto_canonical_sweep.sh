@@ -12,6 +12,8 @@ SUMMARY_BASENAME="qemu_v2_ptc_libcrypto_canonical_sweep"
 
 declare -a SYMBOL_SPECS=()
 declare -a PASSTHROUGH_ARGS=()
+declare -a STATIC_FALLBACK_PROFILES=()
+declare -a STATIC_FALLBACK_SYMBOL_REGEXES=()
 
 usage() {
   cat <<'EOF'
@@ -35,6 +37,8 @@ Options:
   --timeout-sec N
   --parallel-workers N
   --keep-worker-fragments
+  --static-fallback-profile PROFILE
+  --static-fallback-symbol-regex REGEX
   --skip-cmp
   -h, --help
 
@@ -170,6 +174,16 @@ while [[ $# -gt 0 ]]; do
       PASSTHROUGH_ARGS+=("$1" "${2:?missing value for $1}")
       shift 2
       ;;
+    --static-fallback-profile)
+      STATIC_FALLBACK_PROFILES+=("${2:?missing value for --static-fallback-profile}")
+      PASSTHROUGH_ARGS+=("$1" "$2")
+      shift 2
+      ;;
+    --static-fallback-symbol-regex)
+      STATIC_FALLBACK_SYMBOL_REGEXES+=("${2:?missing value for --static-fallback-symbol-regex}")
+      PASSTHROUGH_ARGS+=("$1" "$2")
+      shift 2
+      ;;
     --keep-worker-fragments|--skip-cmp)
       PASSTHROUGH_ARGS+=("$1")
       shift
@@ -275,6 +289,9 @@ if subset_summary.is_file():
             "cmp_verdict_ok": subset_payload.get("cmp_verdict_ok"),
             "run_dir": subset_payload.get("run_dir"),
             "eval_dir": subset_payload.get("eval_dir"),
+            "static_fallback_profiles": subset_payload.get("static_fallback_profiles"),
+            "static_fallback_symbol_regexes": subset_payload.get("static_fallback_symbol_regexes"),
+            "static_fallback": subset_payload.get("static_fallback"),
         }
     )
 else:
@@ -304,8 +321,15 @@ done
 
 SUMMARY_JSON="$RUN_ROOT/${SUMMARY_BASENAME}.summary.json"
 SUMMARY_TABLE="$RUN_ROOT/${SUMMARY_BASENAME}.table.md"
+PASSTHROUGH_ARGS_FILE="$RUN_ROOT/.passthrough_args"
+STATIC_FALLBACK_PROFILES_FILE="$RUN_ROOT/.static_fallback_profiles"
+STATIC_FALLBACK_SYMBOL_REGEXES_FILE="$RUN_ROOT/.static_fallback_symbol_regexes"
 
-python3 - "$SUMMARY_JSON" "$SUMMARY_TABLE" "$LABEL_PREFIX" "${ITEM_JSONS[@]}" <<'PY'
+printf '%s\n' "${PASSTHROUGH_ARGS[@]}" > "$PASSTHROUGH_ARGS_FILE"
+printf '%s\n' "${STATIC_FALLBACK_PROFILES[@]}" > "$STATIC_FALLBACK_PROFILES_FILE"
+printf '%s\n' "${STATIC_FALLBACK_SYMBOL_REGEXES[@]}" > "$STATIC_FALLBACK_SYMBOL_REGEXES_FILE"
+
+python3 - "$SUMMARY_JSON" "$SUMMARY_TABLE" "$LABEL_PREFIX" "$PASSTHROUGH_ARGS_FILE" "$STATIC_FALLBACK_PROFILES_FILE" "$STATIC_FALLBACK_SYMBOL_REGEXES_FILE" "${ITEM_JSONS[@]}" <<'PY'
 import json
 from collections import Counter
 import sys
@@ -314,7 +338,16 @@ from pathlib import Path
 summary_json = Path(sys.argv[1])
 summary_table = Path(sys.argv[2])
 label_prefix = sys.argv[3]
-item_paths = [Path(p) for p in sys.argv[4:]]
+passthrough_args_path = Path(sys.argv[4])
+static_fallback_profiles_path = Path(sys.argv[5])
+static_fallback_symbol_regexes_path = Path(sys.argv[6])
+item_paths = [Path(p) for p in sys.argv[7:]]
+
+
+def read_lines(path):
+    if not path.is_file():
+        return []
+    return path.read_text(encoding="utf-8", errors="replace").splitlines()
 
 
 def parse_cmp_verdict(verdict_path_str):
@@ -393,18 +426,21 @@ for path in item_paths:
     item["cmp_verdict_ok"] = verdict_ok
     item["cmp_verdict_reasons"] = verdict_reasons
     if cmp_payload is not None:
-      item["cmp_metrics"] = {
-          "precision": cmp_payload.get("precision"),
-          "recall": cmp_payload.get("recall"),
-          "hit": cmp_payload.get("hit"),
-          "ll_count": cmp_payload.get("ll_count"),
-          "obj_count": cmp_payload.get("obj_count"),
-          "false_positive": cmp_payload.get("false_positive"),
-          "false_negative": cmp_payload.get("false_negative"),
-          "mismatch": cmp_payload.get("mismatch"),
-      }
+        cmp_static_fallback = cmp_payload.get("static_fallback")
+        item["cmp_metrics"] = {
+            "precision": cmp_payload.get("precision"),
+            "recall": cmp_payload.get("recall"),
+            "hit": cmp_payload.get("hit"),
+            "ll_count": cmp_payload.get("ll_count"),
+            "obj_count": cmp_payload.get("obj_count"),
+            "false_positive": cmp_payload.get("false_positive"),
+            "false_negative": cmp_payload.get("false_negative"),
+            "mismatch": cmp_payload.get("mismatch"),
+            "static_fallback": cmp_static_fallback,
+        }
+        item["static_fallback"] = cmp_static_fallback
     else:
-      item["cmp_metrics"] = None
+        item["cmp_metrics"] = None
     item["raw_result"] = item.get("result")
     item["raw_status"] = item.get("status")
     item["raw_failure_class"] = item.get("failure_class")
@@ -448,6 +484,9 @@ if cmp_metric_items:
 
 summary = {
     "label_prefix": label_prefix,
+    "passthrough_args": read_lines(passthrough_args_path),
+    "static_fallback_profiles": read_lines(static_fallback_profiles_path),
+    "static_fallback_symbol_regexes": read_lines(static_fallback_symbol_regexes_path),
     "item_count": len(items),
     "pass_count": pass_count,
     "fail_count": fail_count,

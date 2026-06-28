@@ -143,6 +143,8 @@ class ValidateLibcryptoGroundTruthCanonicalTests(unittest.TestCase):
                     min_precision=0.8,
                     min_recall=0.8,
                     examples=10,
+                    static_fallback_profiles=["simd-heavy", "all-functions", "all-text"],
+                    static_fallback_symbol_regexes=["avx512"],
                 )
 
             self.assertEqual(payload["precision"], 1.0)
@@ -150,6 +152,41 @@ class ValidateLibcryptoGroundTruthCanonicalTests(unittest.TestCase):
             self.assertIn("--include-pc-file", seen_cmd["cmd"])
             idx = seen_cmd["cmd"].index("--include-pc-file")
             self.assertEqual(seen_cmd["cmd"][idx + 1], str(include_pc_file))
+            self.assertIn("--static-fallback-symbol-regex", seen_cmd["cmd"])
+            fallback_idx = seen_cmd["cmd"].index("--static-fallback-symbol-regex")
+            self.assertEqual(seen_cmd["cmd"][fallback_idx + 1], "avx512")
+            self.assertEqual(
+                [
+                    seen_cmd["cmd"][idx + 1]
+                    for idx, token in enumerate(seen_cmd["cmd"])
+                    if token == "--static-fallback-profile"
+                ],
+                ["simd-heavy", "all-functions", "all-text"],
+            )
+
+    def test_cmp_parser_accepts_full_static_fallback_profiles(self):
+        module = load_module()
+        parser = module.build_parser()
+
+        args = parser.parse_args(
+            [
+                "cmp",
+                "--binary",
+                "/tmp/libcrypto.so.3",
+                "--groundtruth",
+                "/tmp/libcrypto.gtBlock.pb",
+                "--blocks-pb2",
+                "/tmp/blocks_pb2.py",
+                "--ll",
+                "/tmp/libcrypto.ll",
+                "--static-fallback-profile",
+                "all-functions",
+                "--static-fallback-profile",
+                "all-text",
+            ]
+        )
+
+        self.assertEqual(args.static_fallback_profile, ["all-functions", "all-text"])
 
 
 if __name__ == "__main__":

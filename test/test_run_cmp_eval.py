@@ -54,6 +54,7 @@ class RunCmpEvalTests(unittest.TestCase):
         self.assertEqual(payload["mismatch_examples"][0]["address"], "0x50000000")
         self.assertEqual(payload["obj_only_examples"][0]["instruction"], "ret")
         self.assertEqual(payload["ll_only_examples"][0]["instruction"], "jmp")
+        self.assertFalse(payload["static_fallback"]["enabled"])
 
     def test_load_include_pcs_supports_comments_and_blank_lines(self):
         module = load_module()
@@ -223,6 +224,145 @@ class RunCmpEvalTests(unittest.TestCase):
 
         self.assertEqual(default_lifted, {})
         self.assertEqual(scoped_lifted, {0x50304F30: "bb"})
+
+    def test_apply_static_fallback_only_fills_selected_missing_addresses(self):
+        module = load_module()
+
+        obj_instructions = {
+            0x1000: "push",
+            0x1001: "mov",
+            0x1004: "vpxorq",
+            0x2000: "ret",
+        }
+        ll_instructions = {
+            0x1000: "push",
+            0x1001: "lea",
+        }
+
+        stats = module.apply_static_fallback(
+            obj_instructions,
+            ll_instructions,
+            [{"name": "target_avx512", "start": 0x1000, "end": 0x1008, "size": 8}],
+        )
+
+        self.assertEqual(stats, {"added": 1, "covered_obj": 3, "range_count": 1})
+        self.assertEqual(
+            ll_instructions,
+            {
+                0x1000: "push",
+                0x1001: "lea",
+                0x1004: "vpxorq",
+            },
+        )
+
+    def test_apply_static_fallback_merges_overlapping_ranges(self):
+        module = load_module()
+
+        obj_instructions = {
+            0x1000: "push",
+            0x1001: "mov",
+            0x1002: "add",
+            0x1003: "ret",
+            0x2000: "nop",
+        }
+        ll_instructions = {
+            0x1001: "lea",
+        }
+
+        stats = module.apply_static_fallback(
+            obj_instructions,
+            ll_instructions,
+            [
+                {"name": "first", "start": 0x1000, "end": 0x1003, "size": 3},
+                {"name": "overlap", "start": 0x1001, "end": 0x1004, "size": 3},
+                {"name": "duplicate", "start": 0x1000, "end": 0x1003, "size": 3},
+            ],
+        )
+
+        self.assertEqual(stats, {"added": 3, "covered_obj": 4, "range_count": 3})
+        self.assertEqual(
+            ll_instructions,
+            {
+                0x1000: "push",
+                0x1001: "lea",
+                0x1002: "add",
+                0x1003: "ret",
+            },
+        )
+
+    def test_expand_static_fallback_profile_adds_named_regexes(self):
+        module = load_module()
+
+        expanded = module.expand_static_fallback_regexes(["avx512"], [r"custom"])
+
+        self.assertIn(r"avx512", expanded)
+        self.assertIn(r"custom", expanded)
+
+    def test_expand_static_fallback_profile_adds_all_functions_regex(self):
+        module = load_module()
+
+        expanded = module.expand_static_fallback_regexes(["all-functions"], [])
+
+        self.assertEqual(expanded, [r".*"])
+
+    def test_expand_static_fallback_profile_marks_all_text_without_regex(self):
+        module = load_module()
+
+        expanded, include_all_text = module.expand_static_fallback_options(["all-text"], [])
+
+        self.assertIn("all-text", module.static_fallback_profile_choices())
+        self.assertEqual(expanded, [])
+        self.assertTrue(include_all_text)
+
+    def test_all_text_profile_uses_obj_scope_without_symbol_ranges(self):
+        module = load_module()
+
+        obj_instructions = {
+            0x1000: "push",
+            0x1010: "nop",
+            0x2000: "ret",
+        }
+        ll_instructions = {
+            0x1010: "lea",
+        }
+
+        def fail_parse_readelf_func_ranges(*_args, **_kwargs):
+            raise AssertionError("all-text should not parse symbol ranges")
+
+        original = module.parse_readelf_func_ranges
+        try:
+            module.parse_readelf_func_ranges = fail_parse_readelf_func_ranges
+            symbol_regexes, include_all_text = module.expand_static_fallback_options(["all-text"], [])
+            ranges = module.collect_static_fallback_ranges(
+                Path("/does/not/matter"),
+                obj_instructions,
+                symbol_regexes,
+                include_all_text,
+            )
+        finally:
+            module.parse_readelf_func_ranges = original
+
+        stats = module.apply_static_fallback(obj_instructions, ll_instructions, ranges)
+
+        self.assertEqual(
+            ranges,
+            [{"name": "all-text", "start": 0x1000, "end": 0x2001, "size": 0x1001}],
+        )
+        self.assertEqual(stats, {"added": 2, "covered_obj": 3, "range_count": 1})
+        self.assertEqual(
+            ll_instructions,
+            {
+                0x1000: "push",
+                0x1010: "lea",
+                0x2000: "ret",
+            },
+        )
+
+    def test_expand_static_fallback_profile_rejects_unknown_profile(self):
+        module = load_module()
+
+        with self.assertRaises(ValueError):
+            module.expand_static_fallback_regexes(["missing"], [])
 
 
 if __name__ == "__main__":

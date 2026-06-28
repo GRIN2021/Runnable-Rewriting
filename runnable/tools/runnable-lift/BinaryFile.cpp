@@ -14,7 +14,17 @@
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/StringRef.h"
+#if defined(__has_include)
+#if __has_include("llvm/ADT/Triple.h")
 #include "llvm/ADT/Triple.h"
+#elif __has_include("llvm/TargetParser/Triple.h")
+#include "llvm/TargetParser/Triple.h"
+#else
+#error "Cannot find an LLVM Triple.h header"
+#endif
+#else
+#include "llvm/ADT/Triple.h"
+#endif
 #include "llvm/BinaryFormat/Dwarf.h"
 #include "llvm/BinaryFormat/ELF.h"
 #include "llvm/Object/ELF.h"
@@ -267,7 +277,8 @@ BinaryFile::BinaryFile(std::string FilePath, uint64_t BaseAddress) :
                                  HasRelocationAddend,
                                  std::move(RelocationTypes));
 
-  runnable_assert(TheBinary->getFileFormatName().startswith("ELF"),
+  std::string FileFormatName = TheBinary->getFileFormatName().lower();
+  runnable_assert(StringRef(FileFormatName).startswith("elf"),
                "Only the ELF file format is currently supported");
 
   if (TheArchitecture.pointerSize() == 32) {
@@ -408,6 +419,38 @@ static bool shouldIgnoreSymbol(StringRef Name) {
   return Name == "$a" or Name == "$d";
 }
 
+template<typename T>
+static const typename object::ELFFile<T>::Elf_Ehdr &
+getELFHeader(const object::ELFFile<T> &TheELF) {
+#if LLVM_VERSION_MAJOR >= 15
+  return TheELF.getHeader();
+#else
+  return *TheELF.getHeader();
+#endif
+}
+
+template<typename T>
+static Expected<StringRef>
+getELFSectionName(const object::ELFFile<T> &TheELF,
+                  const typename object::ELFFile<T>::Elf_Shdr &Section) {
+#if LLVM_VERSION_MAJOR >= 15
+  return TheELF.getSectionName(Section);
+#else
+  return TheELF.getSectionName(&Section);
+#endif
+}
+
+template<typename T>
+static Expected<ArrayRef<uint8_t>>
+getELFSectionContents(const object::ELFFile<T> &TheELF,
+                      const typename object::ELFFile<T>::Elf_Shdr *Section) {
+#if LLVM_VERSION_MAJOR >= 15
+  return TheELF.getSectionContents(*Section);
+#else
+  return TheELF.getSectionContents(Section);
+#endif
+}
+
 template<typename T, bool HasAddend>
 void BinaryFile::parseELF(object::ObjectFile *TheBinary, uint64_t BaseAddress) {
   // Parse the ELF file
@@ -419,7 +462,7 @@ void BinaryFile::parseELF(object::ObjectFile *TheBinary, uint64_t BaseAddress) {
   object::ELFFile<T> TheELF = *TheELFOrErr;
 
   // BaseAddress makes sense only for shared (relocatable, PIC) objects
-  if (TheELF.getHeader()->e_type == ELF::ET_DYN)
+  if (getELFHeader(TheELF).e_type == ELF::ET_DYN)
     this->BaseAddress = BaseAddress;
 
   // Look for static or dynamic symbols and relocations
@@ -437,7 +480,7 @@ void BinaryFile::parseELF(object::ObjectFile *TheBinary, uint64_t BaseAddress) {
     logAllUnhandledErrors(std::move(Sections.takeError()), errs(), "");
   } else {
     for (auto &Section : *Sections) {
-      auto NameOrErr = TheELF.getSectionName(&Section);
+      auto NameOrErr = getELFSectionName(TheELF, Section);
       if (NameOrErr) {
         auto &Name = *NameOrErr;
         if (Name == ".symtab") {
@@ -467,7 +510,7 @@ void BinaryFile::parseELF(object::ObjectFile *TheBinary, uint64_t BaseAddress) {
       logAllUnhandledErrors(std::move(Strtab.takeError()), errs(), "");
       runnable_abort();
     }
-    auto StrtabArray = TheELF.getSectionContents(*Strtab);
+    auto StrtabArray = getELFSectionContents(TheELF, *Strtab);
     if (not StrtabArray) {
       logAllUnhandledErrors(std::move(StrtabArray.takeError()), errs(), "");
       runnable_abort();
@@ -499,10 +542,10 @@ void BinaryFile::parseELF(object::ObjectFile *TheBinary, uint64_t BaseAddress) {
     }
   }
 
-  const auto *ElfHeader = TheELF.getHeader();
-  EntryPoint = relocate(static_cast<uint64_t>(ElfHeader->e_entry));
-  ProgramHeaders.Count = ElfHeader->e_phnum;
-  ProgramHeaders.Size = ElfHeader->e_phentsize;
+  const auto &ElfHeader = getELFHeader(TheELF);
+  EntryPoint = relocate(static_cast<uint64_t>(ElfHeader.e_entry));
+  ProgramHeaders.Count = ElfHeader.e_phnum;
+  ProgramHeaders.Size = ElfHeader.e_phentsize;
 
   // Loop over the program headers looking for PT_LOAD segments, read them out
   // and create a global variable for each one of them (writable or read-only),
@@ -550,10 +593,10 @@ void BinaryFile::parseELF(object::ObjectFile *TheBinary, uint64_t BaseAddress) {
       // Check if it's the segment containing the program headers
       auto ProgramHeaderStart = ProgramHeader.p_offset;
       auto ProgramHeaderEnd = ProgramHeader.p_offset + ProgramHeader.p_filesz;
-      if (ProgramHeaderStart <= ElfHeader->e_phoff
-          && ElfHeader->e_phoff < ProgramHeaderEnd) {
+      if (ProgramHeaderStart <= ElfHeader.e_phoff
+          && ElfHeader.e_phoff < ProgramHeaderEnd) {
         uint64_t PhdrAddress = (relocate(ProgramHeader.p_vaddr)
-                                + ElfHeader->e_phoff - ProgramHeader.p_offset);
+                                + ElfHeader.e_phoff - ProgramHeader.p_offset);
         ProgramHeaders.Address = PhdrAddress;
       }
     } break;
@@ -823,7 +866,11 @@ BinaryFile::readRawValue(uint64_t Address, unsigned Size, Endianess E) const {
 
       const unsigned char *Start = Segment.Data.data() + Offset;
 
+#if LLVM_VERSION_MAJOR >= 15
+      using llvm::endianness;
+#else
       using support::endianness;
+#endif
       using support::endian::read;
       switch (Size) {
       case 1:

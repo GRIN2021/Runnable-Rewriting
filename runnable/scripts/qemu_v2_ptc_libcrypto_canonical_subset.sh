@@ -4,7 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 RR_DIR="$(cd "$SCRIPT_DIR/../.." && pwd -P)"
 WORKSPACE_ROOT="$(cd "$RR_DIR/.." && pwd -P)"
-DOCKER_IMAGE="${RUNNABLE_QEMU_V2_LIBCRYPTO_IMAGE:-rr_bionic_exportfs:2026-04-14}"
+DOCKER_IMAGE="${RUNNABLE_QEMU_V2_LIBCRYPTO_IMAGE:-${RUNNABLE_QEMU_V2_IMAGE:-rr_qemu_v2_runtime:latest}}"
 RUNTIME_MODE="${RUNNABLE_QEMU_V2_LIBCRYPTO_RUNTIME_MODE:-auto}"
 SCRATCH_ROOT="${RUNNABLE_QEMU_V2_LIBCRYPTO_SCRATCH_ROOT:-/tmp/rr-qemu-v2-libcrypto-canonical-subset}"
 RUNNABLE_LIFT_BIN="${RUNNABLE_QEMU_V2_LIBCRYPTO_RUNNABLE_LIFT:-$RR_DIR/build-bionic/runnable-lift}"
@@ -28,6 +28,8 @@ KEEP_WORKER_FRAGMENTS="${RUNNABLE_QEMU_V2_LIBCRYPTO_KEEP_WORKER_FRAGMENTS:-0}"
 LABEL="${RUNNABLE_QEMU_V2_LIBCRYPTO_LABEL:-sha1}"
 SKIP_CMP=0
 SIDECAR_CAPTURE_SCRIPT="$SCRIPT_DIR/qemu_v2_ptc_libcrypto_sidecar_capture.sh"
+declare -a STATIC_FALLBACK_PROFILES=()
+declare -a STATIC_FALLBACK_SYMBOL_REGEXES=()
 
 usage() {
   cat <<'EOF'
@@ -52,19 +54,21 @@ Options:
   --timeout-sec N
   --parallel-workers N
   --keep-worker-fragments
+  --static-fallback-profile PROFILE
+  --static-fallback-symbol-regex REGEX
   --label NAME
   --skip-cmp
   -h, --help
 
 This stages a build-tree runnable-lift next to a chosen QEMU V2 libtinycode
-artifact, runs one real libcrypto.so.3 worklist lift inside the bionic runtime
-container, and optionally invokes the canonical compare wrapper.
+artifact, runs one real libcrypto.so.3 worklist lift inside the configured
+runtime container, and optionally invokes the canonical compare wrapper.
 
 Runtime mode:
   auto   Default. Use direct in-container execution when RUNNABLE_QEMU_V2_IN_CONTAINER=1,
-         otherwise launch the configured bionic Docker image.
-  docker Always launch the configured bionic Docker image.
-  direct Run the bionic commands directly in the current environment.
+         otherwise launch the configured Docker image.
+  docker Always launch the configured Docker image.
+  direct Run the runtime commands directly in the current environment.
 EOF
 }
 
@@ -187,19 +191,48 @@ resolve_runtime_command_text() {
   printf '%s' "$command"
 }
 
+append_runtime_dir() {
+  local runtime_dir="$1"
+  local existing
+  [[ -n "$runtime_dir" ]] || return 0
+  for existing in "${BIONIC_LD_LIBRARY_PARTS[@]}"; do
+    [[ "$existing" == "$runtime_dir" ]] && return 0
+  done
+  BIONIC_LD_LIBRARY_PARTS+=("$runtime_dir")
+}
+
 append_existing_runtime_dir() {
   local runtime_dir="$1"
   local resolved_dir
   resolved_dir="$(resolve_runtime_path "$runtime_dir")"
   [[ -d "$resolved_dir" ]] || return 0
-  BIONIC_LD_LIBRARY_PARTS+=("$runtime_dir")
+  append_runtime_dir "$runtime_dir"
+}
+
+append_default_llvm_runtime_dirs() {
+  local candidate llvm_libdir
+  if llvm_libdir="$(llvm-config --libdir 2>/dev/null)" && [[ -n "$llvm_libdir" ]]; then
+    append_runtime_dir "$llvm_libdir"
+  fi
+  for candidate in /usr/lib/llvm-18/lib /usr/lib/llvm-17/lib /usr/lib/llvm-16/lib; do
+    append_runtime_dir "$candidate"
+  done
+}
+
+append_legacy_runtime_root_dirs() {
+  if [[ "$DOCKER_IMAGE" == rr_bionic_exportfs* ]]; then
+    append_runtime_dir "/root/Runnable-Rewriting/build/llvm-release/lib"
+    append_runtime_dir "/root/Runnable-Rewriting/root/lib"
+    return 0
+  fi
+
+  append_existing_runtime_dir "$(runtime_alias_path "$RR_DIR/root/lib")"
 }
 
 default_bionic_ld_library_path() {
   local lift_root="$1"
-  local lift_root_runtime mode
+  local lift_root_runtime
   lift_root_runtime="$(runtime_alias_path "$lift_root")"
-  mode="$(effective_runtime_mode)"
 
   local -a BIONIC_LD_LIBRARY_PARTS=()
   append_existing_runtime_dir "$lift_root_runtime/lib/Support"
@@ -207,20 +240,8 @@ default_bionic_ld_library_path() {
   append_existing_runtime_dir "$lift_root_runtime/lib/Dump"
   append_existing_runtime_dir "$lift_root_runtime/lib/FunctionIsolation"
   append_existing_runtime_dir "$lift_root_runtime/lib/StackAnalysis"
-
-  # In bionic docker mode, prefer the image's own LLVM 7 DSOs rather than the
-  # mounted workspace root/lib, which can carry newer glibc requirements than
-  # the exportfs image. In direct mode inside rr_qemu_v2_runtime, the mounted
-  # workspace build tree provides the matching LLVM 7 DSOs.
-  case "$mode" in
-    docker)
-      append_existing_runtime_dir "/root/Runnable-Rewriting/build/llvm-release/lib"
-      append_existing_runtime_dir "/root/Runnable-Rewriting/root/lib"
-      ;;
-    direct)
-      append_existing_runtime_dir "$(runtime_alias_path "$RR_DIR/build/llvm-release/lib")"
-      ;;
-  esac
+  append_default_llvm_runtime_dirs
+  append_legacy_runtime_root_dirs
 
   if [[ "${#BIONIC_LD_LIBRARY_PARTS[@]}" -eq 0 ]]; then
     return 0
@@ -724,6 +745,14 @@ while [[ $# -gt 0 ]]; do
       KEEP_WORKER_FRAGMENTS=1
       shift
       ;;
+    --static-fallback-profile)
+      STATIC_FALLBACK_PROFILES+=("${2:?missing value for --static-fallback-profile}")
+      shift 2
+      ;;
+    --static-fallback-symbol-regex)
+      STATIC_FALLBACK_SYMBOL_REGEXES+=("${2:?missing value for --static-fallback-symbol-regex}")
+      shift 2
+      ;;
     --label)
       LABEL="${2:?missing value for --label}"
       shift 2
@@ -1014,6 +1043,12 @@ if [[ "$RESULT" == "passed" && "$SKIP_CMP" -eq 0 ]]; then
   if [[ -f "$INCLUDE_PC_FILE" ]]; then
     CMP_ARGS+=(--include-pc-file "$INCLUDE_PC_FILE")
   fi
+  for profile in "${STATIC_FALLBACK_PROFILES[@]}"; do
+    CMP_ARGS+=(--static-fallback-profile "$profile")
+  done
+  for regex in "${STATIC_FALLBACK_SYMBOL_REGEXES[@]}"; do
+    CMP_ARGS+=(--static-fallback-symbol-regex "$regex")
+  done
   set +e
   "${CMP_ARGS[@]}" >"$EVAL_DIR/cmp.stdout" 2>"$EVAL_DIR/cmp.stderr"
   CMP_RC=$?
@@ -1113,6 +1148,8 @@ printf '%s' "$SIDECAR_REPLAY_PC" > "$SCRATCH_ROOT/$LABEL/.sidecar_replay_pc"
 printf '%s' "$COMPARE_SCOPE_MODE" > "$SCRATCH_ROOT/$LABEL/.compare_scope_mode"
 printf '%s' "$INCLUDE_PC_FILE" > "$SCRATCH_ROOT/$LABEL/.include_pc_file"
 printf '%s' "$INCLUDE_PC_AUDIT_JSON" > "$SCRATCH_ROOT/$LABEL/.include_pc_audit_json"
+printf '%s\n' "${STATIC_FALLBACK_PROFILES[@]}" > "$SCRATCH_ROOT/$LABEL/.static_fallback_profiles"
+printf '%s\n' "${STATIC_FALLBACK_SYMBOL_REGEXES[@]}" > "$SCRATCH_ROOT/$LABEL/.static_fallback_symbol_regexes"
 printf '%s' "$LIFT_STDOUT" > "$SCRATCH_ROOT/$LABEL/.lift_stdout"
 printf '%s' "$LIFT_STDERR" > "$SCRATCH_ROOT/$LABEL/.lift_stderr"
 printf '%s' "$LIFT_LL" > "$SCRATCH_ROOT/$LABEL/.lift_ll"
@@ -1126,6 +1163,27 @@ from pathlib import Path
 
 summary_path = Path(sys.argv[1])
 meta_root = Path(sys.argv[2])
+
+
+def read_lines(path: Path):
+    if not path.is_file():
+        return []
+    return [line for line in path.read_text(encoding="utf-8").splitlines() if line]
+
+
+def load_cmp_static_fallback(path: Path):
+    if not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return None
+    static_fallback = payload.get("static_fallback")
+    return static_fallback if isinstance(static_fallback, dict) else None
+
+
+cmp_json_ref = (meta_root / ".cmp_json").read_text().strip()
+cmp_static_fallback = load_cmp_static_fallback(Path(cmp_json_ref)) if cmp_json_ref else None
 payload = {
     "result": (meta_root / ".result").read_text().strip(),
     "failure_class": (meta_root / ".failure_class").read_text().strip(),
@@ -1164,6 +1222,9 @@ payload = {
     "compare_scope_mode": (meta_root / ".compare_scope_mode").read_text().strip() or "full_text",
     "include_pc_file": (meta_root / ".include_pc_file").read_text().strip() or None,
     "include_pc_audit_json": (meta_root / ".include_pc_audit_json").read_text().strip() or None,
+    "static_fallback_profiles": read_lines(meta_root / ".static_fallback_profiles"),
+    "static_fallback_symbol_regexes": read_lines(meta_root / ".static_fallback_symbol_regexes"),
+    "static_fallback": cmp_static_fallback,
     "lift_stdout": (meta_root / ".lift_stdout").read_text().strip(),
     "lift_stderr": (meta_root / ".lift_stderr").read_text().strip(),
     "lift_ll": (meta_root / ".lift_ll").read_text().strip(),

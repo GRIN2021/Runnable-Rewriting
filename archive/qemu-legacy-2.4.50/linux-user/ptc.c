@@ -91,6 +91,7 @@ uint64_t illegal_AccessAddr = 0;
 static uint64_t ptc_signal_faults = 0;
 static uint64_t ptc_explore_branch_faults = 0;
 static uint64_t ptc_unknown_addr_reports = 0;
+static volatile sig_atomic_t ptc_in_translate_exec = 0;
 
 struct image_info info1, *info = &info1;
 
@@ -372,7 +373,11 @@ static void add_helper(gpointer key, gpointer value, gpointer user_data) {
 }
 
 static void sig_handle(int signum, siginfo_t* siginfo, void* context){
-  (void) signum;
+  if (!ptc_in_translate_exec) {
+    signal(signum, SIG_DFL);
+    raise(signum);
+    return;
+  }
   ptc_signal_faults++;
   illegal_AccessAddr = (uint64_t)siginfo->si_addr;
   siglongjmp(cpu->jmp_env,1);
@@ -1151,15 +1156,18 @@ size_t ptc_translate(uint64_t virtual_address,uint32_t force, PTCInstructionList
 
     if(sigsetjmp(cpu->jmp_env,1)==0){
 //      ptc_lockexec();
+      ptc_in_translate_exec = 1;
       tc_ptr = tb->tc_ptr;
       cpu_tb_exec(cpu, tc_ptr);
+      ptc_in_translate_exec = 0;
 //      ptc_unlockexec();
     }
     else{
       //ptc_unlockexec();
+      ptc_in_translate_exec = 0;
       ptc_explore_branch_faults++;
       cpu->exception_index = 11;
-      *dymvirtual_address = virtual_address;
+      *dymvirtual_address = 0;
       return (size_t) tb->size;
    // exit(1);
    // printf("exception_next_eip: %lx\n",env->exception_next_eip);
@@ -1216,11 +1224,15 @@ int64_t ptc_exec(uint64_t virtual_address){
       is_syscall = tb->isSyscall;
 
     if(sigsetjmp(cpu->jmp_env,1)==0){
+      ptc_in_translate_exec = 1;
       tc_ptr = tb->tc_ptr;
       cpu_tb_exec(cpu, tc_ptr);
+      ptc_in_translate_exec = 0;
     }
-    else
+    else {
+      ptc_in_translate_exec = 0;
       return -1;
+    }
 
     return env->eip;
 }
@@ -1256,11 +1268,15 @@ int64_t ptc_exec1(uint64_t begin, uint64_t end){
     }
 
     if(sigsetjmp(cpu->jmp_env,1)==0){
+      ptc_in_translate_exec = 1;
       tc_ptr = tb->tc_ptr;
       cpu_tb_exec(cpu, tc_ptr);
+      ptc_in_translate_exec = 0;
     }
-    else
+    else {
+      ptc_in_translate_exec = 0;
       return -1;
+    }
 
     return env->eip;
 }
@@ -1384,9 +1400,12 @@ uint64_t ptc_run_library(size_t flag){
         }
 
         if(sigsetjmp(cpu->jmp_env,1)==0){
+            ptc_in_translate_exec = 1;
             tc_ptr = tb->tc_ptr;
             cpu_tb_exec(cpu, tc_ptr);
+            ptc_in_translate_exec = 0;
         }else{
+            ptc_in_translate_exec = 0;
             fprintf(stderr,"loader/library failed to run\n");
             exit(1);
         }

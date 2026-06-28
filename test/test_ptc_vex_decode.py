@@ -8,7 +8,7 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-QEMU_ROOT = REPO_ROOT / "qemu"
+QEMU_ROOT = REPO_ROOT / "archive" / "qemu-legacy-2.4.50"
 HARNESS_SOURCE = REPO_ROOT / "test" / "ptc_disassemble_bytes_harness.c"
 TRANSLATE_HARNESS_SOURCE = REPO_ROOT / "test" / "ptc_translate_pc_harness.c"
 LL_COMMENT_RE = re.compile(r"^\s*;\s*(0x[0-9a-fA-F]+):\s+(\S+)")
@@ -277,6 +277,61 @@ class PTCVexDecodeTests(unittest.TestCase):
                 ("8b 8f 70 ff ff ff", "mov", 6),
                 ("4c 8b 87 60 ff ff ff", "mov", 7),
                 ("39 d1", "cmp", 2),
+            ]
+            binary = self._compile_probe_binary(tmpdir, [byte_string for byte_string, _, _ in cases])
+            consumed, pcs = self._run_translate_harness(harness, binary, single_shot=True)
+
+            expected_sizes = [expected_size for _, _, expected_size in cases]
+            self.assertGreaterEqual(len(pcs), len(expected_sizes), pcs)
+            self.assertGreaterEqual(consumed, sum(expected_sizes), consumed)
+            self.assertEqual(
+                [right - left for left, right in zip(pcs, pcs[1:len(expected_sizes)])],
+                expected_sizes[:-1],
+                pcs,
+            )
+
+    def test_ptc_translate_keeps_real_libcrypto_avx512_evex_prefix_in_one_tb(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            harness = self._build_translate_harness(tmpdir)
+            cases = [
+                ("62 f1 fd 48 ef c0", "vpxorq", 6),
+                ("62 f1 fd 48 6f c8", "vmovdqa64", 6),
+                ("62 f1 fe 48 7f 0d ea 0f 00 00", "vmovdqu64", 10),
+                ("62 f1 fe 48 6f 15 e0 0f 00 00", "vmovdqu64", 10),
+                ("62 f2 6d 48 00 da", "vpshufb", 6),
+                ("62 f1 65 48 fe e2", "vpaddd", 6),
+                ("62 f3 dd 48 25 eb 96", "vpternlogq", 7),
+                ("62 f3 55 48 44 f4 00", "vpclmullqlqdq", 7),
+                ("62 f3 55 48 44 fc 10", "vpclmullqhqdq", 7),
+                ("62 73 55 48 44 c4 01", "vpclmulhqlqdq", 7),
+            ]
+            binary = self._compile_probe_binary(tmpdir, [byte_string for byte_string, _, _ in cases])
+            consumed, pcs = self._run_translate_harness(harness, binary, single_shot=True)
+
+            expected_sizes = [expected_size for _, _, expected_size in cases]
+            self.assertGreaterEqual(len(pcs), len(expected_sizes), pcs)
+            self.assertGreaterEqual(consumed, sum(expected_sizes), consumed)
+            self.assertEqual(
+                [right - left for left, right in zip(pcs, pcs[1:len(expected_sizes)])],
+                expected_sizes[:-1],
+                pcs,
+            )
+
+    def test_ptc_translate_keeps_real_libcrypto_avx512_evex_tail_in_one_tb(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpdir = Path(tmp)
+            harness = self._build_translate_harness(tmpdir)
+            cases = [
+                ("62 73 55 48 44 cc 11", "vpclmulhqhqdq", 7),
+                ("62 52 35 48 dc d0", "vaesenc", 6),
+                ("62 72 2d 48 dd df", "vaesenclast", 6),
+                ("62 72 fd 48 1a 25 9b 0f 00 00", "vbroadcastf64x2", 10),
+                ("62 d1 15 48 73 fc 04", "vpslldq", 7),
+                ("62 d1 0d 48 73 dd 04", "vpsrldq", 7),
+                ("62 53 7d 48 39 f7 01", "vextracti32x4", 7),
+                ("62 33 fd 48 3b f0 01", "vextracti64x4", 7),
+                ("62 71 7f 48 7f 35 75 0f 00 00", "vmovdqu8", 10),
             ]
             binary = self._compile_probe_binary(tmpdir, [byte_string for byte_string, _, _ in cases])
             consumed, pcs = self._run_translate_harness(harness, binary, single_shot=True)

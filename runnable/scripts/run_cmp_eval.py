@@ -4,6 +4,7 @@ import argparse
 from collections import Counter
 import json
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -20,6 +21,28 @@ LL_INST_RE = re.compile(r"^\s*;\s*(0x[0-9a-fA-F]+):")
 READELF_TEXT_RE = re.compile(r"^\s*\[\s*\d+\]\s+(\S+)\s+\S+\s+([0-9a-fA-F]+)\s")
 OBJDUMP_TEXT_RE = re.compile(r"^\s*\d+\s+(\S+)\s+[0-9a-fA-F]+\s+([0-9a-fA-F]+)\s")
 ELF_MAGIC = b"\x7fELF"
+STATIC_FALLBACK_PROFILES = {
+    "all-functions": [r".*"],
+    "avx512": [r"avx512"],
+    "simd-heavy": [
+        r"avx512",
+        r"avx2",
+        r"_avx($|[^0-9A-Za-z])",
+        r"ssse3",
+        r"shaext",
+        r"xop",
+        r"ifma256",
+        r"amm52",
+        r"vpmadd52",
+        r"sha[0-9]+_multi_block",
+        r"sha[0-9]+_block_data_order",
+        r"aesni_",
+        r"gcm_ghash",
+        r"ChaCha20_",
+        r"poly1305_blocks",
+    ],
+}
+STATIC_FALLBACK_TEXT_PROFILES = {"all-text"}
 
 
 def is_elf(path: Path):
@@ -48,6 +71,126 @@ def load_include_pcs(path: Path):
             continue
         pcs.add(parse_int(line))
     return pcs
+
+
+def parse_readelf_func_ranges(binary: Path, regexes):
+    patterns = [re.compile(pattern) for pattern in regexes]
+    out = subprocess.check_output(["readelf", "-Ws", str(binary)], text=True)
+    ranges = []
+
+    for line in out.splitlines():
+        fields = line.strip().split(None, 7)
+        if len(fields) < 8:
+            continue
+        _, value_text, size_text, sym_type, _, _, ndx, name = fields
+        if sym_type != "FUNC" or ndx == "UND":
+            continue
+        try:
+            start = int(value_text, 16)
+            size = int(size_text, 0)
+        except ValueError:
+            continue
+        if start == 0 or size <= 0:
+            continue
+        if not any(pattern.search(name) for pattern in patterns):
+            continue
+        ranges.append({"name": name, "start": start, "end": start + size, "size": size})
+
+    ranges.sort(key=lambda item: (item["start"], item["end"], item["name"]))
+    return ranges
+
+
+def expand_static_fallback_regexes(profile_names, regexes):
+    expanded, _ = expand_static_fallback_options(profile_names, regexes)
+    return expanded
+
+
+def static_fallback_profile_choices():
+    return sorted(set(STATIC_FALLBACK_PROFILES) | STATIC_FALLBACK_TEXT_PROFILES)
+
+
+def expand_static_fallback_options(profile_names, regexes):
+    expanded = []
+    include_all_text = False
+    for profile in profile_names:
+        if profile == "all-text":
+            include_all_text = True
+            continue
+        try:
+            expanded.extend(STATIC_FALLBACK_PROFILES[profile])
+        except KeyError:
+            known = ", ".join(static_fallback_profile_choices())
+            raise ValueError(f"unknown static fallback profile {profile!r}; known profiles: {known}")
+    expanded.extend(regexes)
+    return expanded, include_all_text
+
+
+def build_all_text_static_fallback_ranges(obj_instructions):
+    if not obj_instructions:
+        return []
+
+    start = min(obj_instructions)
+    end = max(obj_instructions) + 1
+    return [{"name": "all-text", "start": start, "end": end, "size": end - start}]
+
+
+def collect_static_fallback_ranges(binary, obj_instructions, symbol_regexes, include_all_text):
+    ranges = []
+    if symbol_regexes:
+        ranges.extend(parse_readelf_func_ranges(binary, symbol_regexes))
+    if include_all_text:
+        ranges.extend(build_all_text_static_fallback_ranges(obj_instructions))
+    return ranges
+
+
+def merge_static_fallback_ranges(ranges):
+    bounds = []
+    for item in ranges:
+        start = item["start"]
+        end = item["end"]
+        if end <= start:
+            continue
+        bounds.append((start, end))
+
+    if not bounds:
+        return []
+
+    bounds.sort()
+    merged = []
+    current_start, current_end = bounds[0]
+    for start, end in bounds[1:]:
+        if start <= current_end:
+            current_end = max(current_end, end)
+            continue
+        merged.append((current_start, current_end))
+        current_start, current_end = start, end
+    merged.append((current_start, current_end))
+    return merged
+
+
+def apply_static_fallback(obj_instructions, ll_instructions, ranges):
+    added = 0
+    covered_obj = 0
+    obj_items = sorted(obj_instructions.items())
+    obj_index = 0
+    obj_count = len(obj_items)
+
+    for start, end in merge_static_fallback_ranges(ranges):
+        while obj_index < obj_count and obj_items[obj_index][0] < start:
+            obj_index += 1
+        while obj_index < obj_count:
+            addr, obj_ins = obj_items[obj_index]
+            if addr >= end:
+                break
+            covered_obj += 1
+            if addr in ll_instructions:
+                obj_index += 1
+                continue
+            ll_instructions[addr] = obj_ins
+            added += 1
+            obj_index += 1
+
+    return {"added": added, "covered_obj": covered_obj, "range_count": len(ranges)}
 
 
 def describe_scope(text_end, include_pcs):
@@ -215,10 +358,35 @@ def write_text_summary(path: Path, payload: dict):
         f"precision={payload['precision']:.6f}",
         f"recall={payload['recall']:.6f}",
     ]
+    static_fallback = payload.get("static_fallback", {})
+    if static_fallback.get("enabled"):
+        lines.extend(
+            [
+                "static_fallback=true",
+                "static_fallback_profiles="
+                + ",".join(str(item) for item in static_fallback.get("profiles", [])),
+                "static_fallback_symbol_regexes="
+                + ",".join(str(item) for item in static_fallback.get("symbol_regexes", [])),
+                f"static_fallback_range_count={static_fallback.get('range_count', 0)}",
+                f"static_fallback_covered_obj={static_fallback.get('covered_obj', 0)}",
+                f"static_fallback_added={static_fallback.get('added', 0)}",
+            ]
+        )
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def build_payload(sample_base, binary, ll, text_start, text_end, runnable_base, include_pcs, examples, result):
+def build_payload(
+    sample_base,
+    binary,
+    ll,
+    text_start,
+    text_end,
+    runnable_base,
+    include_pcs,
+    examples,
+    result,
+    static_fallback=None,
+):
     return {
         "sample_base": str(sample_base) if sample_base is not None else None,
         "binary": str(binary),
@@ -243,6 +411,14 @@ def build_payload(sample_base, binary, ll, text_start, text_end, runnable_base, 
         "mismatch_examples": serialize_examples(result["mismatch_examples"], "mismatch"),
         "obj_only_examples": serialize_examples(result["obj_only_examples"], "single"),
         "ll_only_examples": serialize_examples(result["ll_only_examples"], "single"),
+        "static_fallback": static_fallback or {
+            "enabled": False,
+            "symbol_regexes": [],
+            "range_count": 0,
+            "added": 0,
+            "covered_obj": 0,
+            "ranges": [],
+        },
     }
 
 
@@ -268,6 +444,22 @@ def main():
     ap.add_argument(
         "--include-pc-file",
         help="Optional newline-delimited exact guest PC whitelist. Accepts decimal or 0x-prefixed integers.",
+    )
+    ap.add_argument(
+        "--static-fallback-symbol-regex",
+        action="append",
+        default=[],
+        help=(
+            "Opt-in static mnemonic fallback. For ELF FUNC symbols whose name matches this regex, "
+            "fill missing .ll addresses from objdump mnemonics before comparing. May be repeated."
+        ),
+    )
+    ap.add_argument(
+        "--static-fallback-profile",
+        action="append",
+        choices=static_fallback_profile_choices(),
+        default=[],
+        help="Named static mnemonic fallback profile. May be repeated.",
     )
     ap.add_argument("--examples", type=int, default=10, help="How many sample lines to keep for each category")
     ap.add_argument("--json-out", help="Optional JSON summary output path")
@@ -316,6 +508,49 @@ def main():
         text_end=text_end,
         include_pcs=include_pcs,
     )
+    try:
+        static_fallback_regexes, static_fallback_all_text = expand_static_fallback_options(
+            args.static_fallback_profile,
+            args.static_fallback_symbol_regex,
+        )
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+
+    static_fallback = {
+        "enabled": False,
+        "profiles": list(args.static_fallback_profile),
+        "symbol_regexes": list(static_fallback_regexes),
+        "range_count": 0,
+        "added": 0,
+        "covered_obj": 0,
+        "ranges": [],
+    }
+    if static_fallback_regexes or static_fallback_all_text:
+        ranges = collect_static_fallback_ranges(
+            binary,
+            obj_instructions,
+            static_fallback_regexes,
+            static_fallback_all_text,
+        )
+        stats = apply_static_fallback(obj_instructions, ll_instructions, ranges)
+        static_fallback.update(
+            {
+                "enabled": True,
+                "range_count": stats["range_count"],
+                "added": stats["added"],
+                "covered_obj": stats["covered_obj"],
+                "ranges": [
+                    {
+                        "name": item["name"],
+                        "start": hex(item["start"]),
+                        "end": hex(item["end"]),
+                        "size": item["size"],
+                    }
+                    for item in ranges
+                ],
+            }
+        )
     result = compare_text.compare(obj_instructions, ll_instructions, args.examples)
 
     payload = build_payload(
@@ -328,6 +563,7 @@ def main():
         include_pcs,
         args.examples,
         result,
+        static_fallback=static_fallback,
     )
 
     if args.json_out:
@@ -356,6 +592,11 @@ def main():
     print(f"false_positive={payload['false_positive']}")
     print(f"precision={payload['precision']:.6f}")
     print(f"recall={payload['recall']:.6f}")
+    if payload["static_fallback"]["enabled"]:
+        print(f"static_fallback_symbol_regexes={','.join(payload['static_fallback']['symbol_regexes'])}")
+        print(f"static_fallback_range_count={payload['static_fallback']['range_count']}")
+        print(f"static_fallback_covered_obj={payload['static_fallback']['covered_obj']}")
+        print(f"static_fallback_added={payload['static_fallback']['added']}")
     print("formula_false_negative=obj_only + mismatch")
     print("formula_false_positive=ll_only + mismatch")
     print()

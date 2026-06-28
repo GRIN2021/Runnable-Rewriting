@@ -33,6 +33,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     gettext \
     libaio-dev \
     libattr1-dev \
+    libboost-dev \
     libbz2-dev \
     libcap-ng-dev \
     libcapstone-dev \
@@ -53,6 +54,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxml2-dev \
     libzstd-dev \
     llvm \
+    llvm-dev \
     lld \
     make \
     meson \
@@ -63,6 +65,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3-dev \
     python3-packaging \
     python3-pip \
+    python3-pygraphviz \
     python3-pyelftools \
     python3-setuptools \
     python3-tomli \

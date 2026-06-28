@@ -7,6 +7,7 @@
 //
 
 // Standard includes
+#include <algorithm>
 #include <cstdint>
 #include <set>
 #include <sstream>
@@ -17,9 +18,12 @@
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/DebugInfoMetadata.h"
 #include "llvm/IR/GlobalVariable.h"
+#include "llvm/IR/Instructions.h"
 #include "llvm/IR/MDBuilder.h"
 #include "llvm/IR/Module.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/IR/Type.h"
+#include "llvm/Config/llvm-config.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Utils/Cloning.h"
@@ -130,18 +134,136 @@ static Type *typeForPTCTemp(IRBuilder<> &Builder,
 }
 
 static bool shouldSeedAllocatedTemp(const PTCTemp &Temporary) {
-  if (!RunnablePTCAbiMetadata.HasAbiVersion || RunnablePTCAbiMetadata.AbiVersion < 2)
-    return false;
+  // QEMU v2 sidecar payloads can expose allocated temps that are already live
+  // at TB entry. Some of those are reported as TEMP_VAL_DEAD with val=0 even
+  // though following ops read them before a local write. Treat the sidecar's
+  // saved value as the TB-entry seed instead of aborting the translation.
+  return RunnablePTCAbiMetadata.HasAbiVersion
+         && RunnablePTCAbiMetadata.AbiVersion >= 2
+         && Temporary.temp_allocated
+         && !Temporary.fixed_reg;
+}
 
-  if (!Temporary.temp_allocated || Temporary.temp_local || Temporary.fixed_reg)
-    return false;
+static bool isQEMUV2TBScopedTemp(const PTCTemp &Temporary) {
+  return ptc_compat::isPTCAbiV2()
+         && Temporary.temp_allocated
+         && !Temporary.fixed_reg;
+}
 
-  if (Temporary.val_type == PTC_TEMP_VAL_CONST)
-    return true;
+static StructType *getNonOpaquePointeeStruct(Type *MaybePointerType) {
+#if LLVM_VERSION_MAJOR < 15
+  if (MaybePointerType->isPointerTy())
+    return dyn_cast<StructType>(MaybePointerType->getPointerElementType());
+#else
+  (void) MaybePointerType;
+#endif
+  return nullptr;
+}
 
-  // Live-sidecar replay currently approximates some TEMP_CONST entries as
-  // TEMP_VAL_DEAD while still preserving the literal in `val`.
-  return Temporary.val != 0;
+#if LLVM_VERSION_MAJOR >= 15
+static StructType *inferPointeeStructFromUses(Value *MaybePointer,
+                                              SmallPtrSetImpl<Value *> &Visited) {
+  if (!MaybePointer->getType()->isPointerTy())
+    return nullptr;
+  if (!Visited.insert(MaybePointer).second)
+    return nullptr;
+
+  for (User *TheUser : MaybePointer->users()) {
+    if (auto *GEP = dyn_cast<GetElementPtrInst>(TheUser)) {
+      if (auto *Struct = dyn_cast<StructType>(GEP->getSourceElementType()))
+        return Struct;
+    }
+    if (auto *Load = dyn_cast<LoadInst>(TheUser)) {
+      if (auto *Struct = inferPointeeStructFromUses(Load, Visited))
+        return Struct;
+      continue;
+    }
+    if (auto *Store = dyn_cast<StoreInst>(TheUser)) {
+      if (Store->getValueOperand() == MaybePointer) {
+        if (auto *Struct = inferPointeeStructFromUses(Store->getPointerOperand(),
+                                                      Visited))
+          return Struct;
+      }
+      continue;
+    }
+    if (auto *Cast = dyn_cast<CastInst>(TheUser)) {
+      if (auto *Struct = inferPointeeStructFromUses(Cast, Visited))
+        return Struct;
+      continue;
+    }
+  }
+  return nullptr;
+}
+
+static StructType *inferPointeeStructFromUses(Value *MaybePointer) {
+  SmallPtrSet<Value *, 8> Visited;
+  return inferPointeeStructFromUses(MaybePointer, Visited);
+}
+#endif
+
+static Type *getPointerValueType(Value *Pointer) {
+  if (auto *Global = dyn_cast<GlobalVariable>(Pointer))
+    return Global->getValueType();
+  if (auto *Alloca = dyn_cast<AllocaInst>(Pointer))
+    return Alloca->getAllocatedType();
+#if LLVM_VERSION_MAJOR >= 15
+  if (auto *GEP = dyn_cast<GetElementPtrInst>(Pointer))
+    return GEP->getResultElementType();
+
+  runnable_abort("Cannot infer value type from an opaque pointer");
+  return nullptr;
+#else
+  return Pointer->getType()->getPointerElementType();
+#endif
+}
+
+static LoadInst *createLoad(IRBuilder<> &Builder,
+                            Type *ValueType,
+                            Value *Pointer) {
+#if LLVM_VERSION_MAJOR >= 15
+  return Builder.CreateLoad(ValueType, Pointer);
+#else
+  (void) ValueType;
+  return Builder.CreateLoad(Pointer);
+#endif
+}
+
+static LoadInst *createLoad(Type *ValueType,
+                            Value *Pointer,
+                            const Twine &Name,
+                            Instruction *InsertBefore) {
+#if LLVM_VERSION_MAJOR >= 15
+  return new LoadInst(ValueType, Pointer, Name, InsertBefore);
+#else
+  (void) ValueType;
+  return new LoadInst(Pointer, Name, InsertBefore);
+#endif
+}
+
+static Value *coerceEnvToI8Ptr(IRBuilder<> &Builder, Value *EnvValue) {
+  PointerType *I8PtrTy = runnable_llvm::getInt8PtrTy(Builder.getContext());
+  if (EnvValue->getType()->isPointerTy())
+    return Builder.CreateBitCast(EnvValue, I8PtrTy);
+  if (EnvValue->getType()->isIntegerTy())
+    return Builder.CreateIntToPtr(EnvValue, I8PtrTy);
+  return nullptr;
+}
+
+static Value *createEnvBackingOffsetPointer(IRBuilder<> &Builder,
+                                            Value *EnvValue,
+                                            Type *PointeeType,
+                                            int64_t Offset) {
+  Value *EnvI8 = coerceEnvToI8Ptr(Builder, EnvValue);
+  if (EnvI8 == nullptr)
+    return nullptr;
+
+  Value *OffsetValue = ConstantInt::get(Builder.getInt64Ty(), Offset, true);
+#if LLVM_VERSION_MAJOR >= 15
+  Value *Address = Builder.CreateGEP(Builder.getInt8Ty(), EnvI8, OffsetValue);
+#else
+  Value *Address = Builder.CreateGEP(EnvI8, OffsetValue);
+#endif
+  return Builder.CreateBitCast(Address, PointeeType->getPointerTo());
 }
 
 } // namespace
@@ -275,6 +397,7 @@ VariableManager::VariableManager(Module &TheModule,
   ModuleLayout(&HelpersModule.getDataLayout()),
   EnvOffset(0),
   Env(nullptr),
+  EnvBacking(nullptr),
   TargetArchitecture(TargetArchitecture) {
 
   runnable_assert(ptc.initialized_env != nullptr);
@@ -287,30 +410,33 @@ VariableManager::VariableManager(Module &TheModule,
   for (Function &HelperFunction : HelpersModule) {
     FunctionType *HelperType = HelperFunction.getFunctionType();
     Type *ReturnType = HelperType->getReturnType();
-    if (ReturnType->isPointerTy())
-      Structs.insert(dyn_cast<StructType>(ReturnType->getPointerElementType()));
+    Structs.insert(getNonOpaquePointeeStruct(ReturnType));
 
     for (Type *Param : HelperType->params())
-      if (Param->isPointerTy())
-        Structs.insert(dyn_cast<StructType>(Param->getPointerElementType()));
+      Structs.insert(getNonOpaquePointeeStruct(Param));
 
-    if (startsWith(HelperFunction.getName(), HelperPrefix)
+    if (startsWith(HelperFunction.getName().str(), HelperPrefix)
         && HelperFunction.getFunctionType()->getNumParams() > 1) {
 
-      for (Type *Candidate : HelperType->params()) {
+      for (unsigned Index = 0; Index < HelperType->getNumParams(); ++Index) {
+        Type *Candidate = HelperType->getParamType(Index);
         Structs.insert(dyn_cast<StructType>(Candidate));
-        if (Candidate->isPointerTy()) {
-          auto *PointeeType = Candidate->getPointerElementType();
-          auto *EnvType = dyn_cast<StructType>(PointeeType);
-          // Ensure it is a struct and not a union
-          if (EnvType != nullptr && EnvType->getNumElements() > 1) {
+        auto *EnvType = getNonOpaquePointeeStruct(Candidate);
+#if LLVM_VERSION_MAJOR >= 15
+        if (EnvType == nullptr) {
+          auto ArgIt = HelperFunction.arg_begin();
+          std::advance(ArgIt, Index);
+          EnvType = inferPointeeStructFromUses(&*ArgIt);
+        }
+#endif
+        // Ensure it is a struct and not a union
+        if (EnvType != nullptr && EnvType->getNumElements() > 1) {
 
-            auto It = EnvElection.find(EnvType);
-            if (It != EnvElection.end())
-              EnvElection[EnvType]++;
-            else
-              EnvElection[EnvType] = 1;
-          }
+          auto It = EnvElection.find(EnvType);
+          if (It != EnvElection.end())
+            EnvElection[EnvType]++;
+          else
+            EnvElection[EnvType] = 1;
         }
       }
     }
@@ -364,70 +490,177 @@ VariableManager::VariableManager(Module &TheModule,
                                << DoLog);
 }
 
+GlobalVariable *VariableManager::getOrCreateEnvPointerGlobal() {
+  if (Env != nullptr) {
+    auto *EnvGlobal = dyn_cast<GlobalVariable>(Env);
+    runnable_assert(EnvGlobal != nullptr);
+    return EnvGlobal;
+  }
+
+  auto &Context = TheModule.getContext();
+  Type *Int64Ty = Type::getInt64Ty(Context);
+  Type *Int8Ty = Type::getInt8Ty(Context);
+  PointerType *Int8PtrTy = Int8Ty->getPointerTo();
+
+  if (EnvBacking == nullptr) {
+    EnvBacking = new GlobalVariable(TheModule,
+                                    CPUStateType,
+                                    false,
+                                    GlobalValue::InternalLinkage,
+                                    ConstantAggregateZero::get(CPUStateType),
+                                    "runnable_cpu_state");
+  }
+
+  Constant *EnvAddress = EnvBacking;
+  if (EnvOffset != 0) {
+    EnvAddress = ConstantExpr::getBitCast(EnvAddress, Int8PtrTy);
+    EnvAddress =
+      ConstantExpr::getGetElementPtr(Int8Ty,
+                                     EnvAddress,
+                                     ConstantInt::get(Int64Ty, EnvOffset));
+  }
+
+  Constant *EnvInitialValue = ConstantExpr::getPtrToInt(EnvAddress, Int64Ty);
+  auto *EnvGlobal = new GlobalVariable(TheModule,
+                                       Int64Ty,
+                                       false,
+                                       GlobalValue::InternalLinkage,
+                                       EnvInitialValue,
+                                       "env");
+  Env = EnvGlobal;
+  return EnvGlobal;
+}
+
 bool VariableManager::storeToCPUStateOffset(IRBuilder<> &Builder,
                                             unsigned StoreSize,
                                             unsigned Offset,
                                             Value *ToStore) {
-  Value *Target;
-  unsigned Remaining;
-  std::tie(Target, Remaining) = getByCPUStateOffsetInternal(Offset);
+  auto CoerceToWidth = [&](Value *Input, unsigned Bits) -> Value * {
+    auto *TargetTy = Builder.getIntNTy(Bits);
+    if (Input->getType() == TargetTy)
+      return Input;
+    auto *InputTy = dyn_cast<IntegerType>(Input->getType());
+    if (InputTy == nullptr)
+      return nullptr;
+    if (InputTy->getBitWidth() < Bits)
+      return Builder.CreateZExt(Input, TargetTy);
+    return Builder.CreateTrunc(Input, TargetTy);
+  };
 
-  if (Target == nullptr)
-    return false;
+  auto StoreSingle = [&](unsigned SingleStoreSize,
+                         unsigned SingleOffset,
+                         Value *SingleValue) -> bool {
+    Value *Target;
+    unsigned Remaining;
+    std::tie(Target, Remaining) = getByCPUStateOffsetInternal(SingleOffset);
 
-  unsigned ShiftAmount = 0;
-  if (TargetArchitecture.isLittleEndian())
-    ShiftAmount = Remaining;
-  else {
-    // >> (Size1 - Size2) - Remaining;
-    Type *PointeeTy = Target->getType()->getPointerElementType();
-    unsigned GlobalSize = cast<IntegerType>(PointeeTy)->getBitWidth() / 8;
-    runnable_assert(GlobalSize != 0);
-    ShiftAmount = (GlobalSize - StoreSize) - Remaining;
-  }
-  ShiftAmount *= 8;
-
-  // Build blanking mask
-  uint64_t BitMask = (StoreSize == 8 ? (uint64_t) -1 :
-                                       ((uint64_t) 1 << StoreSize * 8) - 1);
-  runnable_assert(ShiftAmount != 64);
-  BitMask <<= ShiftAmount;
-  BitMask = ~BitMask;
-
-  auto *InputStoreTy = cast<IntegerType>(Builder.getIntNTy(StoreSize * 8));
-  auto *FieldTy = cast<IntegerType>(Target->getType()->getPointerElementType());
-  unsigned FieldSize = FieldTy->getBitWidth() / 8;
-
-  // Are we trying to store more than it fits?
-  if (StoreSize > FieldSize) {
-    // If we're storing more than it fits and the following memory is not
-    // padding the store is not valid.
-    if (getByCPUStateOffsetInternal(Offset + FieldSize).first != nullptr)
+    if (Target == nullptr)
       return false;
-  }
 
-  // Truncate value to store
-  auto *Truncated = Builder.CreateTrunc(ToStore, InputStoreTy);
-  if (StoreSize > FieldSize)
-    Truncated = Builder.CreateTrunc(Truncated, FieldTy);
+    auto *InputStoreTy =
+      cast<IntegerType>(Builder.getIntNTy(SingleStoreSize * 8));
+    auto *FieldTy = cast<IntegerType>(getPointerValueType(Target));
+    unsigned FieldSize = FieldTy->getBitWidth() / 8;
+    if (Remaining >= FieldSize)
+      return false;
+    unsigned Available = FieldSize - Remaining;
+    if (SingleStoreSize > Available)
+      return false;
+    unsigned StoreBits = SingleStoreSize * 8;
+    unsigned FieldBits = FieldTy->getBitWidth();
 
-  // Re-extend
-  ToStore = Builder.CreateZExt(Truncated, FieldTy);
+    unsigned ShiftAmount = 0;
+    if (TargetArchitecture.isLittleEndian())
+      ShiftAmount = Remaining;
+    else {
+      // >> (Size1 - Size2) - Remaining;
+      ShiftAmount = (FieldSize - SingleStoreSize) - Remaining;
+    }
+    ShiftAmount *= 8;
 
-  if (BitMask != 0) {
-    // Load the value
-    auto *LoadEnvField = Builder.CreateLoad(Target);
+    // Truncate value to store
+    Value *Truncated = CoerceToWidth(SingleValue, InputStoreTy->getBitWidth());
+    if (Truncated == nullptr)
+      return false;
 
-    auto *Blanked = Builder.CreateAnd(LoadEnvField, BitMask);
+    if (SingleStoreSize == FieldSize && Remaining == 0) {
+      Value *ValueToStore = CoerceToWidth(Truncated, FieldBits);
+      if (ValueToStore == nullptr)
+        return false;
+      Builder.CreateStore(ValueToStore, Target);
+      return true;
+    }
 
-    // Shift value to store
-    ToStore = Builder.CreateShl(ToStore, ShiftAmount);
+    // Re-extend to the field width only for true subfield merges.
+    Value *ValueToStore = CoerceToWidth(Truncated, FieldBits);
+    if (ValueToStore == nullptr)
+      return false;
+
+    runnable_assert(ShiftAmount < FieldBits);
+    runnable_assert(ShiftAmount + StoreBits <= FieldBits);
+    APInt StoreMask = APInt::getLowBitsSet(FieldBits, StoreBits);
+    StoreMask <<= ShiftAmount;
+    APInt PreserveMask = ~StoreMask;
+    runnable_assert(!PreserveMask.isNullValue());
+
+    if (ShiftAmount != 0)
+      ValueToStore = Builder.CreateShl(ValueToStore, ShiftAmount);
+
+    // Load only for partial-field updates where bytes outside StoreMask survive.
+    auto *LoadEnvField = createLoad(Builder, FieldTy, Target);
+
+    auto *Blanked =
+      Builder.CreateAnd(LoadEnvField, ConstantInt::get(FieldTy, PreserveMask));
 
     // Combine them
-    ToStore = Builder.CreateOr(ToStore, Blanked);
-  }
+    ValueToStore = Builder.CreateOr(ValueToStore, Blanked);
 
-  Builder.CreateStore(ToStore, Target);
+    Builder.CreateStore(ValueToStore, Target);
+
+    return true;
+  };
+
+  if (StoreSingle(StoreSize, Offset, ToStore))
+    return true;
+
+  if (getByCPUStateOffsetInternal(Offset).first == nullptr)
+    return false;
+
+  Value *StoreValue = CoerceToWidth(ToStore, StoreSize * 8);
+  if (StoreValue == nullptr)
+    return false;
+
+  unsigned Processed = 0;
+  while (Processed < StoreSize) {
+    unsigned CurrentOffset = Offset + Processed;
+    Value *Target;
+    unsigned Remaining;
+    std::tie(Target, Remaining) = getByCPUStateOffsetInternal(CurrentOffset);
+
+    unsigned SegmentSize = 1;
+    if (Target != nullptr) {
+      auto *FieldTy = cast<IntegerType>(getPointerValueType(Target));
+      unsigned FieldSize = FieldTy->getBitWidth() / 8;
+      if (Remaining >= FieldSize)
+        return false;
+      SegmentSize = std::min(StoreSize - Processed, FieldSize - Remaining);
+    }
+
+    if (Target != nullptr) {
+      unsigned ShiftBytes = TargetArchitecture.isLittleEndian() ?
+                              Processed :
+                              StoreSize - Processed - SegmentSize;
+      Value *Segment = StoreValue;
+      if (ShiftBytes != 0)
+        Segment = Builder.CreateLShr(Segment, ShiftBytes * 8);
+      Segment = Builder.CreateTrunc(Segment,
+                                    Builder.getIntNTy(SegmentSize * 8));
+      if (!StoreSingle(SegmentSize, CurrentOffset, Segment))
+        return false;
+    }
+
+    Processed += SegmentSize;
+  }
 
   return true;
 }
@@ -435,50 +668,89 @@ bool VariableManager::storeToCPUStateOffset(IRBuilder<> &Builder,
 Value *VariableManager::loadFromCPUStateOffset(IRBuilder<> &Builder,
                                                unsigned LoadSize,
                                                unsigned Offset) {
-  Value *Target;
-  unsigned Remaining;
-  std::tie(Target, Remaining) = getByCPUStateOffsetInternal(Offset);
+  auto LoadSingle = [&](unsigned SingleLoadSize,
+                        unsigned SingleOffset) -> Value * {
+    Value *Target;
+    unsigned Remaining;
+    std::tie(Target, Remaining) = getByCPUStateOffsetInternal(SingleOffset);
 
-  if (Target == nullptr)
+    if (Target == nullptr)
+      return nullptr;
+
+    auto *FieldTy = cast<IntegerType>(getPointerValueType(Target));
+    unsigned FieldSize = FieldTy->getBitWidth() / 8;
+    if (Remaining >= FieldSize)
+      return nullptr;
+    unsigned Available = FieldSize - Remaining;
+    if (SingleLoadSize > Available)
+      return nullptr;
+
+    // Load the whole field
+    auto *LoadEnvField = createLoad(Builder, FieldTy, Target);
+
+    // Extract the desired part
+    // Shift right of the desired amount
+    unsigned ShiftAmount = 0;
+    if (TargetArchitecture.isLittleEndian()) {
+      ShiftAmount = Remaining;
+    } else {
+      // >> (Size1 - Size2) - Remaining;
+      ShiftAmount = (FieldSize - SingleLoadSize) - Remaining;
+    }
+    ShiftAmount *= 8;
+    Value *Result = LoadEnvField;
+
+    if (ShiftAmount != 0)
+      Result = Builder.CreateLShr(Result, ShiftAmount);
+
+    Type *LoadTy = Builder.getIntNTy(SingleLoadSize * 8);
+
+    // Truncate of the desired amount
+    return Builder.CreateTrunc(Result, LoadTy);
+  };
+
+  if (Value *Single = LoadSingle(LoadSize, Offset))
+    return Single;
+
+  if (getByCPUStateOffsetInternal(Offset).first == nullptr)
     return nullptr;
 
-  // Load the whole field
-  auto *LoadEnvField = Builder.CreateLoad(Target);
-
-  // Extract the desired part
-  // Shift right of the desired amount
-  unsigned ShiftAmount = 0;
-  if (TargetArchitecture.isLittleEndian()) {
-    ShiftAmount = Remaining;
-  } else {
-    // >> (Size1 - Size2) - Remaining;
-    auto *LoadedTy = cast<IntegerType>(LoadEnvField->getType());
-    unsigned GlobalSize = LoadedTy->getBitWidth() / 8;
-    runnable_assert(GlobalSize != 0);
-    ShiftAmount = (GlobalSize - LoadSize) - Remaining;
-  }
-  ShiftAmount *= 8;
-  Value *Result = LoadEnvField;
-
-  if (ShiftAmount != 0)
-    Result = Builder.CreateLShr(Result, ShiftAmount);
-
   Type *LoadTy = Builder.getIntNTy(LoadSize * 8);
+  Value *Result = ConstantInt::get(LoadTy, 0);
 
-  // Are we trying to load more than its available in the field?
-  if (auto FieldTy = dyn_cast<IntegerType>(Result->getType())) {
-    unsigned FieldSize = FieldTy->getBitWidth() / 8;
-    if (FieldSize < LoadSize) {
-      // If after what we are loading ther is something that is not padding we
-      // cannot load safely
-      if (getByCPUStateOffsetInternal(Offset + FieldSize).first != nullptr)
+  unsigned Processed = 0;
+  while (Processed < LoadSize) {
+    unsigned CurrentOffset = Offset + Processed;
+    Value *Target;
+    unsigned Remaining;
+    std::tie(Target, Remaining) = getByCPUStateOffsetInternal(CurrentOffset);
+
+    unsigned SegmentSize = 1;
+    if (Target != nullptr) {
+      auto *FieldTy = cast<IntegerType>(getPointerValueType(Target));
+      unsigned FieldSize = FieldTy->getBitWidth() / 8;
+      if (Remaining >= FieldSize)
         return nullptr;
-      Result = Builder.CreateZExt(Result, LoadTy);
+      SegmentSize = std::min(LoadSize - Processed, FieldSize - Remaining);
     }
+
+    if (Target != nullptr) {
+      Value *Segment = LoadSingle(SegmentSize, CurrentOffset);
+      if (Segment == nullptr)
+        return nullptr;
+      Segment = Builder.CreateZExt(Segment, LoadTy);
+      unsigned ShiftBytes = TargetArchitecture.isLittleEndian() ?
+                              Processed :
+                              LoadSize - Processed - SegmentSize;
+      if (ShiftBytes != 0)
+        Segment = Builder.CreateShl(Segment, ShiftBytes * 8);
+      Result = Builder.CreateOr(Result, Segment);
+    }
+
+    Processed += SegmentSize;
   }
 
-  // Truncate of the desired amount
-  return Builder.CreateTrunc(Result, LoadTy);
+  return Result;
 }
 
 bool VariableManager::memcpyAtEnvOffset(llvm::IRBuilder<> &Builder,
@@ -525,16 +797,137 @@ bool VariableManager::memcpyAtEnvOffset(llvm::IRBuilder<> &Builder,
 
     Value *Dst = EnvIsSrc ? OtherPtr : EnvVar;
     Value *Src = EnvIsSrc ? EnvVar : OtherPtr;
-    Builder.CreateStore(Builder.CreateLoad(Src), Dst);
 
-    Type *PointeeTy = EnvVar->getType()->getPointerElementType();
-    Offset += ModuleLayout->getTypeAllocSize(PointeeTy);
+    Type *EnvVarTy = EnvVar->getValueType();
+    Builder.CreateStore(createLoad(Builder, EnvVarTy, Src), Dst);
+
+    Offset += ModuleLayout->getTypeAllocSize(EnvVarTy);
   }
 
   if (OnlyPointersAndPadding)
     cast<Instruction>(OtherBasePtr)->eraseFromParent();
 
   return Offset == TotalSize;
+}
+
+bool VariableManager::syncCPUStateGlobalsWithEnvBacking(IRBuilder<> &Builder,
+                                                        Value *EnvValue,
+                                                        bool FlushToEnv) {
+  if (EnvValue == nullptr)
+    return false;
+
+  bool SyncedAny = false;
+  for (const auto &Entry : CPUStateGlobals) {
+    intptr_t AbsoluteOffset = Entry.first;
+    GlobalVariable *CSV = Entry.second;
+    if (CSV == nullptr)
+      continue;
+
+    Type *CSVType = CSV->getValueType();
+    if (!CSVType->isIntegerTy())
+      continue;
+
+    int64_t EnvRelativeOffset =
+      static_cast<int64_t>(AbsoluteOffset)
+      - static_cast<int64_t>(EnvOffset);
+    Value *BackingSlot =
+      createEnvBackingOffsetPointer(Builder,
+                                    EnvValue,
+                                    CSVType,
+                                    EnvRelativeOffset);
+    if (BackingSlot == nullptr)
+      return false;
+
+    if (FlushToEnv) {
+      Value *CSVValue = createLoad(Builder, CSVType, CSV);
+      Builder.CreateStore(CSVValue, BackingSlot);
+    } else {
+      Value *BackingValue = createLoad(Builder, CSVType, BackingSlot);
+      Builder.CreateStore(BackingValue, CSV);
+    }
+
+    SyncedAny = true;
+  }
+
+  static bool Reported = false;
+  if (SyncedAny && !Reported) {
+    errs() << "runnable-lift: syncing QEMU v2 CPUState CSVs at helper"
+           << " env backing boundary\n";
+    Reported = true;
+  }
+
+  return true;
+}
+
+bool VariableManager::syncCPUStateRangeWithEnvBacking(IRBuilder<> &Builder,
+                                                      Value *EnvValue,
+                                                      intptr_t EnvRelativeOffset,
+                                                      uint64_t Size,
+                                                      bool FlushToEnv) {
+  if (EnvValue == nullptr || Size == 0)
+    return false;
+
+  uint64_t Processed = 0;
+  std::set<intptr_t> SyncedOffsets;
+  while (Processed < Size) {
+    intptr_t AbsoluteOffset =
+      static_cast<intptr_t>(EnvOffset) + EnvRelativeOffset + Processed;
+
+    GlobalVariable *CSV = nullptr;
+    unsigned Remaining = 0;
+    std::tie(CSV, Remaining) = getByCPUStateOffsetInternal(AbsoluteOffset);
+    if (CSV == nullptr) {
+      Processed++;
+      continue;
+    }
+
+    intptr_t CSVOffset = AbsoluteOffset - Remaining;
+    if (!SyncedOffsets.insert(CSVOffset).second) {
+      Processed++;
+      continue;
+    }
+
+    Type *CSVType = CSV->getValueType();
+    if (!CSVType->isIntegerTy()) {
+      Processed++;
+      continue;
+    }
+
+    uint64_t FieldSize = ModuleLayout->getTypeAllocSize(CSVType);
+    if (FieldSize == 0) {
+      Processed++;
+      continue;
+    }
+
+    Value *BackingSlot =
+      createEnvBackingOffsetPointer(Builder,
+                                    EnvValue,
+                                    CSVType,
+                                    CSVOffset
+                                      - static_cast<intptr_t>(EnvOffset));
+    if (BackingSlot == nullptr)
+      return false;
+
+    if (FlushToEnv) {
+      Value *CSVValue = createLoad(Builder, CSVType, CSV);
+      Builder.CreateStore(CSVValue, BackingSlot);
+    } else {
+      Value *BackingValue = createLoad(Builder, CSVType, BackingSlot);
+      Builder.CreateStore(BackingValue, CSV);
+    }
+
+    uint64_t Step = FieldSize > Remaining ? FieldSize - Remaining : 1;
+    Processed += std::max<uint64_t>(Step, 1);
+  }
+
+  static bool Reported = false;
+  if (!SyncedOffsets.empty() && !Reported) {
+    errs() << "runnable-lift: syncing bounded QEMU v2 CPUState CSVs at"
+           << " helper env backing boundary\n";
+    Reported = true;
+  }
+
+  return true;
 }
 
 void VariableManager::aliasAnalysis() {
@@ -558,7 +951,7 @@ void VariableManager::aliasAnalysis() {
     const GlobalVariable *GV = P.second;
     CSVAliasInfo &AliasInfo = CSVAliasInfoMap[GV];
 
-    std::string Name = GV->getName();
+    std::string Name = GV->getName().str();
     MDNode *CSVScope = MDB.createAliasScope(Name, CSVDomain);
     AliasInfo.AliasScope = CSVScope;
     AllCSVScopes.push_back(CSVScope);
@@ -632,7 +1025,9 @@ void VariableManager::finalize() {
                                           { Builder.getInt32Ty(),
                                             Builder.getInt64Ty() },
                                           false);
-  auto *Temp = TheModule.getOrInsertFunction("set_register", SetRegisterTy);
+  auto *Temp = runnable_llvm::getOrInsertFunction(TheModule,
+                                                  "set_register",
+                                                  SetRegisterTy);
   auto *SetRegister = cast<Function>(Temp);
   SetRegister->setLinkage(GlobalValue::ExternalLinkage);
 
@@ -664,8 +1059,7 @@ void VariableManager::finalize() {
                                       DefaultBB,
                                       CPUStateGlobals.size());
   for (auto &P : CPUStateGlobals) {
-    Type *CSVTy = P.second->getType();
-    auto *CSVIntTy = cast<IntegerType>(CSVTy->getPointerElementType());
+    auto *CSVIntTy = cast<IntegerType>(P.second->getValueType());
     if (CSVIntTy->getBitWidth() <= 64) {
       // Set the value of the CSV
       auto *SetRegisterBB = BasicBlock::Create(Context, "", SetRegister);
@@ -740,6 +1134,123 @@ static ConstantInt *fromBytes(IntegerType *Type, void *Data) {
   runnable_unreachable("Unexpected type");
 }
 
+static ConstantInt *adjustQEMUV2CPUStateInitialValue(StructType *CPUStateType,
+                                                     unsigned EnvOffset,
+                                                     intptr_t Offset,
+                                                     StringRef Name,
+                                                     IntegerType *Type,
+                                                     ConstantInt *InitialValue) {
+  if (!ptc_compat::isPTCAbiV2()
+      || CPUStateType == nullptr
+      || (!CPUStateType->getName().contains("CPUX86State")
+          && !CPUStateType->getName().contains("X86CPU")))
+    return InitialValue;
+
+  auto adjustedValue = [&](uint64_t Value, const char *Field) {
+    errs() << "runnable-lift: initializing QEMU v2 x86_64 CPUState "
+           << Field
+           << " offset=0x" << Twine::utohexstr(Offset);
+    if (!Name.empty())
+      errs() << " name=" << Name;
+    errs() << " value=0x" << Twine::utohexstr(Value) << "\n";
+    return ConstantInt::get(Type, Value);
+  };
+
+  intptr_t EnvRelativeOffset =
+    Offset - static_cast<intptr_t>(EnvOffset);
+
+  // QEMU x86 keeps env->df as the byte step used by string instructions:
+  // +1 for forward direction, -1 for backward direction. The live sidecar's
+  // captured initial env can leave this derived field zero before any string
+  // op reads it, but generated TCG uses env->df directly for movs/stos/loads.
+  static constexpr intptr_t X86DFEnvOffset = 0xac;
+  if (EnvRelativeOffset == X86DFEnvOffset
+      && Type->getBitWidth() == 32
+      && InitialValue->isZero())
+    return adjustedValue(1, "df");
+
+  // The QEMU v2 sidecar can expose CPUX86State bytes before the x86 reset
+  // helpers have canonicalized derived FPU/SSE state. Helpers such as
+  // helper_cvtsi2ss read env->sse_status directly, so initialize the materialized
+  // CSVs to the same reset state as cpu_set_fpuc(env, 0x37f) and mxcsr=0x1f80.
+  static constexpr intptr_t X86FPSTTEnvOffset = 0x230;
+  static constexpr intptr_t X86FPUSenvOffset = 0x234;
+  static constexpr intptr_t X86FPUCEnvOffset = 0x236;
+  static constexpr intptr_t X86FPTagsEnvOffset = 0x238;
+  static constexpr intptr_t X86FPStatusEnvOffset = 0x2d8;
+  static constexpr intptr_t X86MMXStatusEnvOffset = 0x2f0;
+  static constexpr intptr_t X86SSEStatusEnvOffset = 0x2f7;
+  static constexpr intptr_t X86MXCSREnvOffset = 0x300;
+  static constexpr intptr_t X86XStateBVEnvOffset = 0x1140;
+  static constexpr intptr_t X86XCR0EnvOffset = 0x1148;
+
+  if (EnvRelativeOffset == X86FPSTTEnvOffset && Type->getBitWidth() == 32)
+    return adjustedValue(0, "fpstt");
+  if (EnvRelativeOffset == X86FPUSenvOffset && Type->getBitWidth() == 16)
+    return adjustedValue(0, "fpus");
+  if (EnvRelativeOffset == X86FPUCEnvOffset && Type->getBitWidth() == 16)
+    return adjustedValue(0x37f, "fpuc");
+  if (EnvRelativeOffset >= X86FPTagsEnvOffset
+      && EnvRelativeOffset < X86FPTagsEnvOffset + 8
+      && Type->getBitWidth() == 8)
+    return adjustedValue(1, "fptags");
+
+  auto adjustFloatStatusByte = [&](intptr_t BaseOffset,
+                                   const char *Field,
+                                   bool IsX87FPStatus)
+    -> ConstantInt * {
+    if (EnvRelativeOffset < BaseOffset || EnvRelativeOffset >= BaseOffset + 7
+        || Type->getBitWidth() != 8)
+      return nullptr;
+
+    uint64_t Value = 0;
+    intptr_t FieldOffset = EnvRelativeOffset - BaseOffset;
+    if (FieldOffset == 3 && IsX87FPStatus)
+      Value = 80;
+
+    return adjustedValue(Value, Field);
+  };
+
+  if (auto *Adjusted =
+        adjustFloatStatusByte(X86FPStatusEnvOffset, "fp_status",
+                              true))
+    return Adjusted;
+  if (auto *Adjusted =
+        adjustFloatStatusByte(X86MMXStatusEnvOffset, "mmx_status",
+                              false))
+    return Adjusted;
+  if (auto *Adjusted =
+        adjustFloatStatusByte(X86SSEStatusEnvOffset, "sse_status",
+                              false))
+    return Adjusted;
+
+  if (EnvRelativeOffset == X86MXCSREnvOffset && Type->getBitWidth() == 32)
+    return adjustedValue(0x1f80, "mxcsr");
+  if (EnvRelativeOffset == X86XStateBVEnvOffset && Type->getBitWidth() == 64)
+    return adjustedValue(0x3, "xstate_bv");
+  if (EnvRelativeOffset == X86XCR0EnvOffset && Type->getBitWidth() == 64)
+    return adjustedValue(0x1, "xcr0");
+
+  return InitialValue;
+}
+
+static GlobalVariable *materializeGlobalDeclaration(Module &M,
+                                                    StringRef Name,
+                                                    Type *ExpectedType,
+                                                    Constant *Initializer) {
+  if (Name.empty())
+    return nullptr;
+
+  GlobalVariable *GV = M.getNamedGlobal(Name);
+  if (GV == nullptr || !GV->isDeclaration())
+    return nullptr;
+
+  runnable_assert(GV->getValueType() == ExpectedType);
+  GV->setConstant(false);
+  GV->setInitializer(Initializer);
+  return GV;
+}
+
 // TODO: document that it can return nullptr
 GlobalVariable *
 VariableManager::getByCPUStateOffset(intptr_t Offset, std::string Name) {
@@ -757,7 +1268,7 @@ VariableManager::getByCPUStateOffsetInternal(intptr_t Offset,
   static const char *UnknownCSVPref = "state_0x";
   if (it == CPUStateGlobals.end()
       || (Name.size() != 0
-          && it->second->getName().startswith(UnknownCSVPref))) {
+          && startsWith(it->second->getName().str(), UnknownCSVPref))) {
     Type *VariableType;
     unsigned Remaining;
     std::tie(VariableType,
@@ -789,14 +1300,26 @@ VariableManager::getByCPUStateOffsetInternal(intptr_t Offset,
                            << " initial_data="
                            << static_cast<const void *>(InitialData)
                            << DoLog);
-    auto *InitialValue = fromBytes(cast<IntegerType>(VariableType), InitialData);
+    auto *VariableIntType = cast<IntegerType>(VariableType);
+    auto *InitialValue = fromBytes(VariableIntType, InitialData);
+    InitialValue = adjustQEMUV2CPUStateInitialValue(CPUStateType,
+                                                   EnvOffset,
+                                                   Offset,
+                                                   Name,
+                                                   VariableIntType,
+                                                   InitialValue);
 
-    auto *NewVariable = new GlobalVariable(TheModule,
-                                           VariableType,
-                                           false,
-                                           GlobalValue::ExternalLinkage,
-                                           InitialValue,
-                                           Name);
+    auto *NewVariable = materializeGlobalDeclaration(TheModule,
+                                                     Name,
+                                                     VariableType,
+                                                     InitialValue);
+    if (NewVariable == nullptr)
+      NewVariable = new GlobalVariable(TheModule,
+                                       VariableType,
+                                       false,
+                                       GlobalValue::ExternalLinkage,
+                                       InitialValue,
+                                       Name);
     runnable_assert(NewVariable != nullptr);
 
     if (it != CPUStateGlobals.end()) {
@@ -829,10 +1352,16 @@ Value *VariableManager::getOrCreate(unsigned TemporaryId, bool Reading) {
   StringRef TemporaryName(Temporary->name != nullptr ? Temporary->name : "");
 
   if (ptc_temp_is_global(Instructions, TemporaryId)) {
+    if (ptc_compat::isPTCAbiV2()
+        && Temporary->fixed_reg != 0
+        && TemporaryName == "env") {
+      return getOrCreateEnvPointerGlobal();
+    }
+
     // Basically we use fixed_reg to detect "env"
     if (Temporary->fixed_reg == 0) {
       Value *Result = getByCPUStateOffset(EnvOffset + Temporary->mem_offset,
-                                          TemporaryName);
+                                          TemporaryName.str());
       runnable_assert(Result != nullptr);
       return Result;
     } else {
@@ -856,13 +1385,23 @@ Value *VariableManager::getOrCreate(unsigned TemporaryId, bool Reading) {
         return Result;
       }
     }
-  } else if (Temporary->temp_local) {
+  } else if (Temporary->temp_local || isQEMUV2TBScopedTemp(*Temporary)) {
     auto it = LocalTemporaries.find(TemporaryId);
     if (it != LocalTemporaries.end()) {
       return it->second;
     } else {
       AllocaInst *NewTemporary = Builder.CreateAlloca(VariableType);
       LocalTemporaries[TemporaryId] = NewTemporary;
+      if (Reading && shouldSeedAllocatedTemp(*Temporary)) {
+        auto *InitialValue = ConstantInt::get(cast<IntegerType>(VariableType),
+                                              Temporary->val);
+        Builder.CreateStore(InitialValue, NewTemporary);
+        runnable_log(VMStateLog,
+                     "materialized v2 sidecar TB-scoped temp"
+                       << " temp_id=" << TemporaryId
+                       << " value=" << Temporary->val
+                       << DoLog);
+      }
       return NewTemporary;
     }
   } else {
@@ -899,8 +1438,8 @@ Value *VariableManager::getOrCreate(unsigned TemporaryId, bool Reading) {
 Value *VariableManager::computeEnvAddress(Type *TargetType,
                                           Instruction *InsertBefore,
                                           unsigned Offset) {
-  auto *LoadEnv = new LoadInst(Env, "", InsertBefore);
-  Type *EnvType = Env->getType()->getPointerElementType();
+  Type *EnvType = getPointerValueType(Env);
+  auto *LoadEnv = createLoad(EnvType, Env, "", InsertBefore);
   Value *Integer = LoadEnv;
   if (Offset != 0)
     Integer = BinaryOperator::Create(Instruction::Add,

@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <map>
 #include <string>
+#include <vector>
 
 // LLVM includes
 #include "llvm/IR/IRBuilder.h"
@@ -142,16 +143,35 @@ public:
                          unsigned Offset,
                          bool EnvIsSrc);
 
+  /// Synchronize materialized CPUState CSV globals with the real env backing
+  /// memory passed to QEMU helpers.  FlushToEnv=true writes CSVs to env before
+  /// a helper; FlushToEnv=false reloads helper side effects back to CSVs.
+  bool syncCPUStateGlobalsWithEnvBacking(llvm::IRBuilder<> &Builder,
+                                         llvm::Value *EnvValue,
+                                         bool FlushToEnv);
+
+  /// Synchronize a bounded env-relative CPUState byte range with the real env
+  /// backing memory passed to QEMU helpers.
+  bool syncCPUStateRangeWithEnvBacking(llvm::IRBuilder<> &Builder,
+                                       llvm::Value *EnvValue,
+                                       intptr_t EnvRelativeOffset,
+                                       uint64_t Size,
+                                       bool FlushToEnv);
+
   /// \brief Perform finalization steps on variables
   void finalize();
 
   /// \brief Gets the CPUStateType
   llvm::StructType *getCPUStateType() const { return CPUStateType; }
 
+  unsigned envOffset() const { return EnvOffset; }
+
   bool hasEnv() const { return Env != nullptr; }
 
 private:
   void aliasAnalysis();
+
+  llvm::GlobalVariable *getOrCreateEnvPointerGlobal();
 
   llvm::Value *loadFromCPUStateOffset(llvm::IRBuilder<> &Builder,
                                       unsigned LoadSize,
@@ -184,6 +204,7 @@ private:
   unsigned EnvOffset;
 
   llvm::Value *Env;
+  llvm::GlobalVariable *EnvBacking;
   Architecture &TargetArchitecture;
 };
 

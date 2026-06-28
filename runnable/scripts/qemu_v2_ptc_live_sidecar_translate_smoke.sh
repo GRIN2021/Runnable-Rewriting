@@ -3,7 +3,7 @@
 # Smoke the stronger PTC bridge shape: build a throwaway /tmp/libtinycode-x86_64.so
 # whose ptc_translate path shells out to a /tmp sidecar that regenerates live
 # QEMU walker/model data during the translate call, then reconstructs a
-# non-empty PTCInstructionList using the exact repo qemu/linux-user/ptc.h ABI.
+# non-empty PTCInstructionList using the archived legacy ptc.h ABI.
 #
 # This avoids linking non-PIC QEMU objects into the shared object. The dynamic
 # library stays PIC-only and only depends on the repo headers plus libc/dl.
@@ -12,6 +12,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 RR_DIR="$(cd "$SCRIPT_DIR/../.." && pwd -P)"
+LEGACY_QEMU_DIR="${RUNNABLE_QEMU_LEGACY_SRC:-$RR_DIR/archive/qemu-legacy-2.4.50}"
 
 SCRATCH_ROOT="${RUNNABLE_QEMU_V2_PTC_LIVE_SIDECAR_ROOT:-/tmp/rr-qemu-v2-upstream-probes/ptc-live-sidecar-translate-smoke}"
 QEMU_SRC="${RUNNABLE_QEMU_V2_UPSTREAM_SRC:-/tmp/rr-qemu-v2-upstream-probes/qemu-10.2.3}"
@@ -19,6 +20,11 @@ JOBS="${RUNNABLE_QEMU_V2_JOBS:-3}"
 PAYLOAD_SOURCE="${RUNNABLE_QEMU_V2_PTC_LIVE_SIDECAR_PAYLOAD_SOURCE:-}"
 MODEL_SOURCE="${RUNNABLE_QEMU_V2_PTC_LIVE_SIDECAR_MODEL_SOURCE:-}"
 SUMMARY_SOURCE="${RUNNABLE_QEMU_V2_PTC_LIVE_SIDECAR_SUMMARY_SOURCE:-}"
+EXTERNAL_BINARY="${RUNNABLE_QEMU_V2_PTC_LIVE_SIDECAR_EXTERNAL_BINARY:-}"
+EXTERNAL_ENTRY="${RUNNABLE_QEMU_V2_PTC_LIVE_SIDECAR_EXTERNAL_ENTRY:-}"
+EXTERNAL_LABEL="${RUNNABLE_QEMU_V2_PTC_LIVE_SIDECAR_EXTERNAL_LABEL:-}"
+EXTERNAL_RUN_DIR="${RUNNABLE_QEMU_V2_PTC_LIVE_SIDECAR_EXTERNAL_RUN_DIR:-}"
+GUEST_BASE="${RUNNABLE_QEMU_V2_PTC_LIVE_SIDECAR_GUEST_BASE:-}"
 FRESH=0
 
 usage() {
@@ -39,6 +45,18 @@ Options:
                       Optional model JSON to stage alongside a replay payload.
   --summary-source PATH
                       Optional summary JSON to stage alongside a replay payload.
+  --external-binary PATH
+                      Generate the sidecar from a caller-supplied executable
+                      with the real QEMU 10.2.3 walker instead of the built-in
+                      scalar smoke. Requires --external-entry.
+  --external-entry HEX
+                      Guest PC to capture and materialize for --external-binary.
+  --external-label NAME
+                      Label for external walker artifacts. Default: executable basename.
+  --external-run-dir DIR
+                      Working directory for the external executable. Default:
+                      directory containing --external-binary.
+  --guest-base HEX    Pass qemu-x86_64 -B HEX to the external walker.
   --fresh             Remove this smoke's scratch root before running.
   -h, --help          Show this help.
 
@@ -99,6 +117,26 @@ while [[ $# -gt 0 ]]; do
       SUMMARY_SOURCE="$(abs_path "${2:?missing value for --summary-source}")"
       shift 2
       ;;
+    --external-binary)
+      EXTERNAL_BINARY="$(abs_path "${2:?missing value for --external-binary}")"
+      shift 2
+      ;;
+    --external-entry)
+      EXTERNAL_ENTRY="${2:?missing value for --external-entry}"
+      shift 2
+      ;;
+    --external-label)
+      EXTERNAL_LABEL="${2:?missing value for --external-label}"
+      shift 2
+      ;;
+    --external-run-dir)
+      EXTERNAL_RUN_DIR="$(abs_path "${2:?missing value for --external-run-dir}")"
+      shift 2
+      ;;
+    --guest-base)
+      GUEST_BASE="${2:?missing value for --guest-base}"
+      shift 2
+      ;;
     --fresh)
       FRESH=1
       shift
@@ -122,10 +160,10 @@ fi
 SCRATCH_ROOT="$(abs_path "$SCRATCH_ROOT")"
 QEMU_SRC="$(abs_path "$QEMU_SRC")"
 
-if [[ ! -x "$QEMU_SRC/configure" && -x "$RR_DIR/qemu/configure" ]]; then
-  QEMU_SRC="$RR_DIR/qemu"
-  log "Falling back to repo qemu source tree: $QEMU_SRC"
-fi
+[[ -f "$QEMU_SRC/meson.build" ]] || die "QEMU 10.2.3 source tree is missing meson.build: $QEMU_SRC"
+[[ -x "$QEMU_SRC/configure" ]] || die "QEMU 10.2.3 source tree is missing executable configure: $QEMU_SRC"
+[[ -f "$QEMU_SRC/VERSION" ]] || die "QEMU 10.2.3 source tree is missing VERSION: $QEMU_SRC"
+[[ "$(tr -d '[:space:]' < "$QEMU_SRC/VERSION")" == "10.2.3" ]] || die "expected QEMU VERSION 10.2.3, found $(tr -d '[:space:]' < "$QEMU_SRC/VERSION") at $QEMU_SRC"
 
 if [[ -n "$PAYLOAD_SOURCE" && ! -f "$PAYLOAD_SOURCE" ]]; then
   die "replay payload source not found: $PAYLOAD_SOURCE"
@@ -135,6 +173,18 @@ if [[ -n "$MODEL_SOURCE" && ! -f "$MODEL_SOURCE" ]]; then
 fi
 if [[ -n "$SUMMARY_SOURCE" && ! -f "$SUMMARY_SOURCE" ]]; then
   die "replay summary source not found: $SUMMARY_SOURCE"
+fi
+if [[ -n "$EXTERNAL_BINARY" && ! -x "$EXTERNAL_BINARY" ]]; then
+  die "external binary not found or not executable: $EXTERNAL_BINARY"
+fi
+if [[ -n "$EXTERNAL_BINARY" && -z "$EXTERNAL_ENTRY" ]]; then
+  die "--external-entry is required with --external-binary"
+fi
+if [[ -z "$EXTERNAL_BINARY" && -n "$EXTERNAL_ENTRY" ]]; then
+  die "--external-entry requires --external-binary"
+fi
+if [[ -n "$PAYLOAD_SOURCE" && -n "$EXTERNAL_BINARY" ]]; then
+  die "--payload-source and --external-binary are mutually exclusive"
 fi
 
 SIDE_ROOT="$SCRATCH_ROOT/sidecar"
@@ -173,14 +223,60 @@ LOG_PATH="$SCRATCH_ROOT/sidecar.log"
 MODEL_JSON="$SCRATCH_ROOT/sidecar.model.json"
 SUMMARY_JSON="$SCRATCH_ROOT/sidecar.summary.json"
 PAYLOAD_OUT="$SCRATCH_ROOT/sidecar.payload.txt"
+PAYLOAD_STDOUT="$PAYLOAD_OUT"
 REAL_ROOT="$SCRATCH_ROOT/real"
 RR_DIR="${PTC_RR_DIR:?missing PTC_RR_DIR}"
 REAL_SCRIPT="$RR_DIR/runnable/scripts/qemu_v2_ptc_real_translate_scalar_smoke.sh"
+WALKER_SCRIPT="$RR_DIR/runnable/scripts/qemu_v2_ptc_tcg_op_walker_probe.sh"
+MATERIALIZE_SCRIPT="$RR_DIR/runnable/scripts/qemu_v2_ptc_materialize_walker_sidecar.py"
+MANIFEST_SCRIPT="$RR_DIR/runnable/scripts/qemu_v2_ptc_v2_manifest.py"
+CONVERT_SCRIPT="$RR_DIR/runnable/scripts/qemu_v2_ptc_convert_walker_jsonl.py"
 PAYLOAD_SOURCE="${PTC_SIDECAR_PAYLOAD_SOURCE:-}"
 MODEL_SOURCE="${PTC_SIDECAR_MODEL_SOURCE:-}"
 SUMMARY_SOURCE="${PTC_SIDECAR_SUMMARY_SOURCE:-}"
+REQUESTED_PC="${PTC_SIDECAR_REQUESTED_PC:-}"
+EXTERNAL_BINARY="${PTC_SIDECAR_EXTERNAL_BINARY:-}"
+EXTERNAL_ENTRY="${PTC_SIDECAR_EXTERNAL_ENTRY:-}"
+EXTERNAL_LABEL="${PTC_SIDECAR_EXTERNAL_LABEL:-}"
+EXTERNAL_RUN_DIR="${PTC_SIDECAR_EXTERNAL_RUN_DIR:-}"
+GUEST_BASE="${PTC_SIDECAR_GUEST_BASE:-}"
 
 mkdir -p "$SCRATCH_ROOT"
+
+install_payload_atomically() {
+  local src="$1"
+  local dst="$2"
+  local tmp
+  mkdir -p "$(dirname "$dst")"
+  tmp="$dst.tmp.$$"
+  cp "$src" "$tmp"
+  mv "$tmp" "$dst"
+}
+
+with_sidecar_lock() {
+  local lock_file="$1"
+  shift
+  mkdir -p "$(dirname "$lock_file")"
+  if command -v flock >/dev/null 2>&1; then
+    (
+      flock 9
+      "$@"
+    ) 9>"$lock_file"
+  else
+    local lock_dir="$lock_file.dir"
+    local rc
+    while ! mkdir "$lock_dir" 2>/dev/null; do
+      sleep 0.1
+    done
+    set +e
+    "$@"
+    rc=$?
+    set -e
+    rmdir "$lock_dir"
+    return "$rc"
+  fi
+}
+
 {
   printf '[%s] sidecar-start scratch_root=%s qemu_src=%s jobs=%s\n' "$(date -u +%FT%TZ)" "$SCRATCH_ROOT" "$QEMU_SRC" "$JOBS"
 } >>"$LOG_PATH"
@@ -195,13 +291,13 @@ if [[ -n "$PAYLOAD_SOURCE" ]]; then
       printf '[%s] sidecar-replay summary_source=%s\n' "$(date -u +%FT%TZ)" "$SUMMARY_SOURCE"
     fi
   } >>"$LOG_PATH"
-  if [[ -n "$MODEL_SOURCE" ]]; then
+  if [[ -n "$MODEL_SOURCE" && "$(readlink -f "$MODEL_SOURCE")" != "$(readlink -f "$MODEL_JSON")" ]]; then
     cp "$MODEL_SOURCE" "$MODEL_JSON"
   fi
-  if [[ -n "$SUMMARY_SOURCE" ]]; then
+  if [[ -n "$SUMMARY_SOURCE" && "$(readlink -f "$SUMMARY_SOURCE")" != "$(readlink -f "$SUMMARY_JSON")" ]]; then
     cp "$SUMMARY_SOURCE" "$SUMMARY_JSON"
   fi
-  python3 - "$PAYLOAD_SOURCE" "$PAYLOAD_OUT" "$MODEL_SOURCE" <<'PY' >"$PAYLOAD_OUT"
+  python3 - "$PAYLOAD_SOURCE" "$PAYLOAD_OUT" "$MODEL_SOURCE" "$REQUESTED_PC" <<'PY' >"$PAYLOAD_OUT"
 import sys
 from pathlib import Path
 import json
@@ -209,6 +305,7 @@ import json
 source_path = Path(sys.argv[1])
 output_path = Path(sys.argv[2])
 model_source = Path(sys.argv[3]) if len(sys.argv) > 3 and sys.argv[3] else None
+requested_pc_text = sys.argv[4] if len(sys.argv) > 4 else ""
 
 model_json = output_path.parent / "sidecar.model.json"
 summary_json = output_path.parent / "sidecar.summary.json"
@@ -228,22 +325,210 @@ if model.get("schema") == "qemu-v2-ptc-live-sidecar-model-v1":
 instructions = model["instructions"]
 temps = model["temps"]
 
+def parse_int_like(value):
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    try:
+        return int(str(value).strip(), 0)
+    except ValueError:
+        return None
+
 def to_int(value):
-    return 0 if value is None else int(value)
+    parsed = parse_int_like(value)
+    return 0 if parsed is None else parsed
 
 def instruction_opcode(inst):
     return inst["ptc_list_model"]["opc"]
 
-debug_index = next((i for i, inst in enumerate(instructions)
-                    if instruction_opcode(inst) == "debug_insn_start"), None)
+def debug_pc(inst):
+    if instruction_opcode(inst) != "debug_insn_start":
+        return None
+    args = inst.get("args") or []
+    if not args:
+        return None
+    return parse_int_like(args[0])
+
+def walker_tb_pc(inst):
+    walker = inst.get("walker") or {}
+    return parse_int_like(walker.get("tb_pc"))
+
+def temp_model_value(temp):
+    model_entry = temp.get("ptc_temp_model") or {}
+    return parse_int_like(model_entry.get("val"))
+
+def infer_dynamic_pc(renumbered, selected):
+    pc_temp_indices = set()
+    temp_values = {}
+    for temp in selected:
+        temp_index = parse_int_like(temp.get("index"))
+        if temp_index is None:
+            continue
+        temp_name = str(temp.get("name") or "").lower()
+        if temp_name in {"pc", "eip", "rip"}:
+            pc_temp_indices.add(temp_index)
+        value = temp_model_value(temp)
+        if value is not None:
+            temp_values[temp_index] = value
+
+    dynamic_pc = None
+    for inst in renumbered:
+        if instruction_opcode(inst) not in {"mov_i32", "mov_i64"}:
+            continue
+        inst_args = inst.get("args") or []
+        if len(inst_args) < 2:
+            continue
+        dst = parse_int_like(inst_args[0])
+        src = parse_int_like(inst_args[1])
+        if dst not in pc_temp_indices or src is None:
+            continue
+        value = temp_values.get(src)
+        if value is not None:
+            dynamic_pc = value
+    return dynamic_pc
+
+def walker_canonical_name(inst):
+    walker = inst.get("walker") or {}
+    return str(walker.get("canonical_name") or walker.get("name") or "")
+
+def walker_scalar_abi(inst, canonical):
+    walker = inst.get("walker") or {}
+    decoded = walker.get("param1_decoded") or {}
+    abi = decoded.get("abi")
+    if abi in {"i32", "i64"}:
+        return abi
+    if canonical.endswith("_i32"):
+        return "i32"
+    if canonical.endswith("_i64"):
+        return "i64"
+    return None
+
+def lower_to_legacy_ptc(inst):
+    model_entry = inst.get("ptc_list_model") or {}
+    opcode = instruction_opcode(inst)
+    canonical = walker_canonical_name(inst)
+    mapped_args = inst.get("args") or []
+    source_index = inst.get("source_index", inst.get("index"))
+
+    if opcode == "debug_insn_start":
+        if not mapped_args:
+            raise SystemExit(f"debug_insn_start instruction {source_index} has no PC arg")
+        if len(mapped_args) != 1:
+            inst["args"] = mapped_args[:1]
+            model_entry["argument_count"] = 1
+            model_entry["not_real_abi"] = False
+            return
+        model_entry["argument_count"] = 1
+        model_entry["not_real_abi"] = False
+        return
+
+    if opcode == "PTC_OP_EXTRACT_I64" or canonical == "extract_i64":
+        if len(mapped_args) != 4:
+            raise SystemExit(f"cannot lower extract_i64 instruction {source_index}: expected 4 args, got {len(mapped_args)}")
+        bit_offset = parse_int_like(mapped_args[2])
+        bit_length = parse_int_like(mapped_args[3])
+        if bit_offset == 0 and bit_length in {8, 16, 32}:
+            inst["args"] = mapped_args[:2]
+            model_entry["opc"] = f"ext{bit_length}u_i64"
+            model_entry["argument_count"] = 2
+            model_entry["not_real_abi"] = False
+            return
+        if bit_offset == 0 and bit_length == 64:
+            inst["args"] = mapped_args[:2]
+            model_entry["opc"] = "mov_i64"
+            model_entry["argument_count"] = 2
+            model_entry["not_real_abi"] = False
+            return
+        raise SystemExit(
+            f"cannot lower extract_i64 instruction {source_index}: "
+            f"unsupported bit slice offset={mapped_args[2]} length={mapped_args[3]}"
+        )
+
+    if opcode in {"PTC_OP_SEXTRACT_I32", "PTC_OP_SEXTRACT_I64"} or canonical in {"sextract", "sextract_i32", "sextract_i64"}:
+        if len(mapped_args) != 4:
+            raise SystemExit(f"cannot lower sextract instruction {source_index}: expected 4 args, got {len(mapped_args)}")
+        scalar_abi = walker_scalar_abi(inst, canonical)
+        if scalar_abi not in {"i32", "i64"}:
+            raise SystemExit(f"cannot lower sextract instruction {source_index}: unsupported scalar type {scalar_abi or 'unknown'}")
+        register_bits = 32 if scalar_abi == "i32" else 64
+        bit_offset = parse_int_like(mapped_args[2])
+        bit_length = parse_int_like(mapped_args[3])
+        if bit_offset == 0 and bit_length in {8, 16}:
+            inst["args"] = mapped_args[:2]
+            model_entry["opc"] = f"ext{bit_length}s_{scalar_abi}"
+            model_entry["argument_count"] = 2
+            model_entry["not_real_abi"] = False
+            return
+        if bit_offset == 0 and bit_length == 32 and scalar_abi == "i64":
+            inst["args"] = mapped_args[:2]
+            model_entry["opc"] = "ext32s_i64"
+            model_entry["argument_count"] = 2
+            model_entry["not_real_abi"] = False
+            return
+        if bit_offset == 0 and bit_length == register_bits:
+            inst["args"] = mapped_args[:2]
+            model_entry["opc"] = f"mov_{scalar_abi}"
+            model_entry["argument_count"] = 2
+            model_entry["not_real_abi"] = False
+            return
+        raise SystemExit(
+            f"cannot lower sextract instruction {source_index}: "
+            f"unsupported bit slice offset={mapped_args[2]} length={mapped_args[3]} type={scalar_abi}"
+        )
+
+    if opcode in (None, "None"):
+        if canonical == "goto_ptr":
+            inst["args"] = ["0"]
+            model_entry["opc"] = "exit_tb"
+            model_entry["argument_count"] = 1
+            model_entry["callo"] = None
+            model_entry["calli"] = None
+            model_entry["not_real_abi"] = False
+            return
+        raise SystemExit(f"cannot materialize unsupported walker instruction {source_index} ({canonical or 'unknown'})")
+
+    if isinstance(opcode, str) and opcode.startswith("PTC_OP_"):
+        raise SystemExit(f"cannot materialize QEMU v2 opcode {opcode} at instruction {source_index}")
+
+requested_pc = parse_int_like(requested_pc_text)
+selected_tb_pc = next(
+    (walker_tb_pc(inst) for inst in instructions if walker_tb_pc(inst) == requested_pc),
+    None,
+) if requested_pc is not None else None
+debug_indices = [
+    i for i, inst in enumerate(instructions)
+    if instruction_opcode(inst) == "debug_insn_start"
+]
+debug_index = None
+if selected_tb_pc is not None:
+    debug_index = next(
+        (
+            i for i in debug_indices
+            if walker_tb_pc(instructions[i]) == selected_tb_pc
+            and debug_pc(instructions[i]) == requested_pc
+        ),
+        None,
+    )
+if debug_index is None and requested_pc is not None:
+    debug_index = next((i for i in debug_indices if debug_pc(instructions[i]) == requested_pc), None)
+if debug_index is None:
+    debug_index = debug_indices[0] if debug_indices else None
 if debug_index is None:
     raise SystemExit(f"replay source model has no debug_insn_start instruction: {model_source}")
+if selected_tb_pc is None:
+    selected_tb_pc = walker_tb_pc(instructions[debug_index])
+if selected_tb_pc is None:
+    raise SystemExit(f"replay source model selected debug instruction has no walker tb_pc: {model_source}")
 
-next_debug_index = next((i for i in range(debug_index + 1, len(instructions))
-                         if instruction_opcode(instructions[i]) == "debug_insn_start"), len(instructions))
-selected_instructions = instructions[debug_index:next_debug_index]
+selected_instructions = [
+    inst for index, inst in enumerate(instructions)
+    if index >= debug_index and walker_tb_pc(inst) == selected_tb_pc
+]
 if not selected_instructions:
-    raise SystemExit(f"replay source model is missing instructions after debug_insn_start: {model_source}")
+    raise SystemExit(f"replay source model is missing instructions for tb_pc={hex(selected_tb_pc)}: {model_source}")
 
 temp_by_walker_arg = {}
 for temp in temps:
@@ -258,7 +543,7 @@ for inst in selected_instructions:
         temp = temp_by_walker_arg.get(str(arg))
         if temp is None:
             continue
-        temp_index = int(temp["index"])
+        temp_index = to_int(temp["index"])
         if temp_index not in selected_temp_set:
             selected_temp_set.add(temp_index)
             selected_temp_indices.append(temp_index)
@@ -268,7 +553,7 @@ def temp_sort_key(temp_index):
     flags = temp.get("flags", {})
     return (
         0 if flags.get("is_global") else 1,
-        int(temp["index"]),
+        to_int(temp["index"]),
     )
 
 ordered_temp_indices = sorted(selected_temp_indices, key=temp_sort_key)
@@ -288,6 +573,7 @@ renumbered_instructions = []
 argument_count = 0
 for new_index, inst in enumerate(selected_instructions):
     inst_copy = dict(inst)
+    inst_copy["source_index"] = inst.get("index")
     inst_copy["index"] = new_index
     mapped_args = []
     for arg in inst.get("args", []):
@@ -295,7 +581,7 @@ for new_index, inst in enumerate(selected_instructions):
         if temp is None:
             mapped_args.append(arg)
             continue
-        old_index = int(temp["index"])
+        old_index = to_int(temp["index"])
         if old_index not in temp_remap:
             raise SystemExit(
                 f"replay source model instruction {inst.get('index')} references temp {old_index} "
@@ -303,12 +589,14 @@ for new_index, inst in enumerate(selected_instructions):
             )
         mapped_args.append(str(temp_remap[old_index]))
     inst_copy["args"] = mapped_args
+    lower_to_legacy_ptc(inst_copy)
     renumbered_instructions.append(inst_copy)
-    argument_count += len(mapped_args)
+    argument_count += len(inst_copy["args"])
 
 global_temps = sum(1 for temp in selected_temps if temp.get("flags", {}).get("is_global"))
 if global_temps == 0:
     raise SystemExit(f"replay source model selected no global temps: {model_source}")
+dynamic_pc = infer_dynamic_pc(renumbered_instructions, selected_temps)
 
 output_lines = [
     "PTC_LIVE_SIDECAR v1",
@@ -320,14 +608,22 @@ output_lines = [
     f"model_json={model_json}",
     f"summary_json={summary_json}",
     f"payload_source={source_path}",
+    f"requested_pc={requested_pc_text}",
+    f"selected_debug_pc={hex(debug_pc(selected_instructions[0])) if debug_pc(selected_instructions[0]) is not None else ''}",
 ]
+if dynamic_pc is not None:
+    output_lines.append(f"dynamic_pc={hex(dynamic_pc)}")
+for helper in model.get("helper_defs", []):
+    name = str(helper.get("name") or "")
+    if name and "|" not in name and "\n" not in name and "\r" not in name:
+        output_lines.append(f"helper|{helper['func']}|{name}|{int(helper.get('flags') or 0)}")
 for inst in renumbered_instructions:
     model_entry = inst["ptc_list_model"]
     args = ",".join(str(arg) for arg in inst["args"])
     output_lines.append(
         "instruction|%d|%s|%s|%s|%d|%s"
         % (
-            int(inst["index"]),
+            to_int(inst["index"]),
             model_entry["opc"],
             to_int(model_entry["callo"]),
             to_int(model_entry["calli"]),
@@ -342,20 +638,20 @@ for temp in selected_temps:
     output_lines.append(
         "temp|%d|%s|%d|%d|%d|%d|%d|%d|%s|%d|%d|%d|%d|%d"
         % (
-            int(temp["index"]),
+            to_int(temp["index"]),
             str(temp_name).replace("|", "/"),
-            to_int(model_entry["val_type"]),
-            to_int(model_entry["base_type"]),
-            to_int(model_entry["type"]),
-            to_int(model_entry["reg"]),
-            to_int(model_entry["mem_reg"]),
-            to_int(model_entry["mem_offset"]),
+            to_int(model_entry.get("val_type")),
+            to_int(model_entry.get("base_type")),
+            to_int(model_entry.get("type")),
+            to_int(model_entry.get("reg")),
+            to_int(model_entry.get("mem_reg")),
+            to_int(model_entry.get("mem_offset")),
             "0" if temp_val is None else temp_val,
-            1 if model_entry["fixed_reg"] else 0,
-            1 if model_entry["mem_coherent"] else 0,
-            1 if model_entry["mem_allocated"] else 0,
-            1 if model_entry["temp_local"] else 0,
-            1 if model_entry["temp_allocated"] else 0,
+            1 if model_entry.get("fixed_reg") else 0,
+            1 if model_entry.get("mem_coherent") else 0,
+            1 if model_entry.get("mem_allocated") else 0,
+            1 if model_entry.get("temp_local") else 0,
+            1 if model_entry.get("temp_allocated") else 0,
         )
     )
 output = "\n".join(output_lines) + "\n"
@@ -363,6 +659,124 @@ output_path.write_text(output, encoding="utf-8")
 sys.stdout.write(output)
 PY
   test -s "$PAYLOAD_OUT"
+elif [[ -n "$EXTERNAL_BINARY" ]]; then
+  CAPTURE_PC="${REQUESTED_PC:-$EXTERNAL_ENTRY}"
+  if [[ -z "$CAPTURE_PC" ]]; then
+    CAPTURE_PC="$EXTERNAL_ENTRY"
+  fi
+  SAFE_CAPTURE_PC="$(printf '%s' "$CAPTURE_PC" | tr -c 'A-Za-z0-9_' '_')"
+  if [[ -z "$SAFE_CAPTURE_PC" ]]; then
+    SAFE_CAPTURE_PC="requested"
+  fi
+  RUN_TOKEN="$(date -u +%Y%m%dT%H%M%S%N)-$$-${RANDOM:-0}"
+  EXTERNAL_CACHE_ROOT="$SCRATCH_ROOT/external/cache-$SAFE_CAPTURE_PC"
+  CACHE_PAYLOAD="$EXTERNAL_CACHE_ROOT/materialized/sidecar/sidecar.payload.txt"
+  CACHE_MODEL="$EXTERNAL_CACHE_ROOT/materialized/sidecar/sidecar.model.json"
+  CACHE_SUMMARY="$EXTERNAL_CACHE_ROOT/materialized/sidecar/sidecar.summary.json"
+  if [[ -s "$CACHE_PAYLOAD" && -s "$CACHE_MODEL" && -s "$CACHE_SUMMARY" ]]; then
+    cp "$CACHE_MODEL" "$MODEL_JSON"
+    cp "$CACHE_SUMMARY" "$SUMMARY_JSON"
+    cp "$CACHE_PAYLOAD" "$PAYLOAD_OUT"
+    PAYLOAD_STDOUT="$CACHE_PAYLOAD"
+    printf '[%s] sidecar-external-cache-hit pc=%s payload=%s\n' "$(date -u +%FT%TZ)" "$CAPTURE_PC" "$CACHE_PAYLOAD" >>"$LOG_PATH"
+  else
+    EXTERNAL_LABEL_EFFECTIVE="$EXTERNAL_LABEL"
+    if [[ -z "$EXTERNAL_LABEL_EFFECTIVE" ]]; then
+      EXTERNAL_LABEL_EFFECTIVE="$(basename "$EXTERNAL_BINARY")"
+    fi
+    EXTERNAL_LABEL_EFFECTIVE="$EXTERNAL_LABEL_EFFECTIVE-$SAFE_CAPTURE_PC"
+    EXTERNAL_ROOT="$EXTERNAL_CACHE_ROOT/work-$RUN_TOKEN"
+    SHARED_WALKER_ROOT="$SCRATCH_ROOT/external/shared-walker"
+    SHARED_WALKER_BIN="$SHARED_WALKER_ROOT/build-10.2.3-ptc-tcg-op-walker/qemu-x86_64"
+    SHARED_WALKER_LOCK="$SHARED_WALKER_ROOT/.walker.lock"
+    SHARED_WALKER_JSONL="$SHARED_WALKER_ROOT/dumps/$EXTERNAL_LABEL_EFFECTIVE.tcg-op-walk.jsonl"
+    SHARED_WALKER_RUN_LOG="$SHARED_WALKER_ROOT/dumps/$EXTERNAL_LABEL_EFFECTIVE.run.log"
+    SHARED_WALKER_EXIT_CODE="$SHARED_WALKER_ROOT/dumps/$EXTERNAL_LABEL_EFFECTIVE.exit-code"
+    EXTERNAL_WALKER_JSONL="$EXTERNAL_ROOT/walker/dumps/$EXTERNAL_LABEL_EFFECTIVE.tcg-op-walk.jsonl"
+    EXTERNAL_MANIFEST_JSON="$EXTERNAL_ROOT/$EXTERNAL_LABEL_EFFECTIVE.ptc-v2-manifest.json"
+    EXTERNAL_MANIFEST_HEADER="$EXTERNAL_ROOT/$EXTERNAL_LABEL_EFFECTIVE.ptc-v2-opc.h"
+    EXTERNAL_MODEL_JSON="$EXTERNAL_ROOT/$EXTERNAL_LABEL_EFFECTIVE.ptc-conversion-model.json"
+    EXTERNAL_MATERIALIZED_ROOT="$EXTERNAL_ROOT/materialized"
+    mkdir -p "$EXTERNAL_ROOT" "$EXTERNAL_ROOT/walker/dumps" "$SHARED_WALKER_ROOT"
+
+    {
+      printf '[%s] sidecar-external binary=%s requested_pc=%s capture_pc=%s label=%s run_dir=%s guest_base=%s shared_walker_root=%s\n' \
+        "$(date -u +%FT%TZ)" "$EXTERNAL_BINARY" "$REQUESTED_PC" "$CAPTURE_PC" "$EXTERNAL_LABEL_EFFECTIVE" \
+        "$EXTERNAL_RUN_DIR" "$GUEST_BASE" "$SHARED_WALKER_ROOT"
+    } >>"$LOG_PATH"
+
+    run_external_walker_shared() {
+      local walker_mode="build"
+      local -a walker_args=(
+        --scratch-root "$SHARED_WALKER_ROOT"
+        --qemu-src "$QEMU_SRC"
+        --jobs "$JOBS"
+        --skip-download
+        --external-binary "$EXTERNAL_BINARY"
+        --external-entry "$CAPTURE_PC"
+        --external-label "$EXTERNAL_LABEL_EFFECTIVE"
+      )
+      if [[ -x "$SHARED_WALKER_BIN" ]]; then
+        walker_mode="run-only"
+        walker_args+=(--run-only)
+      fi
+      if [[ -n "$EXTERNAL_RUN_DIR" ]]; then
+        walker_args+=(--external-run-dir "$EXTERNAL_RUN_DIR")
+      fi
+      if [[ -n "$GUEST_BASE" ]]; then
+        walker_args+=(--guest-base "$GUEST_BASE")
+      fi
+      rm -f "$SHARED_WALKER_JSONL" "$SHARED_WALKER_RUN_LOG" "$SHARED_WALKER_EXIT_CODE"
+      printf '[%s] sidecar-external-walker mode=%s shared_root=%s jsonl=%s\n' \
+        "$(date -u +%FT%TZ)" "$walker_mode" "$SHARED_WALKER_ROOT" "$SHARED_WALKER_JSONL" >>"$LOG_PATH"
+      bash "$WALKER_SCRIPT" "${walker_args[@]}" >>"$LOG_PATH" 2>&1
+      if [[ -s "$SHARED_WALKER_JSONL" ]]; then
+        cp "$SHARED_WALKER_JSONL" "$EXTERNAL_WALKER_JSONL"
+        if [[ -f "$SHARED_WALKER_RUN_LOG" ]]; then
+          cp "$SHARED_WALKER_RUN_LOG" "$EXTERNAL_ROOT/walker/dumps/$EXTERNAL_LABEL_EFFECTIVE.run.log"
+        fi
+        if [[ -f "$SHARED_WALKER_EXIT_CODE" ]]; then
+          cp "$SHARED_WALKER_EXIT_CODE" "$EXTERNAL_ROOT/walker/dumps/$EXTERNAL_LABEL_EFFECTIVE.exit-code"
+        fi
+      fi
+    }
+
+    with_sidecar_lock "$SHARED_WALKER_LOCK" run_external_walker_shared
+
+    [[ -s "$EXTERNAL_WALKER_JSONL" ]] || {
+      printf '[%s] sidecar-external-empty-walker jsonl=%s shared_jsonl=%s\n' "$(date -u +%FT%TZ)" "$EXTERNAL_WALKER_JSONL" "$SHARED_WALKER_JSONL" >>"$LOG_PATH"
+      exit 1
+    }
+
+    python3 "$MANIFEST_SCRIPT" \
+      --inventory "$EXTERNAL_ROOT/$EXTERNAL_LABEL_EFFECTIVE.derived.ptc-inventory.json" \
+      --walker-jsonl "$EXTERNAL_WALKER_JSONL" \
+      --source-filter walker-jsonl \
+      --tmp-dir "$EXTERNAL_ROOT/manifest-tmp" \
+      --json-out "$EXTERNAL_MANIFEST_JSON" \
+      --header-out "$EXTERNAL_MANIFEST_HEADER" >>"$LOG_PATH" 2>&1
+
+    python3 "$CONVERT_SCRIPT" \
+      --walker-jsonl "$EXTERNAL_WALKER_JSONL" \
+      --manifest "$EXTERNAL_MANIFEST_JSON" \
+      --json-out "$EXTERNAL_MODEL_JSON" >>"$LOG_PATH" 2>&1
+
+    python3 "$MATERIALIZE_SCRIPT" \
+      --model-json "$EXTERNAL_MODEL_JSON" \
+      --manifest-json "$EXTERNAL_MANIFEST_JSON" \
+      --output-root "$EXTERNAL_MATERIALIZED_ROOT" \
+      --captured-pc "$CAPTURE_PC" \
+      --canonical-pc "$CAPTURE_PC" \
+      --normalize-debug-pc >>"$LOG_PATH" 2>&1
+
+    install_payload_atomically "$EXTERNAL_MATERIALIZED_ROOT/sidecar/sidecar.model.json" "$CACHE_MODEL"
+    install_payload_atomically "$EXTERNAL_MATERIALIZED_ROOT/sidecar/sidecar.summary.json" "$CACHE_SUMMARY"
+    install_payload_atomically "$EXTERNAL_MATERIALIZED_ROOT/sidecar/sidecar.payload.txt" "$CACHE_PAYLOAD"
+    cp "$EXTERNAL_MATERIALIZED_ROOT/sidecar/sidecar.model.json" "$MODEL_JSON"
+    cp "$EXTERNAL_MATERIALIZED_ROOT/sidecar/sidecar.summary.json" "$SUMMARY_JSON"
+    cp "$EXTERNAL_MATERIALIZED_ROOT/sidecar/sidecar.payload.txt" "$PAYLOAD_OUT"
+    PAYLOAD_STDOUT="$EXTERNAL_MATERIALIZED_ROOT/sidecar/sidecar.payload.txt"
+  fi
 else
   printf '[%s] invoking-real-smoke\n' "$(date -u +%FT%TZ)" >>"$LOG_PATH"
   bash "$REAL_SCRIPT" --scratch-root "$REAL_ROOT" --qemu-src "$QEMU_SRC" --jobs "$JOBS" --fresh >>"$LOG_PATH" 2>&1
@@ -402,6 +816,10 @@ print(f"global_temps={int(summary['global_temps'])}")
 print(f"total_temps={int(summary['total_temps'])}")
 print(f"model_json={model_path}")
 print(f"summary_json={model_path.parent / 'sidecar.summary.json'}")
+for helper in model.get("helper_defs", []):
+    name = str(helper.get("name") or "")
+    if name and "|" not in name and "\n" not in name and "\r" not in name:
+        print(f"helper|{helper['func']}|{name}|{int(helper.get('flags') or 0)}")
 for inst in instructions:
     model_entry = inst["ptc_list_model"]
     args = ",".join(str(arg) for arg in inst["args"])
@@ -442,16 +860,17 @@ for temp in temps:
 PY
 fi
 
-cat "$PAYLOAD_OUT"
+cat "$PAYLOAD_STDOUT"
 
 {
-  printf '[%s] sidecar-finished model_json=%s summary_json=%s payload=%s\n' "$(date -u +%FT%TZ)" "$MODEL_JSON" "$SUMMARY_JSON" "$PAYLOAD_OUT"
+  printf '[%s] sidecar-finished model_json=%s summary_json=%s payload=%s stdout_payload=%s\n' "$(date -u +%FT%TZ)" "$MODEL_JSON" "$SUMMARY_JSON" "$PAYLOAD_OUT" "$PAYLOAD_STDOUT"
 } >>"$LOG_PATH"
 EOF
 chmod +x "$SIDE_HELPER"
 
 log "Generating library and harness sources"
-python3 - "$LIB_C" "$HARNESS_C" "$SIDE_HELPER" "$SIDE_ROOT" "$QEMU_SRC" "$LIB_SO" "$RR_DIR" "$JOBS" "$PAYLOAD_SOURCE" "$MODEL_SOURCE" "$SUMMARY_SOURCE" <<'PY'
+python3 - "$LIB_C" "$HARNESS_C" "$SIDE_HELPER" "$SIDE_ROOT" "$QEMU_SRC" "$LIB_SO" "$RR_DIR" "$JOBS" "$PAYLOAD_SOURCE" "$MODEL_SOURCE" "$SUMMARY_SOURCE" "$EXTERNAL_BINARY" "$EXTERNAL_ENTRY" "$EXTERNAL_LABEL" "$EXTERNAL_RUN_DIR" "$GUEST_BASE" <<'PY'
+import json
 import sys
 from pathlib import Path
 
@@ -466,9 +885,72 @@ jobs = int(sys.argv[8])
 payload_source = sys.argv[9]
 model_source = sys.argv[10]
 summary_source = sys.argv[11]
+external_binary = sys.argv[12]
+external_entry = sys.argv[13]
+external_label = sys.argv[14]
+external_run_dir = sys.argv[15]
+guest_base = sys.argv[16]
 side_log = side_root / "sidecar.log"
 side_model = side_root / "sidecar.model.json"
 side_summary = side_root / "sidecar.summary.json"
+request_aware_metadata = '  "request_aware=true\\n"\n' if external_binary else ""
+
+def parse_int_like(value):
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        try:
+            return int(value.strip(), 0)
+        except ValueError:
+            return None
+    return None
+
+def c_string_literal(value):
+    return json.dumps(str(value))
+
+def sidecar_helper_defs_from_model(path):
+    if not path or not path.exists():
+        return []
+    try:
+        model = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    helper_defs = model.get("helper_defs")
+    if not isinstance(helper_defs, list):
+        helper_defs = []
+    result = []
+    seen = set()
+    for helper in helper_defs:
+        if not isinstance(helper, dict):
+            continue
+        func = parse_int_like(helper.get("func"))
+        name = helper.get("name")
+        flags = parse_int_like(helper.get("flags"))
+        if func is None or not isinstance(name, str) or not name or func in seen:
+            continue
+        seen.add(func)
+        result.append({"func": func, "name": name.removeprefix("helper_"), "flags": 0 if flags is None else flags})
+    return result
+
+def render_helper_defs(helper_defs):
+    rows = ['static PTCHelperDef ptc_helper_defs_storage[PTC_LIVE_SIDECAR_HELPER_CAPACITY] = {']
+    for helper in helper_defs:
+        rows.append(
+            '  { (void *)(uintptr_t)UINT64_C(0x%x), %s, %uu },'
+            % (helper["func"], c_string_literal(helper["name"]), helper["flags"])
+        )
+    rows.append('};')
+    return "\n".join(rows), len(helper_defs)
+
+helper_defs = sidecar_helper_defs_from_model(Path(model_source) if model_source else side_model)
+helper_defs_c, helper_defs_size = render_helper_defs(helper_defs)
+try:
+    harness_pc_value = int(external_entry, 0) if external_binary and external_entry else 0x401000
+except ValueError:
+    harness_pc_value = 0x401000
+harness_pc_literal = f"UINT64_C(0x{harness_pc_value:x})"
 
 lib_c = f'''#define _GNU_SOURCE 1
 #include <errno.h>
@@ -480,6 +962,8 @@ lib_c = f'''#define _GNU_SOURCE 1
 
 #define TCG_TARGET_REG_BITS 64
 #define TARGET_LONG_BITS 64
+#define PTC_LIVE_SIDECAR_HELPER_CAPACITY 256u
+#define PTC_LIVE_SIDECAR_HELPER_TOKEN_BASE UINT64_C(0xfff0000000000000)
 #define TCG_TARGET_HAS_div2_i32 0
 #define TCG_TARGET_HAS_rot_i32 0
 #define TCG_TARGET_HAS_ext8s_i32 0
@@ -552,11 +1036,17 @@ static const char ptc_abi_metadata[] =
   "bridge_kind=live_sidecar\\n"
   "real_translation=true\\n"
   "sidecar_triggered_during_ptc_translate=true\\n"
-  "exact_repo_ptc_h=true\\n";
+  "exact_repo_ptc_h=true\\n"
+{request_aware_metadata};
 
 static const char ptc_sidecar_payload_source[] = "{payload_source}";
 static const char ptc_sidecar_model_source[] = "{model_source}";
 static const char ptc_sidecar_summary_source[] = "{summary_source}";
+static const char ptc_sidecar_external_binary[] = "{external_binary}";
+static const char ptc_sidecar_external_entry[] = "{external_entry}";
+static const char ptc_sidecar_external_label[] = "{external_label}";
+static const char ptc_sidecar_external_run_dir[] = "{external_run_dir}";
+static const char ptc_sidecar_guest_base[] = "{guest_base}";
 static const char ptc_sidecar_helper_path[] = "{side_helper}";
 static const char ptc_sidecar_root_path[] = "{side_root}";
 static const char ptc_qemu_src_path[] = "{qemu_src}";
@@ -573,9 +1063,7 @@ static PTCOpcodeDef ptc_opcode_defs_storage[PTC_INSTRUCTION_NB_OPS] = {{
 #undef DEF
 }};
 
-static PTCHelperDef ptc_helper_defs_storage[1] = {{
-  {{ NULL, "ptc_live_sidecar_helper_table", 0u }},
-}};
+{helper_defs_c}
 
 static uint64_t ptc_elf_start_stack = UINT64_C(0x700000000000);
 static uint64_t ptc_regs[16];
@@ -727,7 +1215,7 @@ static PTCOpcode ptc_lookup_opcode(const char *name)
       return (PTCOpcode) i;
     }}
   }}
-  return (PTCOpcode) 0;
+  return (PTCOpcode) PTC_INSTRUCTION_NB_OPS;
 }}
 
 static int ptc_parse_payload_line(char *line, const char **kind, char **rest)
@@ -754,6 +1242,131 @@ static int ptc_parse_assignment_line(char *line, const char **key, char **value)
   return 0;
 }}
 
+static int ptc_assignment_value(const char *line, const char *expected_key, const char **value)
+{{
+  const char *sep = strchr(line, '=');
+  size_t key_len;
+  if (sep == NULL || expected_key == NULL || value == NULL) {{
+    return -EINVAL;
+  }}
+  key_len = (size_t)(sep - line);
+  if (strlen(expected_key) != key_len || strncmp(line, expected_key, key_len) != 0) {{
+    return -EINVAL;
+  }}
+  *value = sep + 1;
+  return 0;
+}}
+
+typedef struct PTCPayloadHelperAlias {{
+  uint64_t raw_func;
+  uint64_t canonical_func;
+}} PTCPayloadHelperAlias;
+
+static uint64_t ptc_payload_helper_token_for_slot(size_t slot)
+{{
+  return PTC_LIVE_SIDECAR_HELPER_TOKEN_BASE + (uint64_t) slot + UINT64_C(1);
+}}
+
+static size_t ptc_helper_defs_used(void)
+{{
+  size_t i;
+  size_t used = 0;
+
+  for (i = 0; i < PTC_LIVE_SIDECAR_HELPER_CAPACITY; ++i) {{
+    if (ptc_helper_defs_storage[i].func != NULL) {{
+      ++used;
+    }}
+  }}
+
+  return used;
+}}
+
+static int ptc_register_payload_helper(uint64_t func, const char *name, unsigned flags, uint64_t *canonical_func)
+{{
+  size_t i;
+
+  if (canonical_func != NULL) {{
+    *canonical_func = 0;
+  }}
+  if (func == 0 || name == NULL || name[0] == '\\0') {{
+    return -EINVAL;
+  }}
+
+  for (i = 0; i < PTC_LIVE_SIDECAR_HELPER_CAPACITY; ++i) {{
+    if (ptc_helper_defs_storage[i].func != NULL &&
+        ptc_helper_defs_storage[i].name != NULL &&
+        strcmp(ptc_helper_defs_storage[i].name, name) == 0) {{
+      ptc_helper_defs_storage[i].flags = flags;
+      if (canonical_func != NULL) {{
+        *canonical_func = (uint64_t)(uintptr_t)ptc_helper_defs_storage[i].func;
+      }}
+      return 0;
+    }}
+  }}
+
+  for (i = 0; i < PTC_LIVE_SIDECAR_HELPER_CAPACITY; ++i) {{
+    if (ptc_helper_defs_storage[i].func == NULL) {{
+      uint64_t token = ptc_payload_helper_token_for_slot(i);
+      ptc_helper_defs_storage[i].func = (void *)(uintptr_t)token;
+      ptc_helper_defs_storage[i].name = strdup(name);
+      if (ptc_helper_defs_storage[i].name == NULL) {{
+        ptc_helper_defs_storage[i].func = NULL;
+        return -ENOMEM;
+      }}
+      ptc_helper_defs_storage[i].flags = flags;
+      if (canonical_func != NULL) {{
+        *canonical_func = token;
+      }}
+      return 0;
+    }}
+  }}
+
+  return -ENOSPC;
+}}
+
+static int ptc_payload_helper_alias_push(PTCPayloadHelperAlias *aliases,
+                                        size_t *alias_count,
+                                        uint64_t raw_func,
+                                        uint64_t canonical_func)
+{{
+  size_t i;
+
+  if (aliases == NULL || alias_count == NULL || raw_func == 0 || canonical_func == 0) {{
+    return -EINVAL;
+  }}
+
+  for (i = 0; i < *alias_count; ++i) {{
+    if (aliases[i].raw_func == raw_func) {{
+      aliases[i].canonical_func = canonical_func;
+      return 0;
+    }}
+  }}
+
+  if (*alias_count >= PTC_LIVE_SIDECAR_HELPER_CAPACITY) {{
+    return -ENOSPC;
+  }}
+
+  aliases[*alias_count].raw_func = raw_func;
+  aliases[*alias_count].canonical_func = canonical_func;
+  ++*alias_count;
+  return 0;
+}}
+
+static uint64_t ptc_payload_helper_alias_lookup(const PTCPayloadHelperAlias *aliases,
+                                                size_t alias_count,
+                                                uint64_t raw_func)
+{{
+  size_t i;
+
+  for (i = 0; i < alias_count; ++i) {{
+    if (aliases[i].raw_func == raw_func) {{
+      return aliases[i].canonical_func;
+    }}
+  }}
+
+  return 0;
+}}
+
 static int ptc_build_instruction_list_from_payload(FILE *stream, PTCInstructionList *instructions, uint64_t *dymvirtual_address)
 {{
   char *line = NULL;
@@ -770,7 +1383,13 @@ static int ptc_build_instruction_list_from_payload(FILE *stream, PTCInstructionL
   PTCInstruction *instruction_table = NULL;
   PTCTemp *temp_table = NULL;
   size_t arg_cursor = 0;
+  size_t parsed_instruction_rows = 0;
+  size_t parsed_temp_rows = 0;
   size_t temp_name_bytes = 0;
+  PTCPayloadHelperAlias helper_aliases[PTC_LIVE_SIDECAR_HELPER_CAPACITY];
+  size_t helper_alias_count = 0;
+  uint64_t dynamic_pc = 0;
+  int has_dynamic_pc = 0;
   int in_header = 1;
 
   ptc_line_vec_init(&lines);
@@ -789,17 +1408,15 @@ static int ptc_build_instruction_list_from_payload(FILE *stream, PTCInstructionL
   free(line);
 
   for (i = 0; i < lines.count; ++i) {{
-    const char *key;
     const char *kind;
     char *rest;
-    char *tmp;
-    char *value;
+    const char *value;
 
     if (strcmp(lines.items[i], "PTC_LIVE_SIDECAR v1") == 0) {{
       continue;
     }}
-    if (in_header && ptc_parse_assignment_line(lines.items[i], &key, &value) == 0) {{
-      if (strcmp(key, "instruction_count") == 0) {{
+    if (in_header) {{
+      if (ptc_assignment_value(lines.items[i], "instruction_count", &value) == 0) {{
         uint64_t parsed = 0;
         if (ptc_parse_u64(value, &parsed) != 0) {{
           ptc_line_vec_free(&lines);
@@ -808,7 +1425,7 @@ static int ptc_build_instruction_list_from_payload(FILE *stream, PTCInstructionL
         instruction_count = (size_t) parsed;
         continue;
       }}
-      if (strcmp(key, "argument_count") == 0) {{
+      if (ptc_assignment_value(lines.items[i], "argument_count", &value) == 0) {{
         uint64_t parsed = 0;
         if (ptc_parse_u64(value, &parsed) != 0) {{
           ptc_line_vec_free(&lines);
@@ -817,7 +1434,7 @@ static int ptc_build_instruction_list_from_payload(FILE *stream, PTCInstructionL
         argument_count = (size_t) parsed;
         continue;
       }}
-      if (strcmp(key, "temp_count") == 0) {{
+      if (ptc_assignment_value(lines.items[i], "temp_count", &value) == 0) {{
         uint64_t parsed = 0;
         if (ptc_parse_u64(value, &parsed) != 0) {{
           ptc_line_vec_free(&lines);
@@ -826,7 +1443,7 @@ static int ptc_build_instruction_list_from_payload(FILE *stream, PTCInstructionL
         temp_count = (size_t) parsed;
         continue;
       }}
-      if (strcmp(key, "global_temps") == 0) {{
+      if (ptc_assignment_value(lines.items[i], "global_temps", &value) == 0) {{
         uint64_t parsed = 0;
         if (ptc_parse_u64(value, &parsed) != 0) {{
           ptc_line_vec_free(&lines);
@@ -835,7 +1452,7 @@ static int ptc_build_instruction_list_from_payload(FILE *stream, PTCInstructionL
         global_temps = (size_t) parsed;
         continue;
       }}
-      if (strcmp(key, "total_temps") == 0) {{
+      if (ptc_assignment_value(lines.items[i], "total_temps", &value) == 0) {{
         uint64_t parsed = 0;
         if (ptc_parse_u64(value, &parsed) != 0) {{
           ptc_line_vec_free(&lines);
@@ -844,7 +1461,16 @@ static int ptc_build_instruction_list_from_payload(FILE *stream, PTCInstructionL
         total_temps = (size_t) parsed;
         continue;
       }}
-      continue;
+      if (ptc_assignment_value(lines.items[i], "dynamic_pc", &value) == 0) {{
+        uint64_t parsed = 0;
+        if (ptc_parse_u64(value, &parsed) != 0) {{
+          ptc_line_vec_free(&lines);
+          return -EINVAL;
+        }}
+        dynamic_pc = parsed;
+        has_dynamic_pc = 1;
+        continue;
+      }}
     }}
     if (strncmp(lines.items[i], "instruction|", sizeof("instruction|") - 1) == 0 ||
         strncmp(lines.items[i], "temp|", sizeof("temp|") - 1) == 0) {{
@@ -891,6 +1517,63 @@ static int ptc_build_instruction_list_from_payload(FILE *stream, PTCInstructionL
       continue;
     }}
     in_header = 0;
+    if (strcmp(kind, "helper") == 0) {{
+      size_t field_count = 0;
+      mutable_line = strdup(rest);
+      char *cursor = mutable_line;
+      char *token;
+      char *save = NULL;
+      uint64_t parsed_func = 0;
+      uint64_t parsed_flags = 0;
+      uint64_t canonical_func = 0;
+      int register_result = 0;
+
+      if (mutable_line == NULL) {{
+        free(instruction_table);
+        free(arguments);
+        free(temp_table);
+        ptc_line_vec_free(&lines);
+        return -ENOMEM;
+      }}
+      while ((token = strtok_r(cursor, "|", &save)) != NULL && field_count < 16) {{
+        fields[field_count++] = token;
+        cursor = NULL;
+      }}
+      if (field_count != 3 ||
+          ptc_parse_u64(fields[0], &parsed_func) != 0 ||
+          ptc_parse_u64(fields[2], &parsed_flags) != 0) {{
+        fprintf(stderr, "ptc payload parse helper field mismatch: got=%zu line=%s\\n", field_count, rest);
+        free(mutable_line);
+        free(instruction_table);
+        free(arguments);
+        free(temp_table);
+        ptc_line_vec_free(&lines);
+        return -EINVAL;
+      }}
+      register_result = ptc_register_payload_helper(parsed_func, fields[1], (unsigned)parsed_flags, &canonical_func);
+      if (register_result != 0) {{
+        fprintf(stderr, "ptc payload parse helper registration failed: func=%s name=%s rc=%d used=%zu capacity=%u\\n",
+                fields[0], fields[1], register_result, ptc_helper_defs_used(), PTC_LIVE_SIDECAR_HELPER_CAPACITY);
+        free(mutable_line);
+        free(instruction_table);
+        free(arguments);
+        free(temp_table);
+        ptc_line_vec_free(&lines);
+        return -EINVAL;
+      }}
+      if (ptc_payload_helper_alias_push(helper_aliases, &helper_alias_count, parsed_func, canonical_func) != 0) {{
+        fprintf(stderr, "ptc payload parse helper alias table full: func=%s name=%s aliases=%zu capacity=%u\\n",
+                fields[0], fields[1], helper_alias_count, PTC_LIVE_SIDECAR_HELPER_CAPACITY);
+        free(mutable_line);
+        free(instruction_table);
+        free(arguments);
+        free(temp_table);
+        ptc_line_vec_free(&lines);
+        return -EINVAL;
+      }}
+      free(mutable_line);
+      continue;
+    }}
     if (strcmp(kind, "instruction") == 0) {{
       size_t field_count = 0;
       mutable_line = strdup(rest);
@@ -935,6 +1618,16 @@ static int ptc_build_instruction_list_from_payload(FILE *stream, PTCInstructionL
       }}
       inst_index = (size_t) parsed_inst_index;
       arg_count = (size_t) parsed_arg_count;
+      if (parsed_instruction_rows >= instruction_count) {{
+        fprintf(stderr, "ptc payload parse extra instruction beyond header: line=%zu inst_index=%zu opc=%s declared_instruction_count=%zu arg_cursor=%zu argument_count=%zu\\n",
+                i + 1, inst_index, fields[1], instruction_count, arg_cursor, argument_count);
+        free(mutable_line);
+        free(instruction_table);
+        free(arguments);
+        free(temp_table);
+        ptc_line_vec_free(&lines);
+        return -EINVAL;
+      }}
       if (inst_index >= instruction_count) {{
         fprintf(stderr, "ptc payload parse instruction index out of range: index=%zu limit=%zu\\n", inst_index, instruction_count);
         free(mutable_line);
@@ -945,15 +1638,37 @@ static int ptc_build_instruction_list_from_payload(FILE *stream, PTCInstructionL
         return -EINVAL;
       }}
       instruction_table[inst_index].opc = ptc_lookup_opcode(fields[1]);
+      if ((unsigned) instruction_table[inst_index].opc >= PTC_INSTRUCTION_NB_OPS) {{
+        fprintf(stderr, "ptc payload parse unsupported opcode name: line=%zu inst_index=%zu opc=%s\\n",
+                i + 1, inst_index, fields[1]);
+        free(mutable_line);
+        free(instruction_table);
+        free(arguments);
+        free(temp_table);
+        ptc_line_vec_free(&lines);
+        return -EINVAL;
+      }}
       instruction_table[inst_index].callo = (unsigned) strtoul(fields[2], NULL, 0);
       instruction_table[inst_index].calli = (unsigned) strtoul(fields[3], NULL, 0);
       instruction_table[inst_index].args = arguments + arg_cursor;
+      if (arg_count > 0 && arg_cursor >= argument_count) {{
+        fprintf(stderr, "ptc payload parse extra instruction args beyond header: line=%zu inst_index=%zu opc=%s cursor=%zu arg_count=%zu limit=%zu\\n",
+                i + 1, inst_index, fields[1], arg_cursor, arg_count, argument_count);
+        free(mutable_line);
+        free(instruction_table);
+        free(arguments);
+        free(temp_table);
+        ptc_line_vec_free(&lines);
+        return -EINVAL;
+      }}
       if (field_count > 5 && fields[5][0] != '\\0') {{
         char *args_copy = strdup(fields[5]);
         char *arg_cursor_text = args_copy;
         char *arg_token;
         char *arg_save = NULL;
         size_t arg_seen = 0;
+        size_t helper_const_index = (size_t) instruction_table[inst_index].callo +
+                                    (size_t) instruction_table[inst_index].calli;
         if (args_copy == NULL) {{
           free(mutable_line);
           free(instruction_table);
@@ -974,8 +1689,18 @@ static int ptc_build_instruction_list_from_payload(FILE *stream, PTCInstructionL
             ptc_line_vec_free(&lines);
             return -EINVAL;
           }}
+          if (instruction_table[inst_index].opc == PTC_INSTRUCTION_op_call &&
+              arg_seen == helper_const_index) {{
+            uint64_t canonical_helper = ptc_payload_helper_alias_lookup(helper_aliases,
+                                                                        helper_alias_count,
+                                                                        parsed_arg);
+            if (canonical_helper != 0) {{
+              parsed_arg = canonical_helper;
+            }}
+          }}
           if (arg_cursor + arg_seen >= argument_count) {{
-            fprintf(stderr, "ptc payload parse instruction arg overflow: cursor=%zu seen=%zu limit=%zu\\n", arg_cursor, arg_seen, argument_count);
+            fprintf(stderr, "ptc payload parse instruction arg overflow: line=%zu inst_index=%zu opc=%s cursor=%zu seen=%zu limit=%zu\\n",
+                    i + 1, inst_index, fields[1], arg_cursor, arg_seen, argument_count);
             free(args_copy);
             free(mutable_line);
             free(instruction_table);
@@ -1001,6 +1726,7 @@ static int ptc_build_instruction_list_from_payload(FILE *stream, PTCInstructionL
         free(args_copy);
       }}
       arg_cursor += arg_count;
+      ++parsed_instruction_rows;
       free(mutable_line);
       continue;
     }}
@@ -1048,6 +1774,16 @@ static int ptc_build_instruction_list_from_payload(FILE *stream, PTCInstructionL
         return -EINVAL;
       }}
       temp_index = (size_t) parsed_temp_index;
+      if (parsed_temp_rows >= temp_count) {{
+        fprintf(stderr, "ptc payload parse extra temp beyond header: line=%zu temp_index=%zu declared_temp_count=%zu\\n",
+                i + 1, temp_index, temp_count);
+        free(mutable_line);
+        free(instruction_table);
+        free(arguments);
+        free(temp_table);
+        ptc_line_vec_free(&lines);
+        return -EINVAL;
+      }}
       if (temp_index >= temp_count) {{
         fprintf(stderr, "ptc payload parse temp index out of range: index=%zu limit=%zu\\n", temp_index, temp_count);
         free(mutable_line);
@@ -1079,9 +1815,20 @@ static int ptc_build_instruction_list_from_payload(FILE *stream, PTCInstructionL
       temp_table[temp_index].mem_allocated = (unsigned int) strtoul(fields[11], NULL, 0);
       temp_table[temp_index].temp_local = (unsigned int) strtoul(fields[12], NULL, 0);
       temp_table[temp_index].temp_allocated = (unsigned int) strtoul(fields[13], NULL, 0);
+      ++parsed_temp_rows;
       free(mutable_line);
       continue;
     }}
+  }}
+
+  if (parsed_instruction_rows != instruction_count || parsed_temp_rows != temp_count) {{
+    fprintf(stderr, "ptc payload parse row count mismatch: parsed_instructions=%zu expected_instructions=%zu parsed_temps=%zu expected_temps=%zu\\n",
+            parsed_instruction_rows, instruction_count, parsed_temp_rows, temp_count);
+    free(instruction_table);
+    free(arguments);
+    free(temp_table);
+    ptc_line_vec_free(&lines);
+    return -EINVAL;
   }}
 
   if (arg_cursor != argument_count) {{
@@ -1103,7 +1850,7 @@ static int ptc_build_instruction_list_from_payload(FILE *stream, PTCInstructionL
 
   ptc_line_vec_free(&lines);
   if (dymvirtual_address != NULL) {{
-    *dymvirtual_address = UINT64_C(0x401000);
+    *dymvirtual_address = has_dynamic_pc ? dynamic_pc : 0;
   }}
   return 0;
 }}
@@ -1130,7 +1877,7 @@ int ptc_load(void *handle, PTCInterface *output, const char *ptc_filename, const
   result.translate = &ptc_translate;
   result.opcode_defs = ptc_opcode_defs_storage;
   result.helper_defs = ptc_helper_defs_storage;
-  result.helper_defs_size = 1;
+  result.helper_defs_size = PTC_LIVE_SIDECAR_HELPER_CAPACITY;
   result.initialized_env = ptc_initialized_env;
   result.regs = ptc_regs;
   result.pc = 0;
@@ -1164,13 +1911,39 @@ size_t ptc_translate(uint64_t virtual_address, uint32_t force, PTCInstructionLis
   FILE *pipe;
   int status;
   size_t translated = 0;
+  uint64_t sidecar_dynamic_pc = 0;
 
   (void) force;
   if (instructions == NULL) {{
     return 0;
   }}
 
-  snprintf(command, sizeof(command), "PTC_RR_DIR=%s PTC_SIDECAR_PAYLOAD_SOURCE=%s PTC_SIDECAR_MODEL_SOURCE=%s PTC_SIDECAR_SUMMARY_SOURCE=%s %s %s %s %u", "{rr_dir}", ptc_sidecar_payload_source, ptc_sidecar_model_source, ptc_sidecar_summary_source, ptc_sidecar_helper_path, ptc_sidecar_root_path, ptc_qemu_src_path, ptc_sidecar_jobs);
+  snprintf(command, sizeof(command),
+           "PTC_RR_DIR=%s "
+           "PTC_SIDECAR_PAYLOAD_SOURCE=%s "
+           "PTC_SIDECAR_MODEL_SOURCE=%s "
+           "PTC_SIDECAR_SUMMARY_SOURCE=%s "
+           "PTC_SIDECAR_REQUESTED_PC=0x%" PRIx64 " "
+           "PTC_SIDECAR_EXTERNAL_BINARY=%s "
+           "PTC_SIDECAR_EXTERNAL_ENTRY=%s "
+           "PTC_SIDECAR_EXTERNAL_LABEL=%s "
+           "PTC_SIDECAR_EXTERNAL_RUN_DIR=%s "
+           "PTC_SIDECAR_GUEST_BASE=%s "
+           "%s %s %s %u",
+           "{rr_dir}",
+           ptc_sidecar_payload_source,
+           ptc_sidecar_model_source,
+           ptc_sidecar_summary_source,
+           virtual_address,
+           ptc_sidecar_external_binary,
+           ptc_sidecar_external_entry,
+           ptc_sidecar_external_label,
+           ptc_sidecar_external_run_dir,
+           ptc_sidecar_guest_base,
+           ptc_sidecar_helper_path,
+           ptc_sidecar_root_path,
+           ptc_qemu_src_path,
+           ptc_sidecar_jobs);
   pipe = popen(command, "r");
   if (pipe == NULL) {{
     return 0;
@@ -1192,12 +1965,15 @@ size_t ptc_translate(uint64_t virtual_address, uint32_t force, PTCInstructionLis
     return 0;
   }}
 
+  if (dymvirtual_address != NULL) {{
+    sidecar_dynamic_pc = *dymvirtual_address;
+  }}
   ptc_reset_status(virtual_address);
+  if (sidecar_dynamic_pc != 0) {{
+    ptc_syscall_next_eip = sidecar_dynamic_pc;
+  }}
   ptc_icount = instructions->instruction_count;
   ptc_block_size = instructions->instruction_count;
-  if (dymvirtual_address != NULL) {{
-    *dymvirtual_address = virtual_address;
-  }}
   translated = instructions->instruction_count;
   return translated;
 }}
@@ -1258,12 +2034,6 @@ static int verify_translation(PTCInterface *ptc, ptc_translate_ptr_t translate, 
     ptc_instruction_list_free(&list);
     return 1;
   }}
-  if (dynamic_pc != pc) {{
-    fprintf(stderr, "%s changed the dynamic pc unexpectedly: 0x%" PRIx64 " -> 0x%" PRIx64 "\\n", source, pc, dynamic_pc);
-    ptc_instruction_list_free(&list);
-    return 1;
-  }}
-
   if (out_size != NULL) {{
     *out_size = size;
   }}
@@ -1364,12 +2134,12 @@ int main(int argc, char **argv)
     return 1;
   }}
 
-  if (verify_translation(&ptc, ptc_translate, 0x401000u, "dlsym(ptc_translate)", &translated_size, &translated_instruction_count, &translated_argument_count, &translated_temp_count) != 0) {{
+  if (verify_translation(&ptc, ptc_translate, {harness_pc_literal}, "dlsym(ptc_translate)", &translated_size, &translated_instruction_count, &translated_argument_count, &translated_temp_count) != 0) {{
     dlclose(handle);
     return 1;
   }}
 
-  if (verify_translation(&ptc, ptc.translate, 0x402000u, "PTCInterface.translate", &translated_iface_size, NULL, NULL, NULL) != 0) {{
+  if (verify_translation(&ptc, ptc.translate, {harness_pc_literal}, "PTCInterface.translate", &translated_iface_size, NULL, NULL, NULL) != 0) {{
     dlclose(handle);
     return 1;
   }}
@@ -1400,15 +2170,15 @@ bash -n "$SCRIPT_DIR/qemu_v2_ptc_live_sidecar_translate_smoke.sh"
 
 log "Building shared library and harness"
 cc -std=c11 -O2 -g -fPIC -shared -D_GNU_SOURCE \
-  -I"$RR_DIR/qemu/linux-user" \
-  -I"$RR_DIR/qemu/tcg" \
+  -I"$LEGACY_QEMU_DIR/linux-user" \
+  -I"$LEGACY_QEMU_DIR/tcg" \
   -Wno-unused-parameter \
   -o "$LIB_SO" \
   "$LIB_C"
 
 cc -std=c11 -O2 -g -D_GNU_SOURCE \
-  -I"$RR_DIR/qemu/linux-user" \
-  -I"$RR_DIR/qemu/tcg" \
+  -I"$LEGACY_QEMU_DIR/linux-user" \
+  -I"$LEGACY_QEMU_DIR/tcg" \
   -Wno-unused-parameter \
   -o "$HARNESS_BIN" \
   "$HARNESS_C" \

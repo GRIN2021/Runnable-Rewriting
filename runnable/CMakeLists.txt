@@ -15,11 +15,12 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 # This has to be first to get highest priority
 include_directories(include/)
 get_filename_component(REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/.." ABSOLUTE)
+set(LEGACY_QEMU_ROOT "${REPO_ROOT}/archive/qemu-legacy-2.4.50")
 include_directories(BEFORE
-  "${REPO_ROOT}/qemu"
-  "${REPO_ROOT}/qemu/include"
-  "${REPO_ROOT}/qemu/linux-user"
-  "${REPO_ROOT}/qemu/tcg")
+  "${LEGACY_QEMU_ROOT}"
+  "${LEGACY_QEMU_ROOT}/include"
+  "${LEGACY_QEMU_ROOT}/linux-user"
+  "${LEGACY_QEMU_ROOT}/tcg")
 
 # Doxygen
 find_package(Doxygen)
@@ -109,8 +110,14 @@ include_directories("${QEMU_INSTALL_PATH}/include/")
 #
 
 # Basic compiler options
-option(RUNNABLE_STRICT_WARNINGS "Treat runnable C++ warnings as errors." ON)
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++14 -Wall")
+set(RUNNABLE_CXX_STANDARD "c++14")
+set(RUNNABLE_STRICT_WARNINGS_DEFAULT ON)
+if(LLVM_PACKAGE_VERSION VERSION_GREATER "15.99")
+  set(RUNNABLE_CXX_STANDARD "c++17")
+  set(RUNNABLE_STRICT_WARNINGS_DEFAULT OFF)
+endif()
+option(RUNNABLE_STRICT_WARNINGS "Treat runnable C++ warnings as errors." ${RUNNABLE_STRICT_WARNINGS_DEFAULT})
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=${RUNNABLE_CXX_STANDARD} -Wall")
 if(RUNNABLE_STRICT_WARNINGS)
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Werror")
 endif()

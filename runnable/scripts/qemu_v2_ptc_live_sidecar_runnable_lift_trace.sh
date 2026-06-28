@@ -15,6 +15,8 @@ LIBRARY_PATH="${RUNNABLE_QEMU_V2_PTC_LIVE_SIDECAR_LIBRARY:-/tmp/rr-qemu-v2-upstr
 RUNNABLE_LIFT_BIN="${RUNNABLE_LIFT_BIN:-}"
 TIMEOUT_SEC="${RUNNABLE_QEMU_V2_PTC_LIVE_SIDECAR_RUNNABLE_LIFT_TRACE_TIMEOUT_SEC:-10}"
 REPLAY_TRANSLATE_LIB="${RUNNABLE_QEMU_V2_PTC_LIVE_SIDECAR_REPLAY_TRANSLATE_LIB:-1}"
+PROBE_BINARY_SOURCE="${RUNNABLE_QEMU_V2_PTC_LIVE_SIDECAR_PROBE_BINARY:-}"
+PROBE_ENTRY="${RUNNABLE_QEMU_V2_PTC_LIVE_SIDECAR_PROBE_ENTRY:-}"
 FRESH=0
 
 usage() {
@@ -36,6 +38,9 @@ Options:
   --no-replay-library
                       Skip rebuilding a replay-backed live-sidecar library from
                       adjacent sidecar payload/model/summary artifacts.
+  --probe-binary PATH Use an existing executable for the traced probe instead
+                      of compiling a trivial main().
+  --probe-entry HEX   Entry PC for --probe-binary. If omitted, readelf entry is used.
   --fresh             Remove the scratch root before running.
   -h, --help          Show this help.
 EOF
@@ -71,6 +76,10 @@ prepare_replay_library() {
   summary_source="$library_dir/sidecar/sidecar.summary.json"
 
   if [[ "$REPLAY_TRANSLATE_LIB" != "1" ]]; then
+    return 0
+  fi
+  if strings "$LIBRARY_PATH" 2>/dev/null | grep -qx 'request_aware=true'; then
+    log "Keeping request-aware live-sidecar library for runnable-lift trace"
     return 0
   fi
   if [[ ! -f "$payload_source" || ! -f "$model_source" || ! -f "$summary_source" ]]; then
@@ -155,6 +164,14 @@ while [[ $# -gt 0 ]]; do
       REPLAY_TRANSLATE_LIB=0
       shift
       ;;
+    --probe-binary)
+      PROBE_BINARY_SOURCE="$(abs_path "${2:?missing value for --probe-binary}")"
+      shift 2
+      ;;
+    --probe-entry)
+      PROBE_ENTRY="${2:?missing value for --probe-entry}"
+      shift 2
+      ;;
     --fresh)
       FRESH=1
       shift
@@ -208,6 +225,9 @@ fi
 if [[ ! -f "$LIBRARY_PATH" ]]; then
   die "live-sidecar library not found: $LIBRARY_PATH"
 fi
+if [[ -n "$PROBE_BINARY_SOURCE" && ! -x "$PROBE_BINARY_SOURCE" ]]; then
+  die "probe binary not found or not executable: $PROBE_BINARY_SOURCE"
+fi
 
 prepare_replay_library
 
@@ -249,18 +269,27 @@ cp "$HELPERS_LL" "$RUN_DIR/libtinycode-helpers-x86_64.ll"
 cp "$EARLY_LL" "$RUN_DIR/early-linked-x86_64.ll"
 cp "$LIBRARY_PATH" "$STAGED_LIBRARY"
 
-cat >"$PROBE_C" <<'EOF'
+if [[ -n "$PROBE_BINARY_SOURCE" ]]; then
+  cp "$PROBE_BINARY_SOURCE" "$PROBE_BIN"
+  chmod +x "$PROBE_BIN"
+else
+  cat >"$PROBE_C" <<'EOF'
 int main(void) {
   return 0;
 }
 EOF
 
-cc -O0 -g -fno-pie -no-pie -o "$PROBE_BIN" "$PROBE_C"
+  cc -O0 -g -fno-pie -no-pie -o "$PROBE_BIN" "$PROBE_C"
+fi
 
-if command -v readelf >/dev/null 2>&1; then
-  ENTRY="$(readelf -h "$PROBE_BIN" | awk '/Entry point address:/ {print $4}')"
+if [[ -n "$PROBE_ENTRY" ]]; then
+  ENTRY="$PROBE_ENTRY"
 else
-  ENTRY="$(llvm-readelf -h "$PROBE_BIN" | awk '/Entry point address:/ {print $4}')"
+  if command -v readelf >/dev/null 2>&1; then
+    ENTRY="$(readelf -h "$PROBE_BIN" | awk '/Entry point address:/ {print $4}')"
+  else
+    ENTRY="$(llvm-readelf -h "$PROBE_BIN" | awk '/Entry point address:/ {print $4}')"
+  fi
 fi
 
 [[ -n "$ENTRY" ]] || die "could not read ELF entry point from $PROBE_BIN"

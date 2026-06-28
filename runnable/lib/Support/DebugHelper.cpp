@@ -10,6 +10,9 @@
 #include <string>
 
 // LLVM includes
+#include "llvm/ADT/APInt.h"
+#include "llvm/ADT/SmallString.h"
+#include "llvm/Config/llvm-config.h"
 #include "llvm/IR/AssemblyAnnotationWriter.h"
 #include "llvm/IR/DIBuilder.h"
 #include "llvm/IR/Instruction.h"
@@ -23,6 +26,19 @@
 #include "runnable/Support/DebugHelper.h"
 
 using namespace llvm;
+
+static const GlobalVariable *getGlobalFromConstant(const Constant *C) {
+  if (auto *GV = dyn_cast<GlobalVariable>(C))
+    return GV;
+
+  if (auto *CE = dyn_cast<ConstantExpr>(C)) {
+    if (CE->getNumOperands() == 0)
+      return nullptr;
+    return getGlobalFromConstant(CE->getOperand(0));
+  }
+
+  return nullptr;
+}
 
 /// Boring code to get the text of the metadata with the specified kind
 /// associated to the given instruction
@@ -48,10 +64,13 @@ static StringRef getText(const Instruction *Instruction, unsigned Kind) {
   if (auto *String = dyn_cast<MDString>(MDOperand)) {
     return String->getString();
   } else if (auto *CAM = dyn_cast<ConstantAsMetadata>(MDOperand)) {
-    auto *Cast = cast<ConstantExpr>(CAM->getValue());
-    auto *GV = cast<GlobalVariable>(Cast->getOperand(0));
+    auto *GV = getGlobalFromConstant(CAM->getValue());
+    if (GV == nullptr || !GV->hasInitializer())
+      return StringRef();
     auto *Initializer = GV->getInitializer();
-    return cast<ConstantDataArray>(Initializer)->getAsString().drop_back();
+    if (auto *Data = dyn_cast<ConstantDataArray>(Initializer))
+      return Data->getAsString().drop_back();
+    return StringRef();
   } else {
     runnable_abort();
   }
@@ -67,6 +86,18 @@ replaceAll(std::string &Input, const std::string &From, const std::string &To) {
     Input.replace(Start, From.length(), To);
     Start += To.length();
   }
+}
+
+static std::string apIntToString(const APInt &Value,
+                                 unsigned Radix,
+                                 bool IsSigned) {
+#if LLVM_VERSION_MAJOR >= 18
+  SmallString<32> Buffer;
+  Value.toString(Buffer, Radix, IsSigned, false, false);
+  return Buffer.str().str();
+#else
+  return Value.toString(Radix, IsSigned);
+#endif
 }
 
 /// Writes the text contained in the metadata with the specified kind ID to the
@@ -118,7 +149,7 @@ static StringRef getInstructionAddressText(const Instruction *Instr,
     return StringRef();
 
   static thread_local std::string Text;
-  Text = "0x" + CI->getValue().toString(16, false);
+  Text = "0x" + apIntToString(CI->getValue(), 16, false);
   return Text;
 }
 
@@ -227,6 +258,17 @@ void DebugHelper::generateDebugInfo() {
 
         runnable_assert(CompileUnit != nullptr);
         DISubprogram *Subprogram = nullptr;
+#if LLVM_VERSION_MAJOR >= 18
+        Subprogram = Builder.createFunction(CompileUnit->getFile(), // Scope
+                                            F.getName(),
+                                            StringRef(), // Linkage name
+                                            CompileUnit->getFile(),
+                                            1, // Line
+                                            EmptyType, // Subroutine type
+                                            1, // ScopeLine
+                                            DINode::FlagPrototyped,
+                                            DISubprogram::SPFlagDefinition);
+#else
         Subprogram = Builder.createFunction(CompileUnit->getFile(), // Scope
                                             F.getName(),
                                             StringRef(), // Linkage name
@@ -238,6 +280,7 @@ void DebugHelper::generateDebugInfo() {
                                             1, // ScopeLine
                                             DINode::FlagPrototyped,
                                             false /* isOptimized */);
+#endif
         F.setSubprogram(Subprogram);
       }
     }

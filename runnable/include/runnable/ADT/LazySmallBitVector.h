@@ -12,10 +12,8 @@
 extern "C" {
 #include <strings.h>
 }
+#include <iterator>
 #include <limits>
-
-// Boost includes
-#include <boost/iterator/iterator_facade.hpp>
 
 // Local libraries includes
 #include "runnable/Support/Assert.h"
@@ -81,30 +79,44 @@ inline T excessDivide(T A, unsigned B) {
 class LazySmallBitVector;
 
 template<typename LSBV>
-class LazySmallBitVectorIterator
-  : public boost::iterator_facade<LazySmallBitVectorIterator<LSBV>,
-                                  unsigned,
-                                  boost::forward_traversal_tag,
-                                  unsigned> {
+class LazySmallBitVectorIterator {
 public:
+  using iterator_category = std::forward_iterator_tag;
+  using value_type = unsigned;
+  using difference_type = std::ptrdiff_t;
+  using pointer = void;
+  using reference = unsigned;
+
   LazySmallBitVectorIterator() : BitVector(nullptr), NextBitIndex(0) {}
   LazySmallBitVectorIterator(LSBV *BitVector);
   LazySmallBitVectorIterator(LSBV *BitVector, unsigned Index);
 
-private:
-  void increment();
+  LazySmallBitVectorIterator &operator++() {
+    increment();
+    return *this;
+  }
 
-  bool equal(LazySmallBitVectorIterator const &Other) const {
+  LazySmallBitVectorIterator operator++(int) {
+    LazySmallBitVectorIterator Copy = *this;
+    increment();
+    return Copy;
+  }
+
+  bool operator==(LazySmallBitVectorIterator const &Other) const {
     return BitVector == Other.BitVector && NextBitIndex == Other.NextBitIndex;
   }
 
-  unsigned dereference() const {
+  bool operator!=(LazySmallBitVectorIterator const &Other) const {
+    return !(*this == Other);
+  }
+
+  unsigned operator*() const {
     runnable_assert(BitVector != nullptr && NextBitIndex != 0);
     return NextBitIndex - 1;
   }
 
 private:
-  friend class boost::iterator_core_access;
+  void increment();
 
   LSBV *BitVector;
   unsigned NextBitIndex;

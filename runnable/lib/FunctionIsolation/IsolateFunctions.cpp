@@ -8,6 +8,8 @@
 
 // LLVM includes
 #include "llvm/ADT/PostOrderIterator.h"
+#include "llvm/Config/llvm-config.h"
+#include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Verifier.h"
 #include "llvm/Support/raw_os_ostream.h"
@@ -33,6 +35,19 @@ typedef DenseMap<const Value *, Value *> ValueToValueMap;
 
 using IF = IsolateFunctions;
 using IFI = IsolateFunctionsImpl;
+
+namespace {
+
+static LoadInst *createLoad(IRBuilder<> &Builder, GlobalVariable *Global,
+                            const Twine &Name) {
+#if LLVM_VERSION_MAJOR >= 15
+  return Builder.CreateLoad(Global->getValueType(), Global, Name);
+#else
+  return Builder.CreateLoad(Global, Name);
+#endif
+}
+
+} // namespace
 
 char IF::ID = 0;
 static RegisterPass<IF> X("isolate", "Isolate Functions Pass", true, true);
@@ -132,7 +147,7 @@ void IFI::throwException(Reason Code, BasicBlock *BB, uint64_t AdditionalPC) {
   Builder.CreateStore(ConstantTrue, ExceptionFlag);
 
   // Call the _debug_exception function to print usefull stuff
-  LoadInst *ProgramCounter = Builder.CreateLoad(PC, "");
+  LoadInst *ProgramCounter = createLoad(Builder, PC, "");
 
   uint64_t LastPC;
 
@@ -198,7 +213,7 @@ void IFI::populateFunctionDispatcher() {
   IRBuilder<> Builder(Context);
   Builder.SetInsertPoint(DispatcherBB);
 
-  LoadInst *ProgramCounter = Builder.CreateLoad(PC, "");
+  LoadInst *ProgramCounter = createLoad(Builder, PC, "");
 
   SwitchInst *Switch = Builder.CreateSwitch(ProgramCounter, UnexpectedPC);
 
@@ -259,7 +274,7 @@ IFI::createInvokeReturnBlock(Function *Root, BasicBlock *UnexpectedPC) {
 
   // Add a conditional branch at the end of the invoke exit block that jumps to
   // the right basic block on the basis of the flag.
-  LoadInst *Flag = BuilderReturnBB.CreateLoad(ExceptionFlag, "");
+  LoadInst *Flag = createLoad(BuilderReturnBB, ExceptionFlag, "");
   BuilderReturnBB.CreateCondBr(Flag, AbnormalInvoke, NormalInvoke);
 
   return InvokeReturnBlock;
@@ -278,7 +293,7 @@ BasicBlock *IFI::createCatchBlock(Function *Root, BasicBlock *UnexpectedPC) {
   Builder.SetInsertPoint(CatchBB);
 
   // Create the StructType necessary for the landingpad
-  PointerType *RetTyPointerType = Type::getInt8PtrTy(Context);
+  PointerType *RetTyPointerType = runnable_llvm::getInt8PtrTy(Context);
   IntegerType *RetTyIntegerType = Type::getInt32Ty(Context);
   std::vector<Type *> InArgsType{ RetTyPointerType, RetTyIntegerType };
   StructType *RetTyStruct = StructType::create(Context,
@@ -290,7 +305,8 @@ BasicBlock *IFI::createCatchBlock(Function *Root, BasicBlock *UnexpectedPC) {
   LandingPadInst *LandingPad = Builder.CreateLandingPad(RetTyStruct, 0);
 
   // Add a catch all (constructed with the null value as clause)
-  LandingPad->addClause(ConstantPointerNull::get(Type::getInt8PtrTy(Context)));
+  LandingPad->addClause(ConstantPointerNull::get(
+    runnable_llvm::getInt8PtrTy(Context)));
 
   // This should be an unreachable (we should never reach the catch block), but
   // to avoid optimizations that purge this basic block (and also the
@@ -357,7 +373,7 @@ bool IFI::replaceFunctionCall(BasicBlock *NewBB,
     BasicBlock *FallthroughNew = cast<BasicBlock>(FallthroughOldIt->second);
 
     // Additional check for the return address PC
-    LoadInst *ProgramCounter = Builder.CreateLoad(PC, "");
+    LoadInst *ProgramCounter = createLoad(Builder, PC, "");
     ConstantInt *ExpectedPC = cast<ConstantInt>(Call->getOperand(2));
     Value *Result = Builder.CreateICmpEQ(ProgramCounter, ExpectedPC);
 
@@ -382,11 +398,11 @@ bool IFI::replaceFunctionCall(BasicBlock *NewBB,
 
 bool IFI::isTerminatorWithInvalidTarget(Instruction *I,
                                         const ValueToValueMap &RootToIsolated) {
-  if (auto *Terminator = dyn_cast<TerminatorInst>(I)) {
+  if (auto *Terminator = runnable_llvm::dynCastTerminator(I)) {
 
     // Here we check if among the successors of a terminator instruction
     // there is one that doesn't belong to the current function.
-    for (BasicBlock *Target : Terminator->successors()) {
+    for (BasicBlock *Target : runnable_llvm::successors(Terminator)) {
       if (RootToIsolated.count(Target) == 0) {
         return true;
       }
@@ -399,8 +415,8 @@ bool IFI::isTerminatorWithInvalidTarget(Instruction *I,
 bool IFI::cloneInstruction(BasicBlock *NewBB,
                            Instruction *OldInstruction,
                            IsolatedFunctionDescriptor &Descriptor) {
-  Value *PCReg = getModule(NewBB)->getGlobalVariable(GCBI.pcReg()->getName(),
-                                                     true);
+  GlobalVariable *PCReg = getModule(NewBB)->getGlobalVariable(
+    GCBI.pcReg()->getName(), true);
   runnable_assert(PCReg != nullptr);
   ValueToValueMap &RootToIsolated = Descriptor.ValueMap;
 
@@ -408,7 +424,7 @@ bool IFI::cloneInstruction(BasicBlock *NewBB,
   IRBuilder<> Builder(Context);
   Builder.SetInsertPoint(NewBB);
 
-  if (isa<TerminatorInst>(OldInstruction)) {
+  if (runnable_llvm::isaTerminator(OldInstruction)) {
     auto Type = Descriptor.Members.at(NewBB);
     switch (Type) {
     case StackAnalysis::BranchType::InstructionLocalCFG:
@@ -477,7 +493,8 @@ bool IFI::cloneInstruction(BasicBlock *NewBB,
             or Type == DispatcherBlock) {
           // The target is not a translated block, let's try to go through the
           // function dispatcher and let it throw the exception if necessary
-          auto *Null = ConstantPointerNull::get(Type::getInt8PtrTy(Context));
+          auto *Null = ConstantPointerNull::get(
+            runnable_llvm::getInt8PtrTy(Context));
           CallInst::Create(FunctionDispatcher, { Null }, "", Trampoline);
           ReturnInst::Create(Context, Trampoline);
         } else if (FunctionsIt != Functions.end()) {
@@ -490,7 +507,7 @@ bool IFI::cloneInstruction(BasicBlock *NewBB,
         } else {
           uint64_t PC = getBasicBlockPC(BB);
           runnable_assert(PC != 0);
-          auto *PCType = PCReg->getType()->getPointerElementType();
+          auto *PCType = PCReg->getValueType();
           new StoreInst(ConstantInt::get(PCType, PC), PCReg, Trampoline);
           throwException(StandardNonTranslatedBlock, Trampoline, 0);
         }
@@ -522,7 +539,7 @@ bool IFI::cloneInstruction(BasicBlock *NewBB,
                                              DefaultCase,
                                              Switch->getNumCases());
 
-      for (SwitchInst::CaseHandle &Case : Switch->cases()) {
+      for (const SwitchInst::CaseHandle &Case : Switch->cases()) {
         NewSwitch->addCase(Case.getCaseValue(),
                            GetTrampoline(Case.getCaseSuccessor()));
       }
@@ -690,7 +707,7 @@ void IFI::run() {
   // Instantiate the dispatcher function, that is called in occurence of an
   // indirect function call.
   auto *FT = FunctionType::get(Type::getVoidTy(Context),
-                               { Type::getInt8PtrTy(Context) },
+                               { runnable_llvm::getInt8PtrTy(Context) },
                                false);
 
   // Creation of the function
@@ -879,7 +896,7 @@ void IFI::run() {
       // Collect all the successors of a basic block and add them in a proper
       // data structure
       std::vector<BasicBlock *> Successors;
-      for (BasicBlock *Successor : Terminator->successors()) {
+      for (BasicBlock *Successor : runnable_llvm::successors(Terminator)) {
 
         runnable_assert(GCBI.isTranslated(Successor)
                      || GCBI.getType(Successor) == AnyPCBlock
@@ -955,7 +972,7 @@ void IFI::run() {
 
         VisitAction visit(instruction_range Range) {
           runnable_assert(Range.begin() != Range.end());
-          auto *T = cast<TerminatorInst>(&*Range.begin());
+          auto *T = runnable_llvm::castTerminator(&*Range.begin());
           using namespace StackAnalysis::BranchType;
           if (Descriptor.Members.at(T->getParent()) == FakeFunctionCall) {
             runnable_assert(FakeCall == nullptr or FakeCall == T->getParent(),

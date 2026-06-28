@@ -17,10 +17,9 @@ apt-get install --no-install-recommends --yes \
   libglib2.0-dev \
   m4 \
   pkg-config \
-  python \
-  python-pyelftools \
   python3 \
   python3-cffi \
+  python3-pyelftools \
   python3-pygraphviz \
   python3-setuptools \
   sed \

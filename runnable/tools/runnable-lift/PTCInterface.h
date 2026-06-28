@@ -6,10 +6,16 @@
 //
 
 // Standard includes
+#include <algorithm>
 #include <memory>
 #include <string>
 #include <type_traits>
 #include <utility>
+#include <vector>
+
+// LLVM includes
+#include "llvm/ADT/Twine.h"
+#include "llvm/Support/raw_ostream.h"
 
 // Local libraries includes
 #include "runnable/Support/runnable.h"
@@ -44,6 +50,221 @@ struct RunnablePTCAbiMetadataInfo {
 extern RunnablePTCAbiMetadataInfo RunnablePTCAbiMetadata;
 
 namespace ptc_compat {
+
+inline bool isPTCAbiV2() {
+  return RunnablePTCAbiMetadata.HasAbiVersion
+         && RunnablePTCAbiMetadata.AbiVersion >= 2;
+}
+
+inline const char *getConditionName(PTCInterface &Interface,
+                                    PTCCondition Condition) {
+  if (!isPTCAbiV2() && Interface.get_condition_name != nullptr)
+    return Interface.get_condition_name(Condition);
+
+  switch (Condition) {
+  case PTC_COND_NEVER:
+    return "never";
+  case PTC_COND_ALWAYS:
+    return "always";
+  case PTC_COND_EQ:
+    return "eq";
+  case PTC_COND_NE:
+    return "ne";
+  case PTC_COND_LT:
+    return "lt";
+  case PTC_COND_GE:
+    return "ge";
+  case PTC_COND_LE:
+    return "le";
+  case PTC_COND_GT:
+    return "gt";
+  case PTC_COND_LTU:
+    return "ltu";
+  case PTC_COND_GEU:
+    return "geu";
+  case PTC_COND_LEU:
+    return "leu";
+  case PTC_COND_GTU:
+    return "gtu";
+  }
+
+  return nullptr;
+}
+
+inline bool looksLikeRawTCGTempArg(PTCInstructionArg Arg,
+                                   const PTCInstructionList &Instructions) {
+  if (Arg < Instructions.total_temps)
+    return false;
+
+  // Modern sidecar args are raw TCGTemp pointers. Real immediates in this path
+  // are usually small offsets or PC-sized constants, and are never inspected as
+  // out/in temp operands.
+  return Arg >= 4096;
+}
+
+struct RawTCGTempArgMap {
+  bool Valid = false;
+  uint64_t Base = 0;
+  uint64_t Stride = 0;
+  unsigned Hits = 0;
+};
+
+inline bool rawArgMapsToTemp(const RawTCGTempArgMap &Map,
+                             const PTCInstructionList &Instructions,
+                             PTCInstructionArg RawArg,
+                             unsigned &TempId) {
+  if (!Map.Valid)
+    return false;
+  if (RawArg < Map.Base)
+    return false;
+
+  uint64_t Delta = RawArg - Map.Base;
+  if (Map.Stride == 0 || Delta % Map.Stride != 0)
+    return false;
+
+  uint64_t Index = Delta / Map.Stride;
+  if (Index >= Instructions.total_temps)
+    return false;
+
+  TempId = static_cast<unsigned>(Index);
+  return true;
+}
+
+inline RawTCGTempArgMap
+inferRawTCGTempArgMap(const PTCInstructionList &Instructions,
+                      const std::vector<PTCInstructionArg> &RawArgs) {
+  RawTCGTempArgMap Best;
+  if (RawArgs.size() < 2 || Instructions.total_temps == 0)
+    return Best;
+
+  std::vector<PTCInstructionArg> UniqueArgs = RawArgs;
+  std::sort(UniqueArgs.begin(), UniqueArgs.end());
+  UniqueArgs.erase(std::unique(UniqueArgs.begin(), UniqueArgs.end()),
+                   UniqueArgs.end());
+
+  for (uint64_t Stride = 8; Stride <= 256; Stride += 8) {
+    for (PTCInstructionArg Anchor : UniqueArgs) {
+      for (unsigned AnchorId = 0; AnchorId < Instructions.total_temps;
+           AnchorId++) {
+        uint64_t Offset = Stride * AnchorId;
+        if (Anchor < Offset)
+          continue;
+
+        uint64_t Base = Anchor - Offset;
+        unsigned Hits = 0;
+        for (PTCInstructionArg Candidate : UniqueArgs) {
+          unsigned TempId = 0;
+          RawTCGTempArgMap Probe;
+          Probe.Valid = true;
+          Probe.Base = Base;
+          Probe.Stride = Stride;
+          if (rawArgMapsToTemp(Probe, Instructions, Candidate, TempId))
+            Hits++;
+        }
+
+        if (Hits > Best.Hits) {
+          Best.Valid = true;
+          Best.Base = Base;
+          Best.Stride = Stride;
+          Best.Hits = Hits;
+        }
+      }
+    }
+  }
+
+  if (Best.Hits < 2)
+    Best.Valid = false;
+  return Best;
+}
+
+inline bool normalizePTCV2InstructionList(PTCInterface &Interface,
+                                          PTCInstructionList *Instructions) {
+  if (!isPTCAbiV2())
+    return true;
+  if (Instructions == nullptr
+      || Instructions->instructions == nullptr
+      || Instructions->arguments == nullptr
+      || Instructions->temps == nullptr
+      || Instructions->instruction_count == 0
+      || Instructions->total_temps == 0)
+    return true;
+
+  std::vector<PTCInstructionArg> RawTempArgs;
+  for (unsigned I = 0; I < Instructions->instruction_count; I++) {
+    PTCInstruction &Instruction = Instructions->instructions[I];
+    PTCOpcodeDef *Def = ptc_instruction_opcode_def(&Interface, &Instruction);
+    if (Def == nullptr || Instruction.args == nullptr)
+      continue;
+
+    if (Instruction.opc == PTC_INSTRUCTION_op_call)
+      continue;
+
+    unsigned TempArgCount = Def->nb_oargs + Def->nb_iargs;
+    for (unsigned ArgIndex = 0; ArgIndex < TempArgCount; ArgIndex++) {
+      PTCInstructionArg Arg = Instruction.args[ArgIndex];
+      if (looksLikeRawTCGTempArg(Arg, *Instructions))
+        RawTempArgs.push_back(Arg);
+    }
+  }
+
+  RawTCGTempArgMap Map = inferRawTCGTempArgMap(*Instructions, RawTempArgs);
+  if (!Map.Valid)
+    return true;
+
+  unsigned NormalizedArgs = 0;
+  for (unsigned I = 0; I < Instructions->instruction_count; I++) {
+    PTCInstruction &Instruction = Instructions->instructions[I];
+    PTCOpcodeDef *Def = ptc_instruction_opcode_def(&Interface, &Instruction);
+    if (Def == nullptr || Instruction.args == nullptr)
+      continue;
+
+    if (Instruction.opc == PTC_INSTRUCTION_op_call) {
+      if (Instruction.callo == 0 && Instruction.calli == 0 && Def->nb_cargs >= 2) {
+        unsigned TempId = 0;
+        if (rawArgMapsToTemp(Map, *Instructions, Instruction.args[0], TempId)) {
+          Instruction.args[0] = TempId;
+          Instruction.calli = 1;
+          NormalizedArgs++;
+        }
+      }
+      continue;
+    }
+
+    unsigned TempArgCount = Def->nb_oargs + Def->nb_iargs;
+    for (unsigned ArgIndex = 0; ArgIndex < TempArgCount; ArgIndex++) {
+      PTCInstructionArg Arg = Instruction.args[ArgIndex];
+      if (Arg < Instructions->total_temps)
+        continue;
+
+      unsigned TempId = 0;
+      if (!rawArgMapsToTemp(Map, *Instructions, Arg, TempId)) {
+        llvm::errs() << "runnable-lift: failed to decode QEMU v2 raw TCGArg"
+                     << " instruction_index=" << I
+                     << " opcode=" << static_cast<unsigned>(Instruction.opc)
+                     << " arg_index=" << ArgIndex
+                     << " raw=0x" << llvm::Twine::utohexstr(Arg)
+                     << " temp_base=0x" << llvm::Twine::utohexstr(Map.Base)
+                     << " temp_stride=" << Map.Stride
+                     << " total_temps=" << Instructions->total_temps << "\n";
+        return false;
+      }
+
+      Instruction.args[ArgIndex] = TempId;
+      NormalizedArgs++;
+    }
+  }
+
+  if (NormalizedArgs != 0) {
+    llvm::errs() << "runnable-lift: normalized QEMU v2 raw TCGArg temps"
+                 << " base=0x" << llvm::Twine::utohexstr(Map.Base)
+                 << " stride=" << Map.Stride
+                 << " refs=" << NormalizedArgs
+                 << " matched_unique=" << Map.Hits
+                 << " total_temps=" << Instructions->total_temps << "\n";
+  }
+
+  return true;
+}
 
 inline const char *getLoadStoreName(PTCInterface &Interface,
                                     PTCLoadStoreType Type) {
@@ -161,6 +382,8 @@ inline PTCLoadStoreArg parseLoadStoreArg(PTCInterface &Interface,
 template<typename T>
 auto queueDepthImpl(T &Interface, int)
   -> decltype(Interface.queueDepth(), uint32_t()) {
+  if (Interface.queueDepth == nullptr)
+    return 0;
   return Interface.queueDepth();
 }
 
@@ -176,6 +399,8 @@ inline uint32_t queueDepth(PTCInterface &Interface) {
 template<typename T>
 auto dropCPUStateImpl(T &Interface, int)
   -> decltype(Interface.dropCPUState(), uint32_t()) {
+  if (Interface.dropCPUState == nullptr)
+    return 0;
   return Interface.dropCPUState();
 }
 
@@ -186,6 +411,40 @@ uint32_t dropCPUStateImpl(T &, long) {
 
 inline uint32_t dropCPUState(PTCInterface &Interface) {
   return dropCPUStateImpl(Interface, 0);
+}
+
+template<typename T>
+auto deleteCPULINEStateImpl(T &Interface, int)
+  -> decltype(Interface.deletCPULINEState(), uint32_t()) {
+  if (Interface.deletCPULINEState == nullptr)
+    return 0;
+  return Interface.deletCPULINEState();
+}
+
+template<typename T>
+uint32_t deleteCPULINEStateImpl(T &, long) {
+  return 0;
+}
+
+inline uint32_t deleteCPULINEState(PTCInterface &Interface) {
+  return deleteCPULINEStateImpl(Interface, 0);
+}
+
+template<typename T>
+auto storeCPUStateImpl(T &Interface, int)
+  -> decltype(Interface.storeCPUState(), uint32_t()) {
+  if (Interface.storeCPUState == nullptr)
+    return 0;
+  return Interface.storeCPUState();
+}
+
+template<typename T>
+uint32_t storeCPUStateImpl(T &, long) {
+  return 0;
+}
+
+inline uint32_t storeCPUState(PTCInterface &Interface) {
+  return storeCPUStateImpl(Interface, 0);
 }
 
 template<typename T>
@@ -216,6 +475,36 @@ std::false_type supportsDropCPUStateImpl(long) {
 
 inline bool supportsDropCPUState() {
   return decltype(supportsDropCPUStateImpl<PTCInterface>(0))::value;
+}
+
+template<typename T>
+auto hasStoreCPUStateImpl(T &Interface, int)
+  -> decltype(Interface.storeCPUState, bool()) {
+  return Interface.storeCPUState != nullptr;
+}
+
+template<typename T>
+bool hasStoreCPUStateImpl(T &, long) {
+  return false;
+}
+
+inline bool hasStoreCPUState(PTCInterface &Interface) {
+  return hasStoreCPUStateImpl(Interface, 0);
+}
+
+template<typename T>
+auto hasDropCPUStateImpl(T &Interface, int)
+  -> decltype(Interface.dropCPUState, bool()) {
+  return Interface.dropCPUState != nullptr;
+}
+
+template<typename T>
+bool hasDropCPUStateImpl(T &, long) {
+  return false;
+}
+
+inline bool hasDropCPUState(PTCInterface &Interface) {
+  return hasDropCPUStateImpl(Interface, 0);
 }
 
 } // namespace ptc_compat

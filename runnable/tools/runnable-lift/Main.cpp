@@ -25,9 +25,11 @@ extern "C" {
 
 // LLVM includes
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/InitializePasses.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/Object/Binary.h"
 #include "llvm/Object/ELF.h"
+#include "llvm/PassRegistry.h"
 #include "llvm/Support/raw_ostream.h"
 
 // Local libraries includes
@@ -52,6 +54,14 @@ using std::string;
 // TODO: drop short aliases
 
 namespace {
+
+static void initializeLegacyPasses() {
+  llvm::PassRegistry &Registry = *llvm::PassRegistry::getPassRegistry();
+  llvm::initializeCore(Registry);
+  llvm::initializeAnalysis(Registry);
+  llvm::initializeTransformUtils(Registry);
+  llvm::initializeScalarOpts(Registry);
+}
 
 #define DESCRIPTION desc("virtual address of the entry point where to start")
 opt<unsigned long long> EntryPointAddress("entry",
@@ -270,6 +280,12 @@ static void findFiles(const char *Architecture) {
 
   // TODO: add other search paths?
   std::vector<std::string> SearchPaths;
+  size_t LastSlash = Directory.find_last_of('/');
+  if (LastSlash != std::string::npos) {
+    std::string Prefix = Directory.substr(0, LastSlash);
+    SearchPaths.push_back(Prefix + "/lib");
+    SearchPaths.push_back(Prefix + "/share/runnable");
+  }
 #ifdef INSTALL_PATH
   SearchPaths.push_back(std::string(INSTALL_PATH) + "/lib");
   SearchPaths.push_back(std::string(INSTALL_PATH) + "/share/runnable");
@@ -361,6 +377,7 @@ static int loadPTCLibrary(LibraryPointer &PTCLibrary) {
 }
 
 int main(int argc, const char *argv[]) {
+  initializeLegacyPasses();
   HideUnrelatedOptions({ &MainCategory });
   ParseCommandLineOptions(argc, argv);
   installStatistics();

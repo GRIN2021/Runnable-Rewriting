@@ -14,7 +14,7 @@ from typing import Iterable
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_LEGACY_OPC = REPO_ROOT / "qemu" / "tcg" / "tcg-opc.h"
+DEFAULT_LEGACY_OPC = REPO_ROOT / "archive" / "qemu-legacy-2.4.50" / "tcg" / "tcg-opc.h"
 
 OP_LINE_RE = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\b(?:\s+(.*))?$")
 HEADER_RE = re.compile(r"^====\s+rr tcg dump:\s*(.*?)\s*====$")
@@ -202,6 +202,37 @@ DEFAULT_COMPAT_RULES: dict[str, CompatRule] = {
         note=(
             "modern bit extract is absent from the legacy opcode file; using shifts "
             "and masks would be a lowering pass, not a safe PTCOpcode alias"
+        ),
+    ),
+    "sextract": CompatRule(
+        compatibility="requires-ptc-v2-op",
+        recommendation=RECOMMEND_NEW_OPCODE,
+        safe_legacy_mapping=False,
+        proposed_ptc_v2_opcode="PTC_OP_SEXTRACT",
+        note=(
+            "walker raw opcode name omits the text dump's type suffix; using "
+            "signed shifts or sign-extension ops is a lowering pass, not a "
+            "safe PTCOpcode alias"
+        ),
+    ),
+    "sextract_i64": CompatRule(
+        compatibility="requires-ptc-v2-op",
+        recommendation=RECOMMEND_NEW_OPCODE,
+        safe_legacy_mapping=False,
+        proposed_ptc_v2_opcode="PTC_OP_SEXTRACT_I64",
+        note=(
+            "modern signed bit extract is absent from the legacy opcode file; "
+            "offset-zero slices can lower to signed-extension legacy ops"
+        ),
+    ),
+    "sextract_i32": CompatRule(
+        compatibility="requires-ptc-v2-op",
+        recommendation=RECOMMEND_NEW_OPCODE,
+        safe_legacy_mapping=False,
+        proposed_ptc_v2_opcode="PTC_OP_SEXTRACT_I32",
+        note=(
+            "modern signed bit extract is absent from the legacy opcode file; "
+            "offset-zero slices can lower to signed-extension legacy ops"
         ),
     ),
 }
@@ -983,7 +1014,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--legacy-opc",
         type=Path,
         default=DEFAULT_LEGACY_OPC,
-        help=f"legacy qemu/tcg/tcg-opc.h path (default: {DEFAULT_LEGACY_OPC})",
+        help=f"archived legacy tcg-opc.h path (default: {DEFAULT_LEGACY_OPC})",
     )
     parser.add_argument("--json-out", type=Path, help="write full inventory JSON to this file")
     parser.add_argument("--markdown-out", type=Path, help="write markdown report to this file")

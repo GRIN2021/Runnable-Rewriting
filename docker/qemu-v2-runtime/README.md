@@ -8,7 +8,8 @@ suite, and the minimal PTC shim smoke.
 ## Contents
 
 - `Dockerfile`: Ubuntu 24.04 runtime with QEMU linux-user build dependencies,
-  probe-suite tools, and PTC shim smoke tools.
+  runnable-lift LLVM/Boost build dependencies, probe-suite tools, and PTC shim
+  smoke tools.
 - `smoke.sh`: short container smoke installed as `qemu-v2-runtime-smoke`.
 - `run-smoke.sh`: host-side wrapper that builds the image and runs the short
   smoke with a cached `/tmp` QEMU 10.2.3 tree when available.
@@ -64,8 +65,10 @@ runnable/scripts/build_runnable_lift_v2.sh --verify
 ```
 
 This builds `rr_qemu_v2_runtime:latest`, mounts the repository at
-`/workspace/Runnable-Rewriting`, configures CMake with
-`LLVM_DIR=/workspace/Runnable-Rewriting/root/lib/cmake/llvm`, and builds:
+`/workspace/Runnable-Rewriting`, configures CMake with the Ubuntu 24.04 system
+LLVM CMake package (`llvm-config --cmakedir`, normally
+`/usr/lib/llvm-18/lib/cmake/llvm`), uses apt-provided Boost headers, and
+builds:
 
 ```text
 build-codex-dynamic-current/tools/runnable-lift/runnable-lift
@@ -81,7 +84,8 @@ For direct host execution of the build-tree binary, carry the matching analysis
 DSOs and LLVM runtime on `LD_LIBRARY_PATH`:
 
 ```bash
-export LD_LIBRARY_PATH="$PWD/build-codex-dynamic-current/lib/StackAnalysis:$PWD/build-codex-dynamic-current/lib/BasicAnalyses:$PWD/build-codex-dynamic-current/lib/Support:$PWD/root/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+LLVM_LIBDIR="$(llvm-config --libdir)"
+export LD_LIBRARY_PATH="$PWD/build-codex-dynamic-current/lib/StackAnalysis:$PWD/build-codex-dynamic-current/lib/BasicAnalyses:$PWD/build-codex-dynamic-current/lib/Support:$LLVM_LIBDIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 ```
 
 ## Mount The Repo

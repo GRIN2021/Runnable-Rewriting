@@ -27,7 +27,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parents[1]
 WORKSPACE_ROOT = REPO_ROOT.parent
 DEFAULT_HDD_ROOT = Path("/hdd/runnable-libcrypto-dynamic-parallel")
-DEFAULT_RUNNABLE_IMAGE = "rr_bionic_exportfs:2026-04-14"
+DEFAULT_RUNNABLE_IMAGE = "rr_qemu_v2_runtime:latest"
 DEFAULT_GROUNDTRUTH_X86_IMAGE = "bin2415/x86_gt:0.1"
 DEFAULT_GROUNDTRUTH_PY_IMAGE = "bin2415/py_gt"
 DEFAULT_BASE_ADDRESS = 0x50000000
@@ -42,10 +42,14 @@ DEFAULT_MERGE_WORKERS = 2
 DEFAULT_MERGE_BATCH_SIZE = 64
 DEFAULT_MERGE_POLL_INTERVAL_SEC = 1.0
 DEFAULT_DISK_POLL_INTERVAL_SEC = 5.0
+DU_TRANSIENT_RETRY_COUNT = 3
+DU_TRANSIENT_RETRY_DELAY_SEC = 0.2
 DEFAULT_HDD_MIN_FREE_GB = 50.0
 DEFAULT_EXECUTION_MODEL = "single-container-shards"
 DEFAULT_COORDINATOR_EXTRA_FLAGS = ["-use-debug-symbols", "-no-link"]
 DEFAULT_SHARED_INSTALL_DIR = Path("/hdd/runnable-libcrypto-dynamic-parallel-optimized/shared-install-runnable")
+SYSTEM_LLVM_LIB_DIRS = ("/usr/lib/llvm-18/lib", "/usr/lib/llvm-17/lib", "/usr/lib/llvm-16/lib")
+LEGACY_RUNNABLE_ROOT = "/root/Runnable-Rewriting/root"
 SHARD_RUNNER_SCRIPT = SCRIPT_DIR / "libcrypto_parallel_shard_runner.py"
 READ_ELF_FUNC_RE = re.compile(
     r"^\s*\d+:\s*([0-9a-fA-F]+)\s+(\d+)\s+FUNC\s+\w+\s+\w+\s+(\w+)\s+(.*)$"
@@ -167,6 +171,8 @@ class LiftConfig:
     disk_poll_interval_sec: float = DEFAULT_DISK_POLL_INTERVAL_SEC
     prune_intermediate_files: bool = True
     dynsym_only: bool = True
+    static_fallback_profiles: Tuple[str, ...] = ()
+    static_fallback_symbol_regexes: Tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -375,7 +381,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--workspace-root", type=Path, default=WORKSPACE_ROOT)
     parser.add_argument("--repo-root", type=Path, default=REPO_ROOT)
     parser.add_argument("--groudtruth-repo-root", type=Path, default=WORKSPACE_ROOT / "GroudTruth")
-    parser.add_argument("--docker-image", default=DEFAULT_RUNNABLE_IMAGE)
+    parser.add_argument(
+        "--docker-image",
+        default=os.environ.get("RUNNABLE_QEMU_V2_IMAGE", DEFAULT_RUNNABLE_IMAGE),
+    )
     parser.add_argument("--gt-x86-image", default=DEFAULT_GROUNDTRUTH_X86_IMAGE)
     parser.add_argument("--gt-py-image", default=DEFAULT_GROUNDTRUTH_PY_IMAGE)
     parser.add_argument("--run-label", default=time.strftime("libcrypto-dyn-%Y%m%d-%H%M%S"))
@@ -493,6 +502,25 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-ensure-groundtruth", dest="ensure_groundtruth", action="store_false")
     parser.set_defaults(ensure_groundtruth=True)
     parser.add_argument("--skip-cmp", action="store_true")
+    parser.add_argument(
+        "--static-fallback-profile",
+        action="append",
+        choices=("avx512", "simd-heavy", "all-functions", "all-text"),
+        default=[],
+        help=(
+            "Forwarded to validate_libcrypto_ground_truth.py cmp for named static "
+            "mnemonic fallback profiles. May be repeated."
+        ),
+    )
+    parser.add_argument(
+        "--static-fallback-symbol-regex",
+        action="append",
+        default=[],
+        help=(
+            "Forwarded to validate_libcrypto_ground_truth.py cmp to enable static "
+            "mnemonic fallback for matching ELF FUNC symbols. May be repeated."
+        ),
+    )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument(
         "--preserve-success-seed-logs",
@@ -615,6 +643,8 @@ def load_config(args: argparse.Namespace) -> LiftConfig:
         streaming_merge=args.streaming_merge,
         prune_intermediate_files=args.prune_intermediate_files,
         dynsym_only=args.dynsym_only,
+        static_fallback_profiles=tuple(args.static_fallback_profile),
+        static_fallback_symbol_regexes=tuple(args.static_fallback_symbol_regex),
         merge_workers=max(args.merge_workers, 1),
         merge_batch_size=max(args.merge_batch_size, 2),
         merge_poll_interval_sec=max(args.merge_poll_interval_sec, 0.1),
@@ -913,9 +943,31 @@ def bytes_to_gb(value: int) -> float:
 def measure_tree_bytes(path: Path) -> int:
     if not path.exists():
         return 0
-    result = run_cmd(["du", "-sb", str(path)], capture_output=True)
-    first_token = (result.stdout or "0").strip().split(maxsplit=1)[0]
-    return int(first_token)
+    last_detail = ""
+    for attempt in range(DU_TRANSIENT_RETRY_COUNT):
+        result = run_cmd(["du", "-sb", str(path)], capture_output=True, check=False)
+        for line in reversed((result.stdout or "").splitlines()):
+            tokens = line.strip().split(maxsplit=1)
+            if not tokens:
+                continue
+            try:
+                return int(tokens[0])
+            except ValueError:
+                continue
+        stderr = (result.stderr or "").strip()
+        last_detail = f" rc={result.returncode}"
+        if stderr:
+            last_detail = f"{last_detail}: {stderr}"
+        if result.returncode != 0 and "No such file or directory" in stderr:
+            if not path.exists():
+                return 0
+            if attempt + 1 < DU_TRANSIENT_RETRY_COUNT:
+                time.sleep(DU_TRANSIENT_RETRY_DELAY_SEC)
+                continue
+        if result.returncode != 0:
+            raise RuntimeError(f"du -sb failed for {path}{last_detail}")
+        raise RuntimeError(f"du -sb produced no parseable size for {path}")
+    raise RuntimeError(f"du -sb failed for {path}{last_detail}")
 
 
 def disk_budget_path(layout: LiftLayout) -> Path:
@@ -1354,28 +1406,72 @@ def compile_current_runnable(config: LiftConfig) -> Tuple[Path, Path]:
     build_root = "/hdd-work/runs/{}/build-runnable".format(config.run_label)
     shared_install_root = map_host_path_to_container(config, shared_install_dir)
     container_build_log = map_host_path_to_container(config, build_log)
+    host_uid = os.getuid()
+    host_gid = os.getgid()
     shell_script = f"""
 set -euo pipefail
 cd /workspace/Runnable-Rewriting
 mkdir -p {shlex.quote(build_root)} {shlex.quote(install_root)} {shlex.quote(str(shared_install_root))}
 {{
   cd {shlex.quote(build_root)}
+  LLVM_DIR="${{RUNNABLE_LLVM_DIR:-}}"
+  if [[ -z "$LLVM_DIR" ]] && command -v llvm-config >/dev/null 2>&1; then
+    LLVM_DIR="$(llvm-config --cmakedir)"
+  fi
+  if [[ -z "$LLVM_DIR" || ! -f "$LLVM_DIR/LLVMConfig.cmake" ]]; then
+    for candidate in \
+      /usr/lib/llvm-18/lib/cmake/llvm \
+      /usr/lib/llvm-18/cmake \
+      /usr/lib/cmake/llvm \
+      /usr/share/llvm/cmake \
+      /usr/local/lib/cmake/llvm \
+      /usr/local/share/llvm/cmake; do
+      if [[ -f "$candidate/LLVMConfig.cmake" ]]; then
+        LLVM_DIR="$candidate"
+        break
+      fi
+    done
+  fi
+  if [[ -z "$LLVM_DIR" || ! -f "$LLVM_DIR/LLVMConfig.cmake" ]]; then
+    for candidate in \
+      {LEGACY_RUNNABLE_ROOT}/lib/cmake/llvm \
+      {LEGACY_RUNNABLE_ROOT}/share/llvm/cmake; do
+      if [[ -f "$candidate/LLVMConfig.cmake" ]]; then
+        LLVM_DIR="$candidate"
+        break
+      fi
+    done
+  fi
+  if [[ -z "$LLVM_DIR" || ! -f "$LLVM_DIR/LLVMConfig.cmake" ]]; then
+    echo "LLVMConfig.cmake not found; set RUNNABLE_LLVM_DIR to the LLVM CMake package directory" >&2
+    exit 1
+  fi
+  QEMU_INSTALL_PATH="${{RUNNABLE_QEMU_INSTALL_PATH:-/usr}}"
+  if [[ ! -d "$QEMU_INSTALL_PATH/include" && -d {LEGACY_RUNNABLE_ROOT}/include ]]; then
+    QEMU_INSTALL_PATH={LEGACY_RUNNABLE_ROOT}
+  fi
+  BOOST_ROOT_ARGS=()
+  if [[ -n "${{RUNNABLE_BOOST_ROOT:-}}" ]]; then
+    BOOST_ROOT_ARGS=(-DBOOST_ROOT="$RUNNABLE_BOOST_ROOT" -DBoost_NO_SYSTEM_PATHS=On)
+  elif [[ -d {LEGACY_RUNNABLE_ROOT}/include/boost ]]; then
+    BOOST_ROOT_ARGS=(-DBOOST_ROOT={LEGACY_RUNNABLE_ROOT} -DBoost_NO_SYSTEM_PATHS=On)
+  fi
   cmake /workspace/Runnable-Rewriting/runnable \\
     -DCMAKE_BUILD_TYPE=Debug \\
     -DCMAKE_INSTALL_PREFIX={shlex.quote(install_root)} \\
-    -DQEMU_INSTALL_PATH=/root/Runnable-Rewriting/root \\
-    -DLLVM_DIR=/root/Runnable-Rewriting/root/lib/cmake/llvm \\
-    -DBOOST_ROOT=/root/Runnable-Rewriting/root \\
-    -DBoost_NO_SYSTEM_PATHS=On \\
+    -DQEMU_INSTALL_PATH="$QEMU_INSTALL_PATH" \\
+    -DLLVM_DIR="$LLVM_DIR" \\
     -DCMAKE_CXX_LINK_FLAGS='-static-libgcc -static-libstdc++' \\
-    -DCMAKE_C_LINK_FLAGS='-static-libgcc'
+    -DCMAKE_C_LINK_FLAGS='-static-libgcc' \\
+    "${{BOOST_ROOT_ARGS[@]}}"
   cmake --build .
   cmake --install .
   rm -rf {shlex.quote(str(shared_install_root))}
   cp -a {shlex.quote(install_root)} {shlex.quote(str(shared_install_root))}
+  chown -R {host_uid}:{host_gid} {shlex.quote(str(shared_install_root))}
 }} >{shlex.quote(container_build_log)} 2>&1
 """
-    log("building current dynamic-parallel runnable-lift inside rr_bionic_exportfs")
+    log(f"building current dynamic-parallel runnable-lift inside {config.docker_image}")
     if not config.dry_run:
         result = docker_run_shell(
             config.docker_image,
@@ -1393,7 +1489,7 @@ mkdir -p {shlex.quote(build_root)} {shlex.quote(install_root)} {shlex.quote(str(
                 log_text = build_log.read_text(encoding="utf-8", errors="ignore")
                 if "PTCInterface' has no member named 'queueDepth'" in log_text or "PTCInterface' has no member named 'dropCPUState'" in log_text:
                     detail += (
-                        " (rr_bionic_exportfs:2026-04-14 exposes an older PTCInterface "
+                        " (configured runtime image exposes an older PTCInterface "
                         "than this dynamic-parallel branch expects)"
                     )
             raise RuntimeError(detail)
@@ -1424,29 +1520,83 @@ def resolve_runnable_lift(config: LiftConfig) -> Tuple[Path, Path, str]:
     return built_binary, built_prefix, "freshly built current branch binary"
 
 
-def stage_libtinycode_runtime_assets(config: LiftConfig, prefix: Path) -> Optional[Path]:
-    if config.libtinycode_override is None and config.libtinycode_helpers_override is None:
-        return None
-    if config.libtinycode_override is None or config.libtinycode_helpers_override is None:
-        raise RuntimeError(
-            "libtinycode override requires both --libtinycode-path and "
-            "--libtinycode-helpers-path"
-        )
+def default_libtinycode_candidate_dirs(config: LiftConfig) -> List[Path]:
+    return [
+        config.repo_root / "build-codex-dynamic-current" / "tools" / "runnable-lift",
+        config.repo_root / "build-codex-dynamic-current",
+    ]
 
-    libtinycode = config.libtinycode_override
-    helpers = config.libtinycode_helpers_override
+
+def resolve_libtinycode_runtime_assets(config: LiftConfig) -> Optional[Tuple[Path, Path]]:
+    if config.libtinycode_override is None or config.libtinycode_helpers_override is None:
+        if config.libtinycode_override is not None or config.libtinycode_helpers_override is not None:
+            raise RuntimeError(
+                "libtinycode override requires both --libtinycode-path and "
+                "--libtinycode-helpers-path"
+            )
+        for candidate_dir in default_libtinycode_candidate_dirs(config):
+            libtinycode = candidate_dir / "libtinycode-x86_64.so"
+            helpers = candidate_dir / "libtinycode-helpers-x86_64.ll"
+            if libtinycode.exists() and helpers.exists():
+                return libtinycode, helpers
+        if config.dry_run:
+            return None
+        raise RuntimeError(
+            "missing libtinycode runtime assets; pass --libtinycode-path and "
+            "--libtinycode-helpers-path, or stage libtinycode-x86_64.so and "
+            "libtinycode-helpers-x86_64.ll under build-codex-dynamic-current/"
+            "tools/runnable-lift"
+        )
+    return config.libtinycode_override, config.libtinycode_helpers_override
+
+
+def runtime_asset_target_dirs(config: LiftConfig, prefix: Path) -> List[Path]:
+    if prefix == config.layout.build_dir:
+        target_dirs = [prefix]
+        tools_dir = prefix / "tools" / "runnable-lift"
+        if tools_dir.exists():
+            target_dirs.append(tools_dir)
+        return target_dirs
+    return [prefix / "lib", prefix / "bin"]
+
+
+def stage_libtinycode_runtime_assets(config: LiftConfig, prefix: Path) -> Optional[Path]:
+    assets = resolve_libtinycode_runtime_assets(config)
+    if assets is None:
+        return None
+    libtinycode, helpers = assets
     if not libtinycode.exists():
         raise FileNotFoundError(f"missing libtinycode override: {libtinycode}")
     if not helpers.exists():
         raise FileNotFoundError(f"missing libtinycode helpers override: {helpers}")
 
-    target_dir = prefix if prefix == config.layout.build_dir else prefix / "lib"
-    ensure_dir(target_dir)
-    lib_target = target_dir / "libtinycode-x86_64.so"
-    helpers_target = target_dir / "libtinycode-helpers-x86_64.ll"
-    shutil.copy2(libtinycode, lib_target)
-    shutil.copy2(helpers, helpers_target)
-    return target_dir
+    target_dirs = runtime_asset_target_dirs(config, prefix)
+    for target_dir in target_dirs:
+        ensure_dir(target_dir)
+        lib_target = target_dir / "libtinycode-x86_64.so"
+        helpers_target = target_dir / "libtinycode-helpers-x86_64.ll"
+        shutil.copy2(libtinycode, lib_target)
+        shutil.copy2(helpers, helpers_target)
+    return target_dirs[0]
+
+
+def append_unique(items: List[str], value: str) -> None:
+    if value and value not in items:
+        items.append(value)
+
+
+def configured_llvm_lib_dirs() -> List[str]:
+    parts: List[str] = []
+    override = os.environ.get("RUNNABLE_LLVM_LIBDIR", "")
+    for value in override.split(os.pathsep):
+        append_unique(parts, value)
+    for value in SYSTEM_LLVM_LIB_DIRS:
+        append_unique(parts, value)
+    return parts
+
+
+def uses_legacy_runnable_root(config: LiftConfig) -> bool:
+    return config.docker_image.startswith("rr_bionic_exportfs")
 
 
 def build_container_runtime(config: LiftConfig, prefix: Path) -> Dict[str, str]:
@@ -1459,7 +1609,18 @@ def build_container_runtime(config: LiftConfig, prefix: Path) -> Dict[str, str]:
         bin_dir = f"{prefix_in_container}/bin"
         lib_dir = f"{prefix_in_container}/lib"
         share_dir = f"{prefix_in_container}/share/runnable"
-    path = f"{bin_dir}:/root/Runnable-Rewriting/root/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    path_parts = [
+        bin_dir,
+        "/usr/local/sbin",
+        "/usr/local/bin",
+        "/usr/sbin",
+        "/usr/bin",
+        "/sbin",
+        "/bin",
+    ]
+    if uses_legacy_runnable_root(config):
+        path_parts.insert(1, f"{LEGACY_RUNNABLE_ROOT}/bin")
+    path = ":".join(path_parts)
     ld_library_parts = [lib_dir]
     if prefix == config.layout.build_dir:
         ld_library_parts.extend(
@@ -1471,7 +1632,9 @@ def build_container_runtime(config: LiftConfig, prefix: Path) -> Dict[str, str]:
                 f"{prefix_in_container}/analyses",
             ]
         )
-    ld_library_parts.append("/root/Runnable-Rewriting/root/lib")
+    ld_library_parts.extend(configured_llvm_lib_dirs())
+    if uses_legacy_runnable_root(config):
+        ld_library_parts.append(f"{LEGACY_RUNNABLE_ROOT}/lib")
     ld_library_path = ":".join(ld_library_parts)
     pythonpath = f"{share_dir}:/workspace/Runnable-Rewriting/runnable/scripts"
     return {
@@ -2777,6 +2940,10 @@ def run_canonical_cmp(
         str(out_dir),
         "--allow-low-metrics",
     ]
+    for profile in config.static_fallback_profiles:
+        cmd.extend(["--static-fallback-profile", profile])
+    for regex in config.static_fallback_symbol_regexes:
+        cmd.extend(["--static-fallback-symbol-regex", regex])
     if config.dry_run:
         return {"cmd": cmd, "status": "dry-run"}
     result = run_cmd(cmd, cwd=config.repo_root, capture_output=True, check=False)

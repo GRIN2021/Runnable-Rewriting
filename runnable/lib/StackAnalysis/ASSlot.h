@@ -5,6 +5,7 @@
 #include <limits>
 
 // LLVM includes
+#include "llvm/ADT/Optional.h"
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/Module.h"
 
@@ -185,7 +186,7 @@ public:
   static void
   dumpOffset(const llvm::Module *M, ASID AS, int32_t Offset, T &Output) {
     if (M != nullptr && AS == ASID::cpuID()) {
-      auto Name = csvNameByOffset(Offset, M);
+      auto Name = ASSlot::csvNameByOffset(Offset, M);
       if (Name) {
         Output << *Name;
         return;

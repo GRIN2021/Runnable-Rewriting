@@ -113,12 +113,16 @@ public:
   /// \param Instr the PTCInstruction of the call to the helper.
   ///
   /// \return see InstructionTranslator::TranslationResult.
-  TranslationResult translateCall(PTCInstruction *Instr);
+  TranslationResult translateCall(PTCInstruction *Instr, uint64_t PC);
 
   /// \brief Handle calls to `newPC` marker and emit coverage information
   ///
   /// \param CoveragePath path where the coverage information should be stored.
-  void finalizeNewPCMarkers(std::string &CoveragePath);
+  void finalizeNewPCMarkers(std::string &CoveragePath,
+                            bool RemoveRuntimeMarkers = false);
+
+  /// \brief Materialize unresolved PTC label blocks before leaving a TB.
+  unsigned finalizePendingLabelBlocks();
 
   /// \brief Notifies InstructionTranslator about a new PTC translation
   void reset() { LabeledBasicBlocks.clear(); }

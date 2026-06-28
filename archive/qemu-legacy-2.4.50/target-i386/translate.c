@@ -197,8 +197,8 @@ static int ptc_evex_tail_bytes(CPUX86State *env,
     int length = ptc_modrm_bytes(env, pc, aflag);
 
     /*
-     * General EVEX instruction length calculator. We only need the byte
-     * count to advance PC — we do not execute the instruction.
+     * General EVEX instruction length calculator for unsupported fallback
+     * paths. Hot EVEX instructions are handled before this byte-skip path.
      *
      * After the 4-byte EVEX prefix and 1-byte opcode, the tail is:
      *   ModRM + SIB + displacement  (computed by ptc_modrm_bytes)
@@ -2707,6 +2707,436 @@ static inline void gen_sto_env_A0(DisasContext *s, int offset)
     tcg_gen_qemu_st_i64(cpu_tmp1_i64, cpu_tmp0, mem_index, MO_LEQ);
 }
 
+static inline int zmm_q_offset(int base, int q)
+{
+    return base + offsetof(XMMReg, XMM_Q(q));
+}
+
+static inline int zmm_oword_offset(int base, int lane)
+{
+    return zmm_q_offset(base, lane * 2);
+}
+
+static void gen_zmm_zero_tail(int offset, int bytes)
+{
+    int q;
+
+    tcg_gen_movi_i64(cpu_tmp1_i64, 0);
+    for (q = bytes / 8; q < 8; q++) {
+        tcg_gen_st_i64(cpu_tmp1_i64, cpu_env, zmm_q_offset(offset, q));
+    }
+}
+
+static void gen_zmm_copy(int dst_offset, int src_offset, int bytes)
+{
+    int q;
+
+    for (q = 0; q < bytes / 8; q++) {
+        tcg_gen_ld_i64(cpu_tmp1_i64, cpu_env, zmm_q_offset(src_offset, q));
+        tcg_gen_st_i64(cpu_tmp1_i64, cpu_env, zmm_q_offset(dst_offset, q));
+    }
+    gen_zmm_zero_tail(dst_offset, bytes);
+}
+
+static void gen_zmm_copy_oword(int dst_offset, int src_offset)
+{
+    tcg_gen_ld_i64(cpu_tmp1_i64, cpu_env, zmm_q_offset(src_offset, 0));
+    tcg_gen_st_i64(cpu_tmp1_i64, cpu_env, zmm_q_offset(dst_offset, 0));
+    tcg_gen_ld_i64(cpu_tmp1_i64, cpu_env, zmm_q_offset(src_offset, 1));
+    tcg_gen_st_i64(cpu_tmp1_i64, cpu_env, zmm_q_offset(dst_offset, 1));
+}
+
+static void gen_zmm_copy_oword_lane(int dst_offset, int dst_lane,
+                                    int src_offset, int src_lane)
+{
+    gen_zmm_copy_oword(zmm_oword_offset(dst_offset, dst_lane),
+                       zmm_oword_offset(src_offset, src_lane));
+}
+
+static void gen_zmm_ld_env_A0(DisasContext *s, int offset, int bytes)
+{
+    int q;
+
+    for (q = 0; q < bytes / 8; q++) {
+        if (q == 0) {
+            tcg_gen_qemu_ld_i64(cpu_tmp1_i64, cpu_A0, s->mem_index, MO_LEQ);
+        } else {
+            tcg_gen_addi_tl(cpu_tmp0, cpu_A0, q * 8);
+            tcg_gen_qemu_ld_i64(cpu_tmp1_i64, cpu_tmp0, s->mem_index, MO_LEQ);
+        }
+        tcg_gen_st_i64(cpu_tmp1_i64, cpu_env, zmm_q_offset(offset, q));
+    }
+    gen_zmm_zero_tail(offset, bytes);
+}
+
+static void gen_zmm_st_env_A0(DisasContext *s, int offset, int bytes)
+{
+    int q;
+
+    for (q = 0; q < bytes / 8; q++) {
+        tcg_gen_ld_i64(cpu_tmp1_i64, cpu_env, zmm_q_offset(offset, q));
+        if (q == 0) {
+            tcg_gen_qemu_st_i64(cpu_tmp1_i64, cpu_A0, s->mem_index, MO_LEQ);
+        } else {
+            tcg_gen_addi_tl(cpu_tmp0, cpu_A0, q * 8);
+            tcg_gen_qemu_st_i64(cpu_tmp1_i64, cpu_tmp0, s->mem_index, MO_LEQ);
+        }
+    }
+}
+
+static inline int evex_vlen_bytes(int p2)
+{
+    switch ((p2 >> 5) & 3) {
+    case 2:
+        return 64;
+    case 1:
+        return 32;
+    default:
+        return 16;
+    }
+}
+
+static inline int evex_reg_index(int low3, int p0)
+{
+    return low3 | ((~p0 >> 4) & 8) | ((~p0) & 0x10);
+}
+
+static inline int evex_rm_index(int modrm, int p0)
+{
+    int rm = modrm & 7;
+
+    rm |= ((~p0 >> 2) & 8);
+    if ((modrm >> 6) == 3) {
+        rm |= ((~p0 >> 2) & 0x10);
+    }
+    return rm;
+}
+
+static inline int evex_vvvv_index(int p1, int p2)
+{
+    return ((~p1 >> 3) & 0xf) | ((~p2 << 1) & 0x10);
+}
+
+static inline int zmm_reg_offset(int reg)
+{
+    return offsetof(CPUX86State, xmm_regs[reg]);
+}
+
+static int gen_evex_rm_source(CPUX86State *env, DisasContext *s,
+                              int modrm, int p0, int bytes)
+{
+    int mod = (modrm >> 6) & 3;
+
+    if (mod == 3) {
+        return zmm_reg_offset(evex_rm_index(modrm, p0));
+    }
+
+    gen_lea_modrm(env, s, modrm);
+    gen_zmm_ld_env_A0(s, offsetof(CPUX86State, xmm_t0), bytes);
+    return offsetof(CPUX86State, xmm_t0);
+}
+
+static void gen_zmm_xor(int dst_offset, int src1_offset,
+                        int src2_offset, int bytes)
+{
+    int q;
+    TCGv_i64 tmp = tcg_temp_new_i64();
+
+    for (q = 0; q < bytes / 8; q++) {
+        tcg_gen_ld_i64(cpu_tmp1_i64, cpu_env, zmm_q_offset(src1_offset, q));
+        tcg_gen_ld_i64(tmp, cpu_env, zmm_q_offset(src2_offset, q));
+        tcg_gen_xor_i64(cpu_tmp1_i64, cpu_tmp1_i64, tmp);
+        tcg_gen_st_i64(cpu_tmp1_i64, cpu_env, zmm_q_offset(dst_offset, q));
+    }
+    tcg_temp_free_i64(tmp);
+    gen_zmm_zero_tail(dst_offset, bytes);
+}
+
+static void gen_zmm_ternlog_0x96(int dst_offset, int src1_offset,
+                                 int src2_offset, int bytes)
+{
+    int q;
+    TCGv_i64 tmp = tcg_temp_new_i64();
+
+    for (q = 0; q < bytes / 8; q++) {
+        tcg_gen_ld_i64(cpu_tmp1_i64, cpu_env, zmm_q_offset(dst_offset, q));
+        tcg_gen_ld_i64(tmp, cpu_env, zmm_q_offset(src1_offset, q));
+        tcg_gen_xor_i64(cpu_tmp1_i64, cpu_tmp1_i64, tmp);
+        tcg_gen_ld_i64(tmp, cpu_env, zmm_q_offset(src2_offset, q));
+        tcg_gen_xor_i64(cpu_tmp1_i64, cpu_tmp1_i64, tmp);
+        tcg_gen_st_i64(cpu_tmp1_i64, cpu_env, zmm_q_offset(dst_offset, q));
+    }
+    tcg_temp_free_i64(tmp);
+    gen_zmm_zero_tail(dst_offset, bytes);
+}
+
+static void gen_zmm_add_l(int dst_offset, int src1_offset,
+                          int src2_offset, int bytes)
+{
+    int i;
+
+    for (i = 0; i < bytes / 4; i++) {
+        tcg_gen_ld_i32(cpu_tmp2_i32, cpu_env,
+                       src1_offset + offsetof(XMMReg, XMM_L(i)));
+        tcg_gen_ld_i32(cpu_tmp3_i32, cpu_env,
+                       src2_offset + offsetof(XMMReg, XMM_L(i)));
+        tcg_gen_add_i32(cpu_tmp2_i32, cpu_tmp2_i32, cpu_tmp3_i32);
+        tcg_gen_st_i32(cpu_tmp2_i32, cpu_env,
+                       dst_offset + offsetof(XMMReg, XMM_L(i)));
+    }
+    gen_zmm_zero_tail(dst_offset, bytes);
+}
+
+static void gen_zmm_pshufb(int dst_offset, int src1_offset,
+                           int src2_offset, int bytes)
+{
+    int lane;
+
+    for (lane = 0; lane < bytes / 16; lane++) {
+        gen_zmm_copy_oword_lane(dst_offset, lane, src1_offset, lane);
+        tcg_gen_addi_ptr(cpu_ptr0, cpu_env, zmm_oword_offset(dst_offset, lane));
+        tcg_gen_addi_ptr(cpu_ptr1, cpu_env, zmm_oword_offset(src2_offset, lane));
+        gen_helper_pshufb_xmm(cpu_env, cpu_ptr0, cpu_ptr1);
+    }
+    gen_zmm_zero_tail(dst_offset, bytes);
+}
+
+static void gen_zmm_pclmulqdq(int dst_offset, int src1_offset,
+                              int src2_offset, int bytes, int imm)
+{
+    int lane;
+
+    for (lane = 0; lane < bytes / 16; lane++) {
+        gen_zmm_copy_oword_lane(dst_offset, lane, src1_offset, lane);
+        tcg_gen_addi_ptr(cpu_ptr0, cpu_env, zmm_oword_offset(dst_offset, lane));
+        tcg_gen_addi_ptr(cpu_ptr1, cpu_env, zmm_oword_offset(src2_offset, lane));
+        gen_helper_pclmulqdq_xmm(cpu_env, cpu_ptr0, cpu_ptr1,
+                                 tcg_const_i32(imm));
+    }
+    gen_zmm_zero_tail(dst_offset, bytes);
+}
+
+static void gen_zmm_aes(int dst_offset, int src1_offset,
+                        int src2_offset, int bytes, bool last)
+{
+    int lane;
+
+    for (lane = 0; lane < bytes / 16; lane++) {
+        gen_zmm_copy_oword_lane(dst_offset, lane, src1_offset, lane);
+        tcg_gen_addi_ptr(cpu_ptr0, cpu_env, zmm_oword_offset(dst_offset, lane));
+        tcg_gen_addi_ptr(cpu_ptr1, cpu_env, zmm_oword_offset(src2_offset, lane));
+        if (last) {
+            gen_helper_aesenclast_xmm(cpu_env, cpu_ptr0, cpu_ptr1);
+        } else {
+            gen_helper_aesenc_xmm(cpu_env, cpu_ptr0, cpu_ptr1);
+        }
+    }
+    gen_zmm_zero_tail(dst_offset, bytes);
+}
+
+static void gen_zmm_broadcast_oword_from_mem(CPUX86State *env,
+                                             DisasContext *s,
+                                             int dst_offset,
+                                             int modrm,
+                                             int bytes)
+{
+    int lane;
+
+    gen_lea_modrm(env, s, modrm);
+    gen_ldo_env_A0(s, offsetof(CPUX86State, xmm_t0));
+    for (lane = 0; lane < bytes / 16; lane++) {
+        gen_zmm_copy_oword_lane(dst_offset, lane,
+                                offsetof(CPUX86State, xmm_t0), 0);
+    }
+    gen_zmm_zero_tail(dst_offset, bytes);
+}
+
+static void gen_zmm_shift_dq(int dst_offset, int src_offset,
+                             int bytes, int imm, bool left)
+{
+    int lane;
+
+    tcg_gen_movi_tl(cpu_T[0], imm);
+    tcg_gen_st32_tl(cpu_T[0], cpu_env,
+                    offsetof(CPUX86State, xmm_t0.XMM_L(0)));
+    tcg_gen_movi_tl(cpu_T[0], 0);
+    tcg_gen_st32_tl(cpu_T[0], cpu_env,
+                    offsetof(CPUX86State, xmm_t0.XMM_L(1)));
+
+    for (lane = 0; lane < bytes / 16; lane++) {
+        gen_zmm_copy_oword_lane(dst_offset, lane, src_offset, lane);
+        tcg_gen_addi_ptr(cpu_ptr0, cpu_env, zmm_oword_offset(dst_offset, lane));
+        tcg_gen_addi_ptr(cpu_ptr1, cpu_env, offsetof(CPUX86State, xmm_t0));
+        if (left) {
+            gen_helper_pslldq_xmm(cpu_env, cpu_ptr0, cpu_ptr1);
+        } else {
+            gen_helper_psrldq_xmm(cpu_env, cpu_ptr0, cpu_ptr1);
+        }
+    }
+    gen_zmm_zero_tail(dst_offset, bytes);
+}
+
+static void gen_zmm_extract_owords(int dst_offset, int src_offset,
+                                   int imm, int owords)
+{
+    int lane;
+    int src_lane = imm & 3;
+
+    for (lane = 0; lane < owords; lane++) {
+        gen_zmm_copy_oword_lane(dst_offset, lane, src_offset, src_lane + lane);
+    }
+    gen_zmm_zero_tail(dst_offset, owords * 16);
+}
+
+static bool gen_evex_hot(CPUX86State *env, DisasContext *s,
+                         int opcode, int p0, int p1, int p2)
+{
+    int map = p0 & 3;
+    int pp = p1 & 3;
+    int mask = p2 & 7;
+    int bytes = evex_vlen_bytes(p2);
+    int modrm, mod, group, dst, src1, src2, imm;
+    target_ulong pc = s->pc;
+
+    if (mask != 0) {
+        return false;
+    }
+
+    modrm = cpu_ldub_code(env, s->pc);
+    mod = (modrm >> 6) & 3;
+    dst = evex_reg_index((modrm >> 3) & 7, p0);
+    src1 = evex_vvvv_index(p1, p2);
+
+    switch (opcode) {
+    case 0x6f:
+        if (map != 1 || bytes != 64) {
+            return false;
+        }
+        s->pc++;
+        src2 = gen_evex_rm_source(env, s, modrm, p0, bytes);
+        gen_zmm_copy(zmm_reg_offset(dst), src2, bytes);
+        return true;
+
+    case 0x7f:
+        if (map != 1 || bytes != 64) {
+            return false;
+        }
+        s->pc++;
+        if (mod == 3) {
+            gen_zmm_copy(zmm_reg_offset(evex_rm_index(modrm, p0)),
+                         zmm_reg_offset(dst), bytes);
+        } else {
+            gen_lea_modrm(env, s, modrm);
+            gen_zmm_st_env_A0(s, zmm_reg_offset(dst), bytes);
+        }
+        return true;
+
+    case 0xef:
+        if (map != 1 || pp != 1 || bytes != 64) {
+            return false;
+        }
+        s->pc++;
+        src2 = gen_evex_rm_source(env, s, modrm, p0, bytes);
+        gen_zmm_xor(zmm_reg_offset(dst), zmm_reg_offset(src1), src2, bytes);
+        return true;
+
+    case 0xfe:
+        if (map != 1 || pp != 1 || bytes != 64) {
+            return false;
+        }
+        s->pc++;
+        src2 = gen_evex_rm_source(env, s, modrm, p0, bytes);
+        gen_zmm_add_l(zmm_reg_offset(dst), zmm_reg_offset(src1), src2, bytes);
+        return true;
+
+    case 0x00:
+        if (map != 2 || pp != 1 || bytes != 64) {
+            return false;
+        }
+        s->pc++;
+        src2 = gen_evex_rm_source(env, s, modrm, p0, bytes);
+        gen_zmm_pshufb(zmm_reg_offset(dst), zmm_reg_offset(src1),
+                       src2, bytes);
+        return true;
+
+    case 0xdc:
+    case 0xdd:
+        if (map != 2 || pp != 1 || bytes != 64) {
+            return false;
+        }
+        s->pc++;
+        src2 = gen_evex_rm_source(env, s, modrm, p0, bytes);
+        gen_zmm_aes(zmm_reg_offset(dst), zmm_reg_offset(src1),
+                    src2, bytes, opcode == 0xdd);
+        return true;
+
+    case 0x1a:
+        if (map != 2 || pp != 1 || bytes != 64 || mod == 3) {
+            return false;
+        }
+        s->pc++;
+        gen_zmm_broadcast_oword_from_mem(env, s, zmm_reg_offset(dst),
+                                         modrm, bytes);
+        return true;
+
+    case 0x25:
+        if (map != 3 || pp != 1 || bytes != 64) {
+            return false;
+        }
+        s->pc++;
+        src2 = gen_evex_rm_source(env, s, modrm, p0, bytes);
+        imm = cpu_ldub_code(env, s->pc++);
+        if (imm != 0x96) {
+            s->pc = pc;
+            return false;
+        }
+        gen_zmm_ternlog_0x96(zmm_reg_offset(dst), zmm_reg_offset(src1),
+                             src2, bytes);
+        return true;
+
+    case 0x44:
+        if (map != 3 || pp != 1 || bytes != 64) {
+            return false;
+        }
+        s->pc++;
+        src2 = gen_evex_rm_source(env, s, modrm, p0, bytes);
+        imm = cpu_ldub_code(env, s->pc++);
+        gen_zmm_pclmulqdq(zmm_reg_offset(dst), zmm_reg_offset(src1),
+                          src2, bytes, imm);
+        return true;
+
+    case 0x73:
+        if (map != 1 || pp != 1 || bytes != 64 || mod != 3) {
+            return false;
+        }
+        group = (modrm >> 3) & 7;
+        if (group != 3 && group != 7) {
+            return false;
+        }
+        s->pc++;
+        src2 = zmm_reg_offset(evex_rm_index(modrm, p0));
+        imm = cpu_ldub_code(env, s->pc++);
+        gen_zmm_shift_dq(zmm_reg_offset(src1), src2, bytes,
+                         imm, group == 7);
+        return true;
+
+    case 0x39:
+    case 0x3b:
+        if (map != 3 || pp != 1 || mod != 3) {
+            return false;
+        }
+        s->pc++;
+        src2 = zmm_reg_offset(dst);
+        dst = evex_rm_index(modrm, p0);
+        imm = cpu_ldub_code(env, s->pc++);
+        gen_zmm_extract_owords(zmm_reg_offset(dst), src2, imm,
+                               opcode == 0x39 ? 1 : 2);
+        return true;
+    }
+
+    return false;
+}
+
 static inline void gen_op_movo(int d_offset, int s_offset)
 {
     tcg_gen_ld_i64(cpu_tmp1_i64, cpu_env, s_offset + offsetof(XMMReg, XMM_Q(0)));
@@ -4509,7 +4939,7 @@ static target_ulong disas_insn(CPUX86State *env, DisasContext *s,
     int modrm, reg, rm, mod, op, opreg, val;
     target_ulong next_eip, tval;
     int rex_w, rex_r;
-    int evex_p0 = 0, evex_p1 = 0;
+    int evex_p0 = 0, evex_p1 = 0, evex_p2 = 0;
     static const int pp_prefix[4] = {
         0, PREFIX_DATA, PREFIX_REPZ, PREFIX_REPNZ
     };
@@ -4658,6 +5088,7 @@ static target_ulong disas_insn(CPUX86State *env, DisasContext *s,
                 rex_w = (p1 >> 7) & 1;
                 evex_p0 = p0;
                 evex_p1 = p1;
+                evex_p2 = p2;
                 s->vex_v = (~p1 >> 3) & 0xf;
                 s->vex_l = (p2 >> 5) & 1;
                 prefixes |= pp_prefix[p1 & 3] | PREFIX_VEX;
@@ -4714,12 +5145,17 @@ static target_ulong disas_insn(CPUX86State *env, DisasContext *s,
         b = cpu_ldub_code(env, s->pc++) | 0x100;
         goto reswitch;
     case 0x200 ... 0x2ff: {
-        int tail_bytes = ptc_evex_tail_bytes(env,
-                                             s->pc,
-                                             aflag,
-                                             evex_p0,
-                                             evex_p1,
-                                             b & 0xff);
+        int tail_bytes;
+
+        if (gen_evex_hot(env, s, b & 0xff, evex_p0, evex_p1, evex_p2)) {
+            break;
+        }
+        tail_bytes = ptc_evex_tail_bytes(env,
+                                         s->pc,
+                                         aflag,
+                                         evex_p0,
+                                         evex_p1,
+                                         b & 0xff);
         if (tail_bytes < 0) {
             goto illegal_op;
         }

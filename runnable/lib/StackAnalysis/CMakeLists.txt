@@ -6,6 +6,12 @@ set(PREGENERATED_ABIDATAFLOWS ""
   CACHE FILEPATH
   "Optional path to a pre-generated ABIDataFlows.h.")
 
+if(NOT PREGENERATED_ABIDATAFLOWS
+   AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/ABIDataFlows.h")
+  set(PREGENERATED_ABIDATAFLOWS
+    "${CMAKE_CURRENT_SOURCE_DIR}/ABIDataFlows.h")
+endif()
+
 if(NOT PREGENERATED_ABIDATAFLOWS)
   execute_process(COMMAND python3 -c "import pygraphviz"
     RESULT_VARIABLE HAS_PYGRAPHVIZ

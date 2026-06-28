@@ -58,6 +58,8 @@ static const unsigned align = sizeof(target_reg);
 jmp_buf jmp_buffer;
 target_reg *saved_registers;
 
+__attribute__((weak)) bool has_register(uint32_t register_id);
+
 // Default SIGSEGV handler
 static struct sigaction default_handler;
 
@@ -366,7 +368,6 @@ void newpc(uint64_t pc,
 // if so serialize and jump
 bool is_executable(uint64_t pc) {
   assert(segments_count != 0);
-  printf("PC: %lx\n",pc);
 
   // Check if the pc is inside one of the executable segments
   for (int i = 0; i < segments_count; i++)
@@ -399,6 +400,26 @@ void install_sigsegv_handler(void) {
   int result = 0;
   result = sigaction(SIGSEGV, &segv_handler, &default_handler);
   assert(result == 0);
+}
+
+static void make_executable_segments_executable(void) {
+  long page_size = sysconf(_SC_PAGESIZE);
+  if (page_size <= 0 || segments_count == 0 || segment_boundaries == NULL)
+    return;
+
+  uint64_t page_mask = (uint64_t) page_size - 1;
+  for (uint64_t i = 0; i < segments_count; i++) {
+    uint64_t start = segment_boundaries[2 * i];
+    uint64_t end = segment_boundaries[2 * i + 1];
+    uint64_t aligned_start = start & ~page_mask;
+    uint64_t aligned_end = (end + page_mask) & ~page_mask;
+    if (aligned_end <= aligned_start)
+      continue;
+
+    (void) mprotect((void *) (uintptr_t) aligned_start,
+                    (size_t) (aligned_end - aligned_start),
+                    PROT_READ | PROT_EXEC);
+  }
 }
 
 int main(int argc, char *argv[]) {
@@ -438,12 +459,14 @@ int main(int argc, char *argv[]) {
 
   // Implant custom SIGSEGV handler
   install_sigsegv_handler();
+  make_executable_segments_executable();
 
 #ifdef TARGET_x86_64
   unsigned long fs_value;
   int result = arch_prctl(ARCH_GET_FS, &fs_value);
   assert(result == 0);
-  set_register(REGISTER_FS, fs_value);
+  if (has_register != NULL && has_register(REGISTER_FS))
+    set_register(REGISTER_FS, fs_value);
 #endif
 
   // Run the translated program

@@ -10,6 +10,7 @@
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/raw_ostream.h"
+#include <cctype>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -23,6 +24,12 @@
 #include "PTCInterface.h"
 
 static const int MAX_TEMP_NAME_LENGTH = 128;
+
+static unsigned getPTCLabelId(PTCInstructionArg EncodedLabel) {
+  if (ptc.get_arg_label_id != nullptr)
+    return ptc.get_arg_label_id(EncodedLabel);
+  return static_cast<unsigned>(EncodedLabel);
+}
 
 static void getTemporaryName(char *Buffer,
                              size_t BufferSize,
@@ -158,7 +165,8 @@ int dumpInstruction(std::ostream &Result,
     case PTC_INSTRUCTION_op_movcond_i64: {
       PTCInstructionArg Arg = ptc_instruction_const_arg(&ptc, &Instruction, 0);
       PTCCondition ConditionId = static_cast<PTCCondition>(Arg);
-      const char *ConditionName = ptc.get_condition_name(ConditionId);
+      const char *ConditionName = ptc_compat::getConditionName(ptc,
+                                                               ConditionId);
 
       if (ConditionName != nullptr)
         Result << "," << ConditionName;
@@ -224,7 +232,7 @@ int dumpInstruction(std::ostream &Result,
     case PTC_INSTRUCTION_op_brcond2_i32: {
       PTCInstructionArg Arg = ptc_instruction_const_arg(&ptc, &Instruction, i);
       Result << ","
-             << "$L" << ptc.get_arg_label_id(Arg);
+             << "$L" << getPTCLabelId(Arg);
 
       /* Consume one more argument */
       i++;
@@ -299,8 +307,9 @@ static bool tryObjdumpDisassemble(std::ostream &Result,
       if (Token.empty())
         continue;
 
-      if (Token.size() == 2 && llvm::isHexDigit(Token[0])
-          && llvm::isHexDigit(Token[1])) {
+      if (Token.size() == 2
+          && std::isxdigit(static_cast<unsigned char>(Token[0]))
+          && std::isxdigit(static_cast<unsigned char>(Token[1]))) {
         continue;
       }
 

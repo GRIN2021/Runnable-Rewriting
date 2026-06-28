@@ -32,7 +32,7 @@ bool FunctionCallIdentification::runOnModule(llvm::Module &M) {
   // Create function call marker
   // TODO: we could factor this out
   LLVMContext &C = M.getContext();
-  PointerType *Int8PtrTy = Type::getInt8PtrTy(C);
+  PointerType *Int8PtrTy = runnable_llvm::getInt8PtrTy(C);
   auto *Int8NullPtr = ConstantPointerNull::get(Int8PtrTy);
   auto *PCTy = IntegerType::get(C, GCBI.pcRegSize() * 8);
   auto *PCPtrTy = cast<PointerType>(GCBI.pcReg()->getType());
@@ -41,7 +41,9 @@ bool FunctionCallIdentification::runOnModule(llvm::Module &M) {
   };
   using FT = FunctionType;
   auto *Ty = FT::get(Type::getVoidTy(C), FunctionArgsTy, false);
-  Constant *FunctionCallC = M.getOrInsertFunction("function_call", Ty);
+  Constant *FunctionCallC = runnable_llvm::getOrInsertFunction(M,
+                                                               "function_call",
+                                                               Ty);
   FunctionCall = cast<Function>(FunctionCallC);
 
   // Initialize the function, if necessary

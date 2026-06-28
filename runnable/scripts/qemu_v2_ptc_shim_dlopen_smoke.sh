@@ -171,6 +171,9 @@ build_runnable_lift_ld_library_path() {
       ;;
   esac
 
+  if command -v llvm-config >/dev/null 2>&1; then
+    append_ld_dir "$(llvm-config --libdir)"
+  fi
   append_ld_dir "$RR_DIR/root/lib"
   printf '%s\n' "$RUNNABLE_LIFT_LD_LIBRARY_PATH"
 }

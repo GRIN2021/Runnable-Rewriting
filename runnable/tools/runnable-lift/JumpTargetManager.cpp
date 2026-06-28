@@ -25,9 +25,12 @@
 #include "llvm/ADT/PostOrderIterator.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/Function.h"
+#include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/InlineAsm.h"
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/Verifier.h"
+#include "llvm/Config/llvm-config.h"
 #include "llvm/Support/Endian.h"
 #include "llvm/Transforms/Scalar.h"
 #include "llvm/Transforms/Utils/Cloning.h"
@@ -56,6 +59,77 @@ Logger<> JTCountLog("jtcount");
 static bool inParallelWorkerMode() {
   const char *Value = std::getenv("RUNNABLE_PARALLEL_WORKER_MODE");
   return Value != nullptr && Value[0] == '1';
+}
+
+static Type *getPointerValueType(Value *Pointer) {
+  if (auto *Global = dyn_cast<GlobalVariable>(Pointer))
+    return Global->getValueType();
+
+#if LLVM_VERSION_MAJOR < 15
+  return Pointer->getType()->getPointerElementType();
+#else
+  runnable_abort("Cannot infer value type from an opaque pointer");
+  return nullptr;
+#endif
+}
+
+static LoadInst *createLoad(IRBuilder<> &Builder, Type *ValueType,
+                            Value *Pointer) {
+#if LLVM_VERSION_MAJOR >= 15
+  return Builder.CreateLoad(ValueType, Pointer);
+#else
+  (void) ValueType;
+  return Builder.CreateLoad(Pointer);
+#endif
+}
+
+static CallInst *createNoArgCall(IRBuilder<> &Builder, FunctionType *CalleeTy,
+                                 Value *Callee) {
+#if LLVM_VERSION_MAJOR >= 15
+  return Builder.CreateCall(CalleeTy, Callee, {});
+#else
+  (void) CalleeTy;
+  return Builder.CreateCall(Callee);
+#endif
+}
+
+static void insertMemoryBarrierBefore(Instruction *InsertBefore) {
+  LLVMContext &Context = InsertBefore->getContext();
+  auto *BarrierTy = FunctionType::get(Type::getVoidTy(Context), false);
+  auto *Barrier = InlineAsm::get(BarrierTy, "", "~{memory}", true);
+  IRBuilder<> Builder(InsertBefore);
+  createNoArgCall(Builder, BarrierTy, Barrier);
+}
+
+static std::vector<BasicBlock *>
+computePostOrder(BasicBlock *Start, const std::set<BasicBlock *> &Allowed) {
+  std::vector<BasicBlock *> Result;
+  std::set<BasicBlock *> Visited;
+  std::vector<std::pair<BasicBlock *, bool>> WorkList;
+  WorkList.push_back({ Start, false });
+
+  while (!WorkList.empty()) {
+    BasicBlock *BB = WorkList.back().first;
+    bool Expanded = WorkList.back().second;
+    WorkList.pop_back();
+
+    if (Allowed.count(BB) == 0)
+      continue;
+
+    if (Expanded) {
+      Result.push_back(BB);
+      continue;
+    }
+
+    if (!Visited.insert(BB).second)
+      continue;
+
+    WorkList.push_back({ BB, true });
+    for (BasicBlock *Successor : successors(BB))
+      WorkList.push_back({ Successor, false });
+  }
+
+  return Result;
 }
 
 cl::opt<bool> Statistics("Statistics",
@@ -114,7 +188,6 @@ char TranslateDirectBranchesPass::ID = 0;
 static bool isSumJump(StoreInst *PCWrite);
 
 void TranslateDirectBranchesPass::getAnalysisUsage(AnalysisUsage &AU) const {
-  AU.addRequired<DominatorTreeWrapperPass>();
   AU.addUsedIfAvailable<SETPass>();
   AU.setPreservesAll();
 }
@@ -135,6 +208,123 @@ static void exitTBCleanup(Instruction *ExitTBCall) {
   }
 }
 
+static bool hasTerminatorBefore(Instruction *TheInstruction) {
+  BasicBlock *BB = TheInstruction->getParent();
+  for (Instruction &Current : *BB) {
+    if (&Current == TheInstruction)
+      return false;
+    if (isa<TerminatorInst>(&Current))
+      return true;
+  }
+
+  return false;
+}
+
+static void eraseInstructionSuffix(Instruction *First) {
+  BasicBlock *BB = First->getParent();
+  auto It = First->getIterator();
+  while (It != BB->end()) {
+    Instruction *Current = &*It++;
+    Current->eraseFromParent();
+  }
+}
+
+static Optional<uint64_t> getConstantIntValue(Value *V) {
+  if (auto *Constant = dyn_cast<ConstantInt>(V))
+    return Constant->getZExtValue();
+  return None;
+}
+
+static Optional<uint64_t> getLocalConstantStoreBeforeLoad(LoadInst *Load) {
+  Value *Pointer = Load->getPointerOperand()->stripPointerCasts();
+  if (!isa<AllocaInst>(Pointer))
+    return None;
+
+  BasicBlock *BB = Load->getParent();
+  for (auto It = Load->getIterator(); It != BB->begin();) {
+    --It;
+    auto *Store = dyn_cast<StoreInst>(&*It);
+    if (Store == nullptr)
+      continue;
+
+    if (Store->getPointerOperand()->stripPointerCasts() != Pointer)
+      continue;
+
+    return getConstantIntValue(Store->getValueOperand());
+  }
+
+  return None;
+}
+
+Optional<uint64_t>
+JumpTargetManager::resolveCachedConstantIntegerStore(Value *Pointer) {
+  Value *Stripped = Pointer->stripPointerCasts();
+  if (!isa<AllocaInst>(Stripped))
+    return None;
+
+  auto ConstantIt = ConstantIntegerStoreCache.find(Stripped);
+  if (ConstantIt != ConstantIntegerStoreCache.end())
+    return ConstantIt->second;
+
+  if (NonConstantIntegerStoreCache.count(Stripped) != 0)
+    return None;
+
+  Optional<uint64_t> Result;
+  for (User *TheUser : Stripped->users()) {
+    if (auto *Store = dyn_cast<StoreInst>(TheUser)) {
+      if (Store->getPointerOperand()->stripPointerCasts() != Stripped) {
+        NonConstantIntegerStoreCache.insert(Stripped);
+        return None;
+      }
+
+      auto StoredValue = getConstantIntValue(Store->getValueOperand());
+      if (!StoredValue) {
+        NonConstantIntegerStoreCache.insert(Stripped);
+        return None;
+      }
+
+      if (Result && *Result != *StoredValue) {
+        NonConstantIntegerStoreCache.insert(Stripped);
+        return None;
+      }
+
+      Result = *StoredValue;
+      continue;
+    }
+
+    if (auto *Load = dyn_cast<LoadInst>(TheUser)) {
+      if (Load->getPointerOperand()->stripPointerCasts() == Stripped)
+        continue;
+    }
+
+    NonConstantIntegerStoreCache.insert(Stripped);
+    return None;
+  }
+
+  if (!Result) {
+    NonConstantIntegerStoreCache.insert(Stripped);
+    return None;
+  }
+
+  ConstantIntegerStoreCache[Stripped] = *Result;
+  return Result;
+}
+
+Optional<uint64_t>
+JumpTargetManager::resolveConstantPCStoreValue(Value *StoredValue) {
+  if (auto Constant = getConstantIntValue(StoredValue))
+    return Constant;
+
+  auto *Load = dyn_cast<LoadInst>(StoredValue);
+  if (Load == nullptr)
+    return None;
+
+  if (auto LocalStoreValue = getLocalConstantStoreBeforeLoad(Load))
+    return LocalStoreValue;
+
+  return resolveCachedConstantIntegerStore(Load->getPointerOperand());
+}
+
 bool TranslateDirectBranchesPass::pinJTs(Function &F) {
   const auto *SET = getAnalysisIfAvailable<SETPass>();
   if (SET == nullptr || SET->jumps().size() == 0)
@@ -142,7 +332,7 @@ bool TranslateDirectBranchesPass::pinJTs(Function &F) {
 
   LLVMContext &Context = getContext(&F);
   Value *PCReg = JTM->pcReg();
-  auto *RegType = cast<IntegerType>(PCReg->getType()->getPointerElementType());
+  auto *RegType = cast<IntegerType>(getPointerValueType(PCReg));
   auto C = [RegType](uint64_t A) { return ConstantInt::get(RegType, A); };
   BasicBlock *AnyPC = JTM->anyPC();
   BasicBlock *UnexpectedPC = JTM->unexpectedPC();
@@ -180,7 +370,7 @@ bool TranslateDirectBranchesPass::pinJTs(Function &F) {
     CallExitTB->setArgOperand(0, ExitTBArg);
 
     IRBuilder<> Builder(BB);
-    auto PCLoad = Builder.CreateLoad(PCReg);
+    auto PCLoad = createLoad(Builder, RegType, PCReg);
     if (Destinations.size() == 1) {
       auto *Comparison = Builder.CreateICmpEQ(C(Destinations[0]), PCLoad);
       Builder.CreateCondBr(Comparison,
@@ -217,19 +407,26 @@ bool TranslateDirectBranchesPass::pinJTs(Function &F) {
   return true;
 }
 
-bool TranslateDirectBranchesPass::pinConstantStore(Function &F) {
-  auto &Context = F.getParent()->getContext();
-
-  Function *ExitTB = JTM->exitTB();
-  auto ExitTBIt = ExitTB->use_begin();
-  while (ExitTBIt != ExitTB->use_end()) {
+bool JumpTargetManager::pinConstantDirectBranches() {
+  Function *ExitTBFunction = ExitTB;
+  auto ExitTBIt = ExitTBFunction->use_begin();
+  bool Changed = false;
+  unsigned PinnedQEMUV2BranchArms = 0;
+  unsigned PinnedQEMUV2LocalBackEdges = 0;
+  while (ExitTBIt != ExitTBFunction->use_end()) {
     // Take note of the use and increment the iterator immediately: this allows
     // us to erase the call to exit_tb without unexpected behaviors
     Use &ExitTBUse = *ExitTBIt++;
     if (auto Call = dyn_cast<CallInst>(ExitTBUse.getUser())) {
-      if (Call->getCalledFunction() == ExitTB) {
+      if (Call->getCalledFunction() == ExitTBFunction) {
+        if (hasTerminatorBefore(Call)) {
+          eraseInstructionSuffix(Call);
+          Changed = true;
+          continue;
+        }
+
         // Look for the last write to the PC
-        StoreInst *PCWrite = JTM->getPrevPCWrite(Call);
+        StoreInst *PCWrite = getPrevPCWrite(Call);
 
         // Is destination a constant?
         if (PCWrite == nullptr) {
@@ -239,41 +436,61 @@ bool TranslateDirectBranchesPass::pinConstantStore(Function &F) {
           //if (NextPC != 0 && not NoOSRA && isSumJump(PCWrite))
           //  JTM->registerJT(NextPC, JTReason::SumJump);
 
-          auto *Address = dyn_cast<ConstantInt>(PCWrite->getValueOperand());
-          if (Address != nullptr) {
+          auto Address = resolveConstantPCStoreValue(PCWrite->getValueOperand());
+          if (Address) {
             // Compute the actual PC and get the associated BasicBlock
-            uint64_t TargetPC = Address->getSExtValue();
-	    if(JTM->isIllegalStaticAddr(TargetPC))
+            uint64_t TargetPC = *Address;
+            if (isIllegalStaticAddr(TargetPC))
+              continue;
+            bool QEMUV2BranchArm = false;
+            bool QEMUV2LocalBackEdge = false;
+            if (ptc_compat::isPTCAbiV2()) {
+              BasicBlock *SourceBlock = Call->getParent();
+              QEMUV2BranchArm = SourceBlock->getName().contains("_L");
+              if (!QEMUV2BranchArm) {
+                uint64_t SourcePC = getBasicBlockPC(SourceBlock);
+                if (SourcePC != 0 && TargetPC <= SourcePC
+                    && SourcePC - TargetPC <= 0x1000)
+                  QEMUV2LocalBackEdge = true;
+              }
+
+              if (!QEMUV2BranchArm && !QEMUV2LocalBackEdge)
                 continue;
-            auto *TargetBlock = JTM->obtainJTBB(TargetPC, JTReason::DirectJump);
-	    if(TargetBlock==nullptr)
-		continue;
+            }
+            if (ptc_compat::isPTCAbiV2()) {
+              auto TargetIt = JumpTargets.find(TargetPC);
+              if (TargetIt == JumpTargets.end()
+                  || TargetIt->second.head()->empty()) {
+                runnable_log(RegisterJTLog,
+                             "Skipping unproven QEMU v2 direct target bb."
+                               << nameForAddress(TargetPC));
+                continue;
+              }
+            } else if (!hasJT(TargetPC)) {
+              runnable_log(RegisterJTLog,
+                           "Skipping unregistered direct target bb."
+                             << nameForAddress(TargetPC));
+              continue;
+            }
+            auto *TargetBlock = registerJT(TargetPC, JTReason::DirectJump);
+            if (TargetBlock == nullptr)
+              continue;
 
-            // Remove unreachable right after the exit_tb
-            BasicBlock::iterator CallIt(Call);
-            BasicBlock::iterator BlockEnd = Call->getParent()->end();
-            CallIt++;
-            runnable_assert(CallIt != BlockEnd && isa<UnreachableInst>(&*CallIt));
-            CallIt->eraseFromParent();
-
-            // Cleanup of what's afterwards (only a unconditional jump is
-            // allowed)
-            CallIt = BasicBlock::iterator(Call);
-            BlockEnd = Call->getParent()->end();
-            if (++CallIt != BlockEnd)
-              purgeBranch(CallIt);
+            exitTBCleanup(Call);
 
             if (TargetBlock != nullptr) {
               // A target was found, jump there
+              if (QEMUV2LocalBackEdge)
+                insertMemoryBarrierBefore(Call);
               BranchInst::Create(TargetBlock, Call);
-              JTM->newBranch();
-            } else {
-              // We're jumping to an invalid location, abort everything
-              // TODO: emit a warning
-              CallInst::Create(F.getParent()->getFunction("abort"), {}, Call);
-              new UnreachableInst(Context, Call);
+              newBranch();
+              if (QEMUV2BranchArm)
+                PinnedQEMUV2BranchArms++;
+              else if (QEMUV2LocalBackEdge)
+                PinnedQEMUV2LocalBackEdges++;
             }
             Call->eraseFromParent();
+            Changed = true;
           }
         }
       } else {
@@ -284,7 +501,19 @@ bool TranslateDirectBranchesPass::pinConstantStore(Function &F) {
     }
   }
 
-  return true;
+  if (ptc_compat::isPTCAbiV2()
+      && (PinnedQEMUV2BranchArms != 0 || PinnedQEMUV2LocalBackEdges != 0)) {
+    errs() << "runnable-lift: pinned QEMU v2 constant direct branches"
+           << " branch_arms=" << PinnedQEMUV2BranchArms
+           << " local_back_edges=" << PinnedQEMUV2LocalBackEdges << "\n";
+  }
+
+  return Changed;
+}
+
+bool TranslateDirectBranchesPass::pinConstantStore(Function &F) {
+  (void) F;
+  return JTM != nullptr && JTM->pinConstantDirectBranches();
 }
 
 bool TranslateDirectBranchesPass::forceFallthroughAfterHelper(CallInst *Call) {
@@ -293,7 +522,7 @@ bool TranslateDirectBranchesPass::forceFallthroughAfterHelper(CallInst *Call) {
     return false;
 
   auto *PCReg = JTM->pcReg();
-  auto PCRegTy = PCReg->getType()->getPointerElementType();
+  auto *PCRegTy = cast<IntegerType>(getPointerValueType(PCReg));
   bool ForceFallthrough = false;
 
   BasicBlock::reverse_iterator It(++Call->getReverseIterator());
@@ -346,8 +575,8 @@ bool TranslateDirectBranchesPass::forceFallthroughAfterHelper(CallInst *Call) {
   // possible simply jump to anyPC
   BasicBlock *NextPCBB = JTM->registerJT(NextPC, JTReason::PostHelper);
   if (NextPCBB != nullptr) {
-    Builder.CreateCondBr(Builder.CreateICmpEQ(Builder.CreateLoad(PCReg),
-                                              NextPCConst),
+    Builder.CreateCondBr(Builder.CreateICmpEQ(
+                           createLoad(Builder, PCRegTy, PCReg), NextPCConst),
                          NextPCBB,
                          JTM->anyPC());
   } else {
@@ -359,9 +588,8 @@ bool TranslateDirectBranchesPass::forceFallthroughAfterHelper(CallInst *Call) {
 
 bool TranslateDirectBranchesPass::runOnModule(Module &M) {
   Function &F = *M.getFunction("root");
-  pinConstantStore(F);
+  return pinConstantStore(F);
   //pinJTs(F);
-  return true;
 }
 
 uint64_t TranslateDirectBranchesPass::getNextPC(Instruction *TheInstruction) {
@@ -462,8 +690,16 @@ JumpTargetManager::JumpTargetManager(Function *TheFunction,
   FunctionType *ExitTBTy = FunctionType::get(Type::getVoidTy(Context),
                                              { Type::getInt32Ty(Context) },
                                              false);
-  ExitTB = cast<Function>(TheModule.getOrInsertFunction("exitTB", ExitTBTy));
+  ExitTB = cast<Function>(runnable_llvm::getOrInsertFunction(TheModule,
+                                                             "exitTB",
+                                                             ExitTBTy));
   createDispatcher(TheFunction, PCReg);
+
+  DataSegmStartAddr = 0;
+  DataSegmEndAddr = 0;
+  CodeSegmStartAddr = 0;
+  ro_StartAddr = 0;
+  ro_EndAddr = 0;
 
   for (auto &Segment : Binary.segments()){
     Segment.insertExecutableRanges(std::back_inserter(ExecutableRanges));
@@ -474,8 +710,6 @@ JumpTargetManager::JumpTargetManager(Function *TheFunction,
     if(Segment.IsExecutable)
       CodeSegmStartAddr = Segment.StartVirtualAddress;
   }
-  ro_StartAddr = 0;
-  ro_EndAddr =0;
   if(Binary.rodataStartAddr){
     ro_StartAddr = Binary.rodataStartAddr; 
     ro_EndAddr = Binary.ehframeEndAddr;
@@ -485,10 +719,13 @@ JumpTargetManager::JumpTargetManager(Function *TheFunction,
   if(SupportLib)
     CodeSegmStartAddr = Binary.entryPoint();  
 
-  // Configure GlobalValueNumbering
+  // Configure GlobalValueNumbering. LLVM 15+ no longer tolerates mutating
+  // these global command-line options at this point in process lifetime.
+#if LLVM_VERSION_MAJOR < 15
   StringMap<cl::Option *> &Options(cl::getRegisteredOptions());
   getOption<bool>(Options, "enable-load-pre")->setInitialValue(false);
   getOption<unsigned>(Options, "memdep-block-scan-limit")->setInitialValue(100);
+#endif
   // getOption<bool>(Options, "enable-pre")->setInitialValue(false);
   // getOption<uint32_t>(Options, "max-recurse-depth")->setInitialValue(10);
   haveBB = 0;
@@ -611,7 +848,7 @@ void JumpTargetManager::harvestGlobalData() {
     const unsigned char *DataStart = Data->getRawDataValues().bytes_begin();
     const unsigned char *DataEnd = Data->getRawDataValues().bytes_end();
 
-    using endianness = support::endianness;
+    using endianness = RunnableEndianness;
     if (Binary.architecture().pointerSize() == 64) {
       if (Binary.architecture().isLittleEndian())
         findCodePointers<uint64_t, endianness::little>(StartVirtualAddress,
@@ -638,14 +875,13 @@ void JumpTargetManager::harvestGlobalData() {
                                                  << Unexplored.size());
 }
 
-template<typename value_type, unsigned endian>
+template<typename value_type, RunnableEndianness endian>
 void JumpTargetManager::findCodePointers(uint64_t StartVirtualAddress,
                                          const unsigned char *Start,
                                          const unsigned char *End) {
-  using support::endianness;
   using support::endian::read;
   for (auto Pos = Start; Pos < End - sizeof(value_type); Pos++) {
-    uint64_t Value = read<value_type, static_cast<endianness>(endian), 1>(Pos);
+    uint64_t Value = read<value_type, endian, 1>(Pos);
     BasicBlock *Result = registerJT(Value, JTReason::GlobalData);
 
     if (Result != nullptr)
@@ -683,8 +919,16 @@ BasicBlock *JumpTargetManager::newPC(uint64_t PC, bool &ShouldContinue) {
           // We don't, OK let's explore it next
           Unexplored.erase(UnexploredIt);
         } else {
-          // We do, it will be purged at the next `peek`
-          runnable_assert(ToPurge.count(Result) != 0);
+          // We do. If this was created by splitting an already-translated block,
+          // it will be purged at the next `peek`. Otherwise this is a stale
+          // queued entry for a block that has since been translated; drop the
+          // queue entry and reuse the existing translation.
+          if (ToPurge.count(Result) == 0) {
+            runnable_log(RegisterJTLog,
+                         "Dropping stale queued translated bb."
+                           << nameForAddress(PC) << DoLog);
+            Unexplored.erase(UnexploredIt);
+          }
         }
 
         return Result;
@@ -694,7 +938,10 @@ BasicBlock *JumpTargetManager::newPC(uint64_t PC, bool &ShouldContinue) {
     // It wasn't planned to visit it, so we've already been there, just jump
     // there
     BasicBlock *BB = JTIt->second.head();
-    runnable_assert(!BB->empty());
+    if (BB->empty()) {
+      ShouldContinue = true;
+      return BB;
+    }
     ShouldContinue = false;
     return BB;
   }
@@ -1090,13 +1337,23 @@ private:
   std::queue<std::pair<BasicBlock *, uint64_t>> NewPC;
 };
 
+bool JumpTargetManager::translateDirectJumpTargets() {
+  if (ExitTB->use_empty())
+    return false;
+
+  size_t OldUnexploredSize = Unexplored.size();
+  unsigned OldNewBranches = NewBranches;
+
+  bool Changed = pinConstantDirectBranches();
+
+  return Changed
+         || Unexplored.size() != OldUnexploredSize
+         || NewBranches != OldNewBranches;
+}
+
 void JumpTargetManager::translateIndirectJumps() {
   if (ExitTB->use_empty())
     return;
-
-  legacy::PassManager AnalysisPM;
-  AnalysisPM.add(new TranslateDirectBranchesPass(this));
-  AnalysisPM.run(TheModule);
 
   auto I = ExitTB->use_begin();
 
@@ -1105,6 +1362,11 @@ void JumpTargetManager::translateIndirectJumps() {
      
     if (auto *Call = dyn_cast<CallInst>(ExitTBUse.getUser())) {
       if (Call->getCalledFunction() == ExitTB) {
+        if (hasTerminatorBefore(Call)) {
+          eraseInstructionSuffix(Call);
+          continue;
+        }
+
         // Look for the last write to the PC
         StoreInst *PCWrite = getPrevPCWrite(Call);
         if (PCWrite != nullptr) {
@@ -1142,13 +1404,27 @@ JumpTargetManager::BlockWithAddress JumpTargetManager::peek() {
     purgeTranslation(BB);
   ToPurge.clear();
 
-  if (Unexplored.empty())
-    return NoMoreTargets;
-  else {
+  while (!Unexplored.empty()) {
     BlockWithAddress Result = Unexplored.back();
+    if (isPC(Result.first)) {
+      haveBB = Result.second->empty() ? 0 : 1;
+      if (!Result.second->empty())
+        Unexplored.pop_back();
+      runnable_log(RegisterJTLog,
+                   "Peeking bb." << nameForAddress(Result.first)
+                                  << " empty="
+                                  << (Result.second->empty() ? "true" : "false")
+                                  << " remaining=" << Unexplored.size());
+      return Result;
+    }
+
     Unexplored.pop_back();
-    return Result;
+    errs() << "runnable-lift: dropping non-executable queued pc=0x"
+           << Twine::utohexstr(Result.first) << "\n";
   }
+
+  haveBB = 0;
+  return NoMoreTargets;
 }
 
 void JumpTargetManager::unvisit(BasicBlock *BB) {
@@ -1199,11 +1475,8 @@ void JumpTargetManager::purgeTranslation(BasicBlock *Start) {
   // Erase all the visited basic blocks
   std::set<BasicBlock *> Visited = Queue.visited();
 
-  // Build a subgraph, so that we can visit it in post order, and purge the
-  // content of each basic block
-  SubGraph<BasicBlock *> TranslatedBBs(Start, Visited);
-  for (auto *Node : post_order(TranslatedBBs)) {
-    BasicBlock *BB = Node->get();
+  // Visit the subgraph in post-order, so successors are purged before parents.
+  for (BasicBlock *BB : computePostOrder(Start, Visited)) {
     while (!BB->empty())
       eraseInstruction(&*(--BB->end()));
   }
@@ -1263,10 +1536,21 @@ JumpTargetManager::registerJT(uint64_t PC, JTReason::Values Reason) {
     // Case 1: there's already a BasicBlock for that address, return it
     BasicBlock *BB = TargetIt->second.head();
     TargetIt->second.setReason(Reason);
-    
-    haveBB = 1;
-    
-    unvisit(BB);
+
+    haveBB = BB->empty() ? 0 : 1;
+    if (BB->empty()) {
+      bool AlreadyQueued = false;
+      for (const BlockWithAddress &Queued : Unexplored) {
+        if (Queued.first == PC && Queued.second == BB) {
+          AlreadyQueued = true;
+          break;
+        }
+      }
+      if (!AlreadyQueued)
+        Unexplored.push_back(BlockWithAddress(PC, BB));
+    } else {
+      unvisit(BB);
+    }
     return BB;
   }
 
@@ -1304,8 +1588,7 @@ JumpTargetManager::registerJT(uint64_t PC, JTReason::Values Reason) {
   NewBlock->setName(compareBlockName(PC));
 
   // Create a case for the address associated to the new block
-  auto *PCRegType = PCReg->getType();
-  auto *SwitchType = cast<IntegerType>(PCRegType->getPointerElementType());
+  auto *SwitchType = cast<IntegerType>(getPointerValueType(PCReg));
   auto a = ConstantInt::get(SwitchType, PC);
   DispatcherSwitch->addCase(a, NewBlock);
 
@@ -1341,16 +1624,18 @@ void JumpTargetManager::createDispatcher(Function *OutputFunction,
 
   Module *TheModule = TheFunction->getParent();
   auto *UnknownPCTy = FunctionType::get(Type::getVoidTy(Context), {}, false);
-  Constant *UnknownPC = TheModule->getOrInsertFunction("unknownPC",
-                                                       UnknownPCTy);
-  Builder.CreateCall(cast<Function>(UnknownPC));
+  Constant *UnknownPC = runnable_llvm::getOrInsertFunction(*TheModule,
+                                                           "unknownPC",
+                                                           UnknownPCTy);
+  createNoArgCall(Builder, UnknownPCTy, UnknownPC);
   auto *FailUnreachable = Builder.CreateUnreachable();
   FailUnreachable->setMetadata("runnable.block.type",
                                QMD.tuple((uint32_t) DispatcherFailureBlock));
 
   // Switch on the first argument of the function
   Builder.SetInsertPoint(Entry);
-  Value *SwitchOn = Builder.CreateLoad(SwitchOnPtr);
+  Value *SwitchOn = createLoad(Builder, getPointerValueType(SwitchOnPtr),
+                               SwitchOnPtr);
   SwitchInst *Switch = Builder.CreateSwitch(SwitchOn, DispatcherFail);
   // The switch is the terminator of the dispatcher basic block
   Switch->setMetadata("runnable.block.type",
@@ -1441,7 +1726,7 @@ void JumpTargetManager::setCFGForm(CFGForm::Values NewForm) {
         if (isa<ConstantPointerNull>(Call->getArgOperand(0)))
           continue;
 
-        auto *Terminator = cast<TerminatorInst>(nextNonMarker(Call));
+        auto *Terminator = runnable_llvm::castTerminator(nextNonMarker(Call));
         runnable_assert(Terminator->getNumSuccessors() == 1);
 
         // Get the correct argument, the first is the callee, the second the
@@ -1488,8 +1773,7 @@ void JumpTargetManager::rebuildDispatcher() {
   while (NumCases-- > 0)
     DispatcherSwitch->removeCase(DispatcherSwitch->case_begin());
 
-  auto *PCRegType = PCReg->getType()->getPointerElementType();
-  auto *SwitchType = cast<IntegerType>(PCRegType);
+  auto *SwitchType = cast<IntegerType>(getPointerValueType(PCReg));
 
   // Add all the jump targets if we're using the SemanticPreservingCFG, or
   // only those with no predecessors otherwise
@@ -1507,7 +1791,7 @@ void JumpTargetManager::rebuildDispatcher() {
   if (CurrentCFGForm != CFGForm::SemanticPreservingCFG) {
     // Compute the set of reachable jump targets
     OnceQueue<BasicBlock *> WorkList;
-    for (BasicBlock *BB : DispatcherSwitch->successors())
+    for (BasicBlock *BB : runnable_llvm::successors(DispatcherSwitch))
       WorkList.insert(BB);
 
     while (not WorkList.empty()) {
@@ -1709,8 +1993,8 @@ void JumpTargetManager::searchpartCFG(std::map<llvm::BasicBlock *,llvm::BasicBlo
 
 uint32_t JumpTargetManager::belongToUBlock(llvm::BasicBlock *block){
   llvm::StringRef str = block->getName();
-  LLVM_NODISCARD size_t nPos1 = llvm::StringRef::npos;
-  LLVM_NODISCARD size_t nPos2 = llvm::StringRef::npos;
+  size_t nPos1 = llvm::StringRef::npos;
+  size_t nPos2 = llvm::StringRef::npos;
   llvm::StringRef substr = "";
   nPos1 = str.find_last_of(".");
   nPos2 = str.find_last_of(".",nPos1-1);
@@ -1733,12 +2017,16 @@ bool JumpTargetManager::isELFDataSegmAddr(uint64_t PC){
   bool flag = false;
   if(ro_StartAddr<=PC and PC<ro_EndAddr)
     flag = true;
-  return (ptc.is_image_addr(PC) or flag);
+  if (ptc.is_image_addr != nullptr)
+    return (ptc.is_image_addr(PC) or flag);
+  return (DataSegmStartAddr <= PC && PC < DataSegmEndAddr) or flag;
 }
 
 
 bool JumpTargetManager::isDataSegmAddr(uint64_t PC){
-  return ptc.is_image_addr(PC);  
+  if (ptc.is_image_addr != nullptr)
+    return ptc.is_image_addr(PC);
+  return DataSegmStartAddr <= PC && PC < DataSegmEndAddr;
 } 
 
 std::pair<bool, uint32_t> JumpTargetManager::islegalAddr(llvm::Value *v){
@@ -2381,8 +2669,7 @@ void JumpTargetManager::harvestBlockPCs(std::vector<uint64_t> &BlockPCs,llvm::Ba
 
   int i = 0;
   for(auto pc : BlockPCs){
-    if(!haveTranslatedPC(pc, 0) && !isIllegalStaticAddr(pc))    
-      StaticAddrs[pc] = false;
+    rememberStaticAddr(pc, false);
     i++;
     if(i>=3)
       break;
@@ -2789,7 +3076,7 @@ void JumpTargetManager::handleSuspectDataRegion(uint64_t start, uint64_t end){
     if(size==0)
       continue;
     if((addr + size) == end)
-      StaticAddrs[addr] = false;
+      rememberStaticAddr(addr, false);
 
   }
   *ptc.exception_syscall = tmp;
@@ -2980,11 +3267,18 @@ bool JumpTargetManager::isOutOfAddrRange(uint64_t pc){
   return (pc < AddrRangeMin || pc >= AddrRangeMax);
 }
 
+void JumpTargetManager::rememberStaticAddr(uint64_t PC, uint32_t Flag) {
+  if (!isPC(PC) || isOutOfAddrRange(PC) || isIllegalStaticAddr(PC))
+    return;
+
+  if (!haveTranslatedPC(PC, 0))
+    StaticAddrs[PC] = Flag;
+}
+
 void JumpTargetManager::harvestNextAddrofBr(){
   // *ptc.CFIAddr represents next block addr. 
   auto BlockNext = *ptc.CFIAddr;  
-  if(!haveTranslatedPC(BlockNext, 0))
-      StaticAddrs[BlockNext] = true;
+  rememberStaticAddr(BlockNext, true);
      
   if(Statistics){
       if(*ptc.isDirectJmp){
@@ -3051,7 +3345,8 @@ uint32_t JumpTargetManager::handleStaticAddr(void){
     auto it = UnexploreStaticAddr.begin();
     addr = it->first;
     flag = it->second;
-   if(haveTranslatedPC(addr, 0) or isIllegalStaticAddr(addr)){
+   if(!isPC(addr) or isOutOfAddrRange(addr) or haveTranslatedPC(addr, 0)
+      or isIllegalStaticAddr(addr)){
      if(flag==2)
        CallNextToStaticAddr(it->first);
      UnexploreStaticAddr.erase(it);
@@ -3072,7 +3367,8 @@ uint32_t JumpTargetManager::handleStaticAddr(void){
 void JumpTargetManager::StaticToUnexplore(void){
    for(auto& PC : StaticAddrs){
     BlockMap::iterator TargetIt = JumpTargets.find(PC.first);
-    if(TargetIt == JumpTargets.end() and !isIllegalStaticAddr(PC.first)){
+    if(TargetIt == JumpTargets.end() and isPC(PC.first)
+       and !isOutOfAddrRange(PC.first) and !isIllegalStaticAddr(PC.first)){
       UnexploreStaticAddr[PC.first] = PC.second;
     }
     // This Call-Next-Block has explored in recording branch exploration phase, 
@@ -3099,7 +3395,7 @@ void JumpTargetManager::CallNextToStaticAddr(uint32_t PC){
         count++;
         if(count>3)
           return;
-        StaticAddrs[addr] = false;
+        rememberStaticAddr(addr, false);
         //errs()<<format_hex(pc,0)<<" <- No Crash point, to explore next addr.\n";
       }
     }
@@ -3138,7 +3434,7 @@ uint64_t JumpTargetManager::getStaticAddrfromDestRegs(llvm::Instruction *I, uint
               auto op = REGLABLE(number);
               if(op==UndefineOP)
                   continue;
-              if(isExecutableAddress(ptc.regs[op]))
+              if(isPC(ptc.regs[op]))
                   return ptc.regs[op];
               if(ptc.regs[op] == 0)
                   flag = true;
@@ -3217,7 +3513,7 @@ void JumpTargetManager::registerJumpTable(llvm::BasicBlock *thisBlock,
     auto tmp = getStaticAddrfromDestRegs(add,thisAddr);
     if(tmp==1){
       if(*ptc.isIndirect or *ptc.isIndirectJmp){
-        if(isExecutableAddress(addr)){
+        if(isPC(addr)){
           JTAddr <<"---------> "<< std::hex << addr <<"\n";
           JTtargets.insert(addr);
           continue;
@@ -3972,8 +4268,10 @@ void JumpTargetManager::harvestBTBasicBlock(llvm::BasicBlock *thisBlock,
     if(std::get<0>(item) == destAddr)
         return;
   }
-  if(!haveTranslatedPC(destAddr, 0) && !isOutOfAddrRange(destAddr)){
-      ptc.storeCPUState();
+  if(!haveTranslatedPC(destAddr, 0) && isPC(destAddr) && !isOutOfAddrRange(destAddr)){
+      if (!ptc_compat::hasStoreCPUState(ptc))
+        runnable_abort("PTC backend is missing storeCPUState");
+      ptc_compat::storeCPUState(ptc);
       /* Recording not execute branch destination relationship with current BasicBlock */
      // thisBlock = nullptr; 
       BranchTargets.push_back(std::make_tuple(destAddr,thisBlock,thisAddr)); 
@@ -4685,24 +4983,38 @@ uint32_t JumpTargetManager::StrToInt(const char *str){
 }
 
 void JumpTargetManager::harvestCallBasicBlock(llvm::BasicBlock *thisBlock,uint64_t thisAddr){
+  harvestCallBasicBlock(thisBlock, thisAddr, *ptc.CallNext);
+}
+
+void JumpTargetManager::harvestCallBasicBlock(llvm::BasicBlock *thisBlock,
+                                              uint64_t thisAddr,
+                                              uint64_t ReturnPC){
+  if(CallBranches.find(ReturnPC) == CallBranches.end())
+    CallBranches[ReturnPC] = 1;
   if(Statistics){
-    IndirectBlocksMap::iterator it = CallBranches.find(*ptc.CallNext);
+    IndirectBlocksMap::iterator it = CallBranches.find(ReturnPC);
     if(it == CallBranches.end())
-      CallBranches[*ptc.CallNext] = 1;
+      CallBranches[ReturnPC] = 1;
   }
-  if(!haveTranslatedPC(*ptc.CallNext, 0))
-      StaticAddrs[*ptc.CallNext] = 2;
+  rememberStaticAddr(ReturnPC, 2);
   if (inParallelWorkerMode())
     return;
   for(auto item : BranchTargets){
-    if(std::get<0>(item) == *ptc.CallNext)
+    if(std::get<0>(item) == ReturnPC)
         return;
   }
 
-  if(!haveTranslatedPC(*ptc.CallNext, 0)){
+  if(!isPC(ReturnPC) || isOutOfAddrRange(ReturnPC))
+    return;
+
+  if(JumpTargets.find(ReturnPC) == JumpTargets.end()){
       /* Construct a state that have executed a call to next instruction of CPU state */
       ptc.regs[R_ESP] = ptc.regs[R_ESP] + 8;
-      auto success  = ptc.storeCPUState();
+      bool success = true;
+      if (!ptc_compat::hasStoreCPUState(ptc))
+        success = false;
+      else
+        success = ptc_compat::storeCPUState(ptc) != 0;
       if(!success){
         haveBB = 1;
         *ptc.exception_syscall = -1;
@@ -4718,8 +5030,8 @@ void JumpTargetManager::harvestCallBasicBlock(llvm::BasicBlock *thisBlock,uint64
        * So,this Block will not contain a call instruction, that has been splited
        * but we still record this relationship, because when we backtracking,
        * we will check splited Block. */ 
-      if(!isOutOfAddrRange(*ptc.CallNext)){
-        BranchTargets.push_back(std::make_tuple(*ptc.CallNext,thisBlock,thisAddr));
+      if(isPC(ReturnPC) && !isOutOfAddrRange(ReturnPC)){
+        BranchTargets.push_back(std::make_tuple(ReturnPC,thisBlock,thisAddr));
       }
     }
 }
@@ -4782,16 +5094,18 @@ void JumpTargetManager::harvestbranchBasicBlock(uint64_t nextAddr,
           /* Recording current CPU state */
           if(!isDataSegmAddr(ptc.regs[R_ESP]) and isDataSegmAddr(ptc.regs[R_EBP]))
               ptc.regs[R_ESP] = ptc.regs[R_EBP];
-	  if(isDataSegmAddr(ptc.regs[R_ESP]) and !isDataSegmAddr(ptc.regs[R_EBP]))
-	      ptc.regs[R_EBP] = ptc.regs[R_ESP] + 256;
-	  ptc.regs[R_ESP] = *ptc.ElfStartStack - 512;
-	  ptc.regs[R_EBP] = ptc.regs[R_ESP] + 256;
-          auto success = ptc.storeCPUState();
-	  if(!success)
-	    runnable_abort("Store memory state failed!\n");
-          /* Recording not execute branch destination relationship 
-	   * with current BasicBlock and address */ 
-          if(!isOutOfAddrRange(destAddrSrcBB.first)){
+		  if(isDataSegmAddr(ptc.regs[R_ESP]) and !isDataSegmAddr(ptc.regs[R_EBP]))
+		      ptc.regs[R_EBP] = ptc.regs[R_ESP] + 256;
+		  ptc.regs[R_ESP] = *ptc.ElfStartStack - 512;
+		  ptc.regs[R_EBP] = ptc.regs[R_ESP] + 256;
+	          if (!ptc_compat::hasStoreCPUState(ptc))
+		    runnable_abort("PTC backend is missing storeCPUState");
+	          auto success = ptc_compat::storeCPUState(ptc);
+		  if(!success)
+		    runnable_abort("Store memory state failed!\n");
+		          /* Recording not execute branch destination relationship
+			   * with current BasicBlock and address */
+	          if(isPC(destAddrSrcBB.first) && !isOutOfAddrRange(destAddrSrcBB.first)){
             BranchTargets.push_back(std::make_tuple(
 				destAddrSrcBB.first,
 				//destAddrSrcBB.second,

@@ -10,6 +10,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 RR_DIR="$(cd "$SCRIPT_DIR/../.." && pwd -P)"
+LEGACY_QEMU_DIR="${RUNNABLE_QEMU_LEGACY_SRC:-$RR_DIR/archive/qemu-legacy-2.4.50}"
 
 QEMU_SRC=""
 OUT_DIR=""
@@ -121,8 +122,8 @@ if [[ -e "$OUT_DIR_ABS" ]]; then
   rm -rf "$OUT_DIR_ABS"
 fi
 
-PTC_HEADER_SRC="$RR_DIR/qemu/linux-user/ptc.h"
-TCG_OPC_SRC="$RR_DIR/qemu/tcg/tcg-opc.h"
+PTC_HEADER_SRC="$LEGACY_QEMU_DIR/linux-user/ptc.h"
+TCG_OPC_SRC="$LEGACY_QEMU_DIR/tcg/tcg-opc.h"
 [[ -f "$PTC_HEADER_SRC" ]] || die "legacy PTC header not found: $PTC_HEADER_SRC"
 [[ -f "$TCG_OPC_SRC" ]] || die "legacy tcg-opc.h not found: $TCG_OPC_SRC"
 
@@ -142,8 +143,8 @@ Generated from:
 - QEMU source: \`$QEMU_SRC_ABS\`
 - QEMU version: \`$QEMU_VERSION\`
 - Runnable-Rewriting source: \`$RR_DIR\`
-- Copied legacy ABI header: \`qemu/linux-user/ptc.h\`
-- Copied legacy opcode list: \`qemu/tcg/tcg-opc.h\`
+- Copied legacy ABI header: \`$PTC_HEADER_SRC\`
+- Copied legacy opcode list: \`$TCG_OPC_SRC\`
 
 This tree is a standalone load-smoke stub project. It does not build QEMU
 itself and it does not translate guest code yet. Its purpose is narrower:

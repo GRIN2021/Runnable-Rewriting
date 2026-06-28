@@ -42,16 +42,7 @@ public:
   bool runOnModule(llvm::Module &M) override;
 
   llvm::CallInst *getCall(llvm::Instruction *I) const {
-    return getCall(llvm::cast<llvm::TerminatorInst>(I));
-  }
-
-  llvm::CallInst *getCall(llvm::BasicBlock *BB) const {
-    return getCall(BB->getTerminator());
-  }
-
-  /// \brief Return true if \p T is a function call in the input assembly
-  llvm::CallInst *getCall(llvm::TerminatorInst *T) const {
-    runnable_assert(T != nullptr);
+    auto *T = runnable_llvm::castTerminator(I);
     llvm::Instruction *Previous = getPrevious(T);
     while (Previous != nullptr && isMarker(Previous)) {
       auto *Call = llvm::cast<llvm::CallInst>(Previous);
@@ -64,9 +55,11 @@ public:
     return nullptr;
   }
 
-  /// \brief Return true if \p T is a function call in the input assembly
-  bool isCall(llvm::TerminatorInst *T) const { return getCall(T) != nullptr; }
+  llvm::CallInst *getCall(llvm::BasicBlock *BB) const {
+    return getCall(BB->getTerminator());
+  }
 
+  /// \brief Return true if \p I is a function call in the input assembly
   bool isCall(llvm::Instruction *I) const { return getCall(I) != nullptr; }
 
   bool isCall(llvm::BasicBlock *BB) const {
@@ -77,8 +70,8 @@ public:
     return getFallthrough(BB->getTerminator());
   }
 
-  llvm::BasicBlock *getFallthrough(llvm::TerminatorInst *T) const {
-    runnable_assert(T != nullptr);
+  llvm::BasicBlock *getFallthrough(llvm::Instruction *I) const {
+    auto *T = runnable_llvm::castTerminator(I);
     llvm::Instruction *Previous = getPrevious(T);
     while (Previous != nullptr && isMarker(Previous)) {
       auto *Call = llvm::cast<llvm::CallInst>(Previous);
@@ -101,7 +94,8 @@ public:
     return isFallthrough(getBasicBlockPC(BB));
   }
 
-  bool isFallthrough(llvm::TerminatorInst *I) const {
+  bool isFallthrough(llvm::Instruction *I) const {
+    runnable_llvm::castTerminator(I);
     return isFallthrough(I->getParent());
   }
 

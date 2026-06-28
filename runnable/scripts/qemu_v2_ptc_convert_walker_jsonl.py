@@ -192,10 +192,10 @@ def nullable_bool(value: Any) -> bool | None:
 
 
 def canonical_name(raw_name: str, record: dict[str, Any], tcg_type_info: dict[int, dict[str, Any]]) -> str:
-    if raw_name == "extract":
+    if raw_name in {"extract", "sextract"}:
         tcg_type = decode_tcg_type(record.get("param1"), tcg_type_info)
         if tcg_type.get("abi") in {"i32", "i64", "i128"}:
-            return f"extract_{tcg_type['abi']}"
+            return f"{raw_name}_{tcg_type['abi']}"
     return raw_name
 
 
@@ -499,6 +499,7 @@ def convert_record(
             "arg_count": record.get("arg_count"),
             "op_capacity": record.get("op_capacity"),
             "args_truncated": record.get("args_truncated"),
+            "call_helper": record.get("call_helper") if isinstance(record.get("call_helper"), dict) else None,
         },
         "decision": {
             "manifest_category": category,

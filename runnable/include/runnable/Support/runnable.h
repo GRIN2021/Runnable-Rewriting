@@ -8,13 +8,24 @@
 // Standard includes
 #include <cstdint>
 #include <iterator>
+#include <map>
 #include <string>
 #include <vector>
 
 // LLVM includes
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/StringRef.h"
+#if defined(__has_include)
+#if __has_include("llvm/ADT/Triple.h")
 #include "llvm/ADT/Triple.h"
+#elif __has_include("llvm/TargetParser/Triple.h")
+#include "llvm/TargetParser/Triple.h"
+#else
+#error "Cannot find an LLVM Triple.h header"
+#endif
+#else
+#include "llvm/ADT/Triple.h"
+#endif
 #include "llvm/BinaryFormat/ELF.h"
 
 // Local libraries includes
