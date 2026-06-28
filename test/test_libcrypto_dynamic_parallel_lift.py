@@ -1506,6 +1506,34 @@ class LibcryptoDynamicParallelLiftTests(unittest.TestCase):
         self.assertGreater(len(seeds), 1000)
         self.assertEqual(seeds[0].start, min(seed.start for seed in seeds))
 
+    def test_readelf_function_seeds_accepts_hex_symbol_sizes(self):
+        module = load_module()
+        readelf_stdout = """\
+Symbol table '.dynsym' contains 2 entries:
+     1: 0000000000001000    64 FUNC    GLOBAL DEFAULT   13 exported_func
+Symbol table '.symtab' contains 4 entries:
+     2: 0000000000210da0 0x526ea FUNC    LOCAL  DEFAULT   13 ossl_aes_gcm_encrypt_avx512
+     3: 00000000002634a0 0x526e6 FUNC    LOCAL  DEFAULT   13 ossl_aes_gcm_decrypt_avx512
+     4: 0000000000002000    63 FUNC    LOCAL  DEFAULT   13 too_small
+"""
+
+        with mock.patch.object(
+            module, "run_cmd", return_value=mock.Mock(stdout=readelf_stdout)
+        ):
+            seeds = module.readelf_function_seeds(Path("/tmp/libcrypto.so.3"), min_function_size=64)
+
+        by_name = {seed.name: seed for seed in seeds}
+        self.assertEqual(by_name["exported_func"].size, 64)
+        self.assertEqual(by_name["exported_func"].binding, "dynsym")
+        self.assertEqual(by_name["ossl_aes_gcm_encrypt_avx512"].size, 0x526EA)
+        self.assertEqual(
+            by_name["ossl_aes_gcm_encrypt_avx512"].end_exclusive,
+            0x210DA0 + 0x526EA,
+        )
+        self.assertEqual(by_name["ossl_aes_gcm_encrypt_avx512"].binding, "symtab")
+        self.assertEqual(by_name["ossl_aes_gcm_decrypt_avx512"].size, 0x526E6)
+        self.assertNotIn("too_small", by_name)
+
     def test_seed_start_can_target_a_specific_libcrypto_function(self):
         module = load_module()
         binary = (

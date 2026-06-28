@@ -52,7 +52,7 @@ SYSTEM_LLVM_LIB_DIRS = ("/usr/lib/llvm-18/lib", "/usr/lib/llvm-17/lib", "/usr/li
 LEGACY_RUNNABLE_ROOT = "/root/Runnable-Rewriting/root"
 SHARD_RUNNER_SCRIPT = SCRIPT_DIR / "libcrypto_parallel_shard_runner.py"
 READ_ELF_FUNC_RE = re.compile(
-    r"^\s*\d+:\s*([0-9a-fA-F]+)\s+(\d+)\s+FUNC\s+\w+\s+\w+\s+(\w+)\s+(.*)$"
+    r"^\s*\d+:\s*([0-9a-fA-F]+)\s+(\S+)\s+FUNC\s+\w+\s+\w+\s+(\w+)\s+(.*)$"
 )
 
 
@@ -855,7 +855,7 @@ def readelf_function_seeds(binary: Path, min_function_size: int) -> List[SeedFun
         if match is None:
             continue
         value = int(match.group(1), 16)
-        size = int(match.group(2))
+        size = int(match.group(2), 0)
         ndx = match.group(3)
         raw_name = match.group(4).strip()
         if ndx == "UND" or value == 0 or size < min_function_size or not raw_name:
