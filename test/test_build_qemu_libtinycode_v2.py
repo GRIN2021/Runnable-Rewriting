@@ -102,6 +102,57 @@ def write_replay_fixture(root: Path) -> tuple[Path, Path, Path]:
     return payload, model, summary
 
 
+def make_fake_docker(root: Path) -> tuple[Path, Path]:
+    docker = root / "docker"
+    marker = root / "docker-invoked.marker"
+    docker.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        f"printf '%s\\n' \"$*\" > '{marker}'\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    docker.chmod(docker.stat().st_mode | stat.S_IXUSR)
+    return docker, marker
+
+
+def make_fake_live_sidecar_override(root: Path, metadata_text: str) -> Path:
+    script = root / "fake-live-sidecar.sh"
+    script.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        "scratch_root=''\n"
+        "while [[ $# -gt 0 ]]; do\n"
+        "  case \"$1\" in\n"
+        "    --scratch-root)\n"
+        "      scratch_root=\"$2\"\n"
+        "      shift 2\n"
+        "      ;;\n"
+        "    *)\n"
+        "      shift\n"
+        "      ;;\n"
+        "  esac\n"
+        "done\n"
+        "[[ -n \"$scratch_root\" ]]\n"
+        "mkdir -p \"$scratch_root/sidecar\"\n"
+        "cat > \"$scratch_root/libtinycode.c\" <<'EOF_C'\n"
+        "#include <stddef.h>\n"
+        "int ptc_load(void) { return 0; }\n"
+        f"const char *ptc_get_abi_metadata(void) {{ return \"{metadata_text}\"; }}\n"
+        "EOF_C\n"
+        "cc -shared -fPIC \"$scratch_root/libtinycode.c\" -o \"$scratch_root/libtinycode-x86_64.so\"\n"
+        "cat > \"$scratch_root/sidecar/sidecar.model.json\" <<'EOF_MODEL'\n"
+        "{\"schema\":\"qemu-v2-ptc-live-sidecar-model-v1\",\"helper_defs\":[],\"instructions\":[],\"temps\":[]}\n"
+        "EOF_MODEL\n"
+        "cat > \"$scratch_root/sidecar/sidecar.summary.json\" <<'EOF_SUMMARY'\n"
+        "{\"payload_instruction_count\":1,\"selected_instruction_count\":1,\"source_instruction_count\":1,\"rejected_instruction_count\":0}\n"
+        "EOF_SUMMARY\n",
+        encoding="utf-8",
+    )
+    script.chmod(script.stat().st_mode | stat.S_IXUSR)
+    return script
+
+
 class BuildQemuLibtinycodeV2Tests(unittest.TestCase):
     def run_script(self, *args: str, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
         merged_env = os.environ.copy()
@@ -156,6 +207,76 @@ class BuildQemuLibtinycodeV2Tests(unittest.TestCase):
         self.assertIn("QEMU 10.2.3 source tree", combined)
         self.assertIn("10.2.2", combined)
         self.assertNotIn("not implemented yet", combined)
+
+    def test_libtinycode_host_docker_mode_rejects_wrong_qemu_version_before_docker(self) -> None:
+        host_qemu_root = REPO_ROOT / "tmp-test-qemu-host-docker"
+        host_qemu_root.mkdir(exist_ok=True)
+        qemu = make_fake_qemu_source(host_qemu_root, "10.2.2")
+        with tempfile.TemporaryDirectory(dir=REPO_ROOT) as tmp:
+            root = Path(tmp)
+            docker_dir = root / "bin"
+            docker_dir.mkdir()
+            _, docker_marker = make_fake_docker(docker_dir)
+            build_dir = root / "build"
+            install_dir = root / "install"
+
+            result = self.run_script(
+                "--libtinycode",
+                "--qemu-src",
+                str(qemu),
+                "--build-dir",
+                str(build_dir),
+                "--install-dir",
+                str(install_dir),
+                "--skip-image-build",
+                env={
+                    "PATH": f"{docker_dir}:{os.environ['PATH']}",
+                    "RUNNABLE_QEMU_V2_IN_CONTAINER": "0",
+                },
+            )
+
+        shutil.rmtree(host_qemu_root)
+        self.assertNotEqual(result.returncode, 0)
+        combined = result.stdout + result.stderr
+        self.assertIn("VERSION=10.2.3", combined)
+        self.assertIn("10.2.2", combined)
+        self.assertFalse(docker_marker.exists(), "docker should not be invoked for wrong QEMU source")
+
+    def test_libtinycode_host_docker_mode_reports_replay_paths_outside_repo(self) -> None:
+        host_qemu_root = REPO_ROOT / "tmp-test-qemu-replay-host-docker"
+        host_qemu_root.mkdir(exist_ok=True)
+        qemu = make_fake_qemu_10_2_3(host_qemu_root)
+        with tempfile.TemporaryDirectory(dir=REPO_ROOT) as repo_tmp, tempfile.TemporaryDirectory() as external_tmp:
+            repo_root = Path(repo_tmp)
+            docker_dir = repo_root / "bin"
+            docker_dir.mkdir()
+            _, docker_marker = make_fake_docker(docker_dir)
+            external_payload = Path(external_tmp) / "payload.txt"
+            external_payload.write_text("payload\n", encoding="utf-8")
+
+            result = self.run_script(
+                "--libtinycode",
+                "--qemu-src",
+                str(qemu),
+                "--build-dir",
+                str(repo_root / "build"),
+                "--install-dir",
+                str(repo_root / "install"),
+                "--replay-payload",
+                str(external_payload),
+                "--skip-image-build",
+                env={
+                    "PATH": f"{docker_dir}:{os.environ['PATH']}",
+                    "RUNNABLE_QEMU_V2_IN_CONTAINER": "0",
+                },
+            )
+
+        shutil.rmtree(host_qemu_root)
+        self.assertNotEqual(result.returncode, 0)
+        combined = result.stdout + result.stderr
+        self.assertIn("--replay-payload", combined)
+        self.assertIn("repository root", combined)
+        self.assertFalse(docker_marker.exists(), "docker should not be invoked for unsupported replay input paths")
 
     def test_libtinycode_mode_installs_live_sidecar_artifacts_from_replay_fixture(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -217,6 +338,31 @@ class BuildQemuLibtinycodeV2Tests(unittest.TestCase):
             metadata_text = raw_metadata.decode("utf-8")
             self.assertIn("abi_version=2", metadata_text)
             self.assertIn("real_translation=true", metadata_text)
+
+    def test_libtinycode_mode_rejects_forbidden_empty_stub_metadata_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            qemu = make_fake_qemu_10_2_3(root)
+            fake_live_sidecar = make_fake_live_sidecar_override(
+                root,
+                "abi_version=2\\nreal_translation=true\\nREAL_PTC_TRANSLATION=not-migrated-empty-stub\\n",
+            )
+            result = self.run_script(
+                "--libtinycode",
+                "--no-docker",
+                "--qemu-src",
+                str(qemu),
+                "--build-dir",
+                str(root / "build"),
+                "--install-dir",
+                str(root / "install"),
+                env={"RUNNABLE_QEMU_V2_LIVE_SIDECAR_SCRIPT_OVERRIDE": str(fake_live_sidecar)},
+            )
+
+        self.assertNotEqual(result.returncode, 0)
+        combined = result.stdout + result.stderr
+        self.assertIn("REAL_PTC_TRANSLATION=not-migrated-empty-stub", combined)
+        self.assertNotIn("LIBTINYCODE_V2_BUILD_OK=1", combined)
 
     def test_helper_generator_emits_sentinel_when_helper_defs_missing_or_empty(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

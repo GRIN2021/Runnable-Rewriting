@@ -152,6 +152,21 @@ is_qemu_10_2_3_tree() {
   [[ "$(tr -d '[:space:]' < "$dir/VERSION")" == "10.2.3" ]]
 }
 
+require_qemu_10_2_3_tree() {
+  local input="$1"
+  local qemu_src_abs qemu_version
+
+  qemu_src_abs="$(resolve_existing_dir "$input" "QEMU 10.2.3 source tree")"
+  [[ -f "$qemu_src_abs/meson.build" ]] || die "QEMU 10.2.3 source tree is missing meson.build: $qemu_src_abs"
+  [[ -x "$qemu_src_abs/configure" ]] || die "QEMU 10.2.3 source tree is missing executable configure: $qemu_src_abs"
+  [[ -f "$qemu_src_abs/VERSION" ]] || die "QEMU 10.2.3 source tree is missing VERSION: $qemu_src_abs"
+  qemu_version="$(tr -d '[:space:]' < "$qemu_src_abs/VERSION")"
+  [[ "$qemu_version" == "10.2.3" ]] || \
+    die "QEMU 10.2.3 source tree expected VERSION=10.2.3, found $qemu_version at $qemu_src_abs"
+
+  printf '%s\n' "$qemu_src_abs"
+}
+
 auto_detect_qemu_10_2_3_src() {
   local search_root version_file dir
   local -a candidates=()
@@ -214,6 +229,21 @@ container_repo_path() {
   fi
 }
 
+container_repo_path_for_arg() {
+  local input="$1"
+  local flag="$2"
+  local abs="$3"
+
+  case "$abs" in
+    "$RR_DIR"|"$RR_DIR"/*)
+      container_repo_path "$abs"
+      ;;
+    *)
+      die "$flag must resolve under the repository root for host-side Docker handoff: $input -> $abs"
+      ;;
+  esac
+}
+
 build_ptc_shim_stub() {
   local qemu_src_abs out_dir_abs artifact generator
 
@@ -221,14 +251,11 @@ build_ptc_shim_stub() {
   [[ -f "$generator" ]] || die "PTC shim generator not found: $generator"
 
   if [[ "$QEMU_SRC_SET" -eq 1 ]]; then
-    qemu_src_abs="$(resolve_existing_dir "$QEMU_SRC" "QEMU 10.2.3 source tree")"
+    qemu_src_abs="$(require_qemu_10_2_3_tree "$QEMU_SRC")"
   else
     qemu_src_abs="$(auto_detect_qemu_10_2_3_src)" || \
       die "could not auto-detect QEMU 10.2.3 source; pass --qemu-src"
   fi
-
-  is_qemu_10_2_3_tree "$qemu_src_abs" || \
-    die "expected QEMU 10.2.3 source with meson.build and executable configure: $qemu_src_abs"
 
   out_dir_abs="$(resolve_tmp_output_dir "$PTC_SHIM_OUT_DIR")"
   artifact="$out_dir_abs/build/libtinycode-x86_64.so"
@@ -264,20 +291,15 @@ build_libtinycode_v2() {
   local lib_so helper_ir metadata_json sidecar_model sidecar_summary qemu_version
   local -a live_args
 
-  live_script="$SCRIPT_DIR/qemu_v2_ptc_live_sidecar_translate_smoke.sh"
+  live_script="${RUNNABLE_QEMU_V2_LIVE_SIDECAR_SCRIPT_OVERRIDE:-$SCRIPT_DIR/qemu_v2_ptc_live_sidecar_translate_smoke.sh}"
   helper_generator="$SCRIPT_DIR/qemu_v2_generate_libtinycode_helpers.py"
   legacy_qemu_dir="${RUNNABLE_QEMU_LEGACY_SRC:-$RR_DIR/archive/qemu-legacy-2.4.50}"
 
   [[ -f "$live_script" ]] || die "live-sidecar builder not found: $live_script"
   [[ -f "$helper_generator" ]] || die "helper IR generator not found: $helper_generator"
 
-  qemu_src_abs="$(resolve_existing_dir "$QEMU_SRC" "QEMU 10.2.3 source tree")"
-  [[ -f "$qemu_src_abs/meson.build" ]] || die "QEMU 10.2.3 source tree is missing meson.build: $qemu_src_abs"
-  [[ -x "$qemu_src_abs/configure" ]] || die "QEMU 10.2.3 source tree is missing executable configure: $qemu_src_abs"
-  [[ -f "$qemu_src_abs/VERSION" ]] || die "QEMU 10.2.3 source tree is missing VERSION: $qemu_src_abs"
+  qemu_src_abs="$(require_qemu_10_2_3_tree "$QEMU_SRC")"
   qemu_version="$(tr -d '[:space:]' < "$qemu_src_abs/VERSION")"
-  [[ "$qemu_version" == "10.2.3" ]] || \
-    die "QEMU 10.2.3 source tree expected VERSION=10.2.3, found $qemu_version at $qemu_src_abs"
 
   build_dir_abs="$(resolve_output_dir "$BUILD_DIR")"
   install_dir_abs="$(resolve_output_dir "$INSTALL_DIR")"
@@ -371,6 +393,9 @@ text = metadata.decode("utf-8", errors="replace")
 for field in ("abi_version=2", "real_translation=true"):
     if field not in text:
         raise SystemExit(f"ptc_get_abi_metadata missing {field}: {text}")
+forbidden_marker = "REAL_PTC_TRANSLATION=not-migrated-empty-stub"
+if forbidden_marker in text:
+    raise SystemExit(f"ptc_get_abi_metadata contains forbidden marker {forbidden_marker}: {text}")
 print(text, end="" if text.endswith("\n") else "\n")
 PY
 
@@ -455,8 +480,8 @@ if [[ "$MODE" == "libtinycode" ]]; then
   if ! [[ "$JOBS" =~ ^[0-9]+$ ]] || [[ "$JOBS" -lt 1 ]]; then
     die "--jobs must be a positive integer: $JOBS"
   fi
-  if [[ "$USE_DOCKER" != "never" && ! is_container ]]; then
-    QEMU_SRC_ABS="$(resolve_existing_dir "$QEMU_SRC" "QEMU 10.2.3 source tree")"
+  if [[ "$USE_DOCKER" != "never" ]] && ! is_container; then
+    QEMU_SRC_ABS="$(require_qemu_10_2_3_tree "$QEMU_SRC")"
     BUILD_DIR_ABS="$(resolve_output_dir "$BUILD_DIR")"
     INSTALL_DIR_ABS="$(resolve_output_dir "$INSTALL_DIR")"
     QEMU_SRC_CONTAINER="$(container_repo_path "$QEMU_SRC_ABS")"
@@ -481,13 +506,16 @@ if [[ "$MODE" == "libtinycode" ]]; then
       --jobs "$JOBS"
     )
     if [[ -n "$REPLAY_PAYLOAD" ]]; then
-      DOCKER_ARGS+=(--replay-payload "$(container_repo_path "$(input_to_path "$REPLAY_PAYLOAD")")")
+      REPLAY_PAYLOAD_ABS="$(input_to_path "$REPLAY_PAYLOAD")"
+      DOCKER_ARGS+=(--replay-payload "$(container_repo_path_for_arg "$REPLAY_PAYLOAD" "--replay-payload" "$REPLAY_PAYLOAD_ABS")")
     fi
     if [[ -n "$REPLAY_MODEL" ]]; then
-      DOCKER_ARGS+=(--replay-model "$(container_repo_path "$(input_to_path "$REPLAY_MODEL")")")
+      REPLAY_MODEL_ABS="$(input_to_path "$REPLAY_MODEL")"
+      DOCKER_ARGS+=(--replay-model "$(container_repo_path_for_arg "$REPLAY_MODEL" "--replay-model" "$REPLAY_MODEL_ABS")")
     fi
     if [[ -n "$REPLAY_SUMMARY" ]]; then
-      DOCKER_ARGS+=(--replay-summary "$(container_repo_path "$(input_to_path "$REPLAY_SUMMARY")")")
+      REPLAY_SUMMARY_ABS="$(input_to_path "$REPLAY_SUMMARY")"
+      DOCKER_ARGS+=(--replay-summary "$(container_repo_path_for_arg "$REPLAY_SUMMARY" "--replay-summary" "$REPLAY_SUMMARY_ABS")")
     fi
     DOCKER_ARGS+=(--no-docker)
 
@@ -527,7 +555,7 @@ echo "build dir      : $BUILD_DIR_ABS"
 echo "install dir    : $INSTALL_DIR_ABS"
 echo "parallel jobs   : $JOBS"
 
-if [[ "$USE_DOCKER" != "never" && ! is_container ]]; then
+if [[ "$USE_DOCKER" != "never" ]] && ! is_container; then
   QEMU_SRC_CONTAINER="$(container_repo_path "$QEMU_SRC_ABS")"
   BUILD_DIR_CONTAINER="$(container_repo_path "$BUILD_DIR_ABS")"
   INSTALL_DIR_CONTAINER="$(container_repo_path "$INSTALL_DIR_ABS")"
