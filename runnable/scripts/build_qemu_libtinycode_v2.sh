@@ -2,9 +2,9 @@
 #
 # build_qemu_libtinycode_v2.sh - build helper for the QEMU V2 runtime image.
 #
-# The vanilla upstream linux-user path is implemented. The real
-# libtinycode-specific QEMU V2 port remains explicit not-implemented work. A
-# separate transition mode builds the current minimal PTC shim stub under /tmp.
+# The upstream linux-user path is implemented. The libtinycode flow builds the
+# current QEMU V2 live-sidecar artifact, while a separate transition mode still
+# builds the minimal PTC shim stub under /tmp for compatibility smoke checks.
 #
 # Usage:
 #   runnable/scripts/build_qemu_libtinycode_v2.sh \
@@ -106,6 +106,17 @@ resolve_existing_dir() {
   path="$(input_to_path "$input")"
   [[ -d "$path" ]] || die "$purpose not found: $path"
   (cd "$path" && pwd -P)
+}
+
+resolve_existing_file() {
+  local input="$1"
+  local purpose="$2"
+  local path dir base
+  path="$(input_to_path "$input")"
+  [[ -f "$path" ]] || die "$purpose not found: $path"
+  dir="$(cd "$(dirname "$path")" && pwd -P)"
+  base="$(basename "$path")"
+  printf '%s/%s\n' "$dir" "$base"
 }
 
 resolve_output_dir() {
@@ -244,6 +255,49 @@ container_repo_path_for_arg() {
   esac
 }
 
+set_container_handoff_dir_path() {
+  local out_var="$1"
+  local abs="$2"
+  local external_container_path="$3"
+  local access_mode="${4:-}"
+  local path
+
+  case "$abs" in
+    "$RR_DIR"|"$RR_DIR"/*)
+      path="$(container_repo_path "$abs")"
+      ;;
+    *)
+      if [[ -n "$access_mode" ]]; then
+        DOCKER_MOUNTS+=(-v "$abs:$external_container_path:$access_mode")
+      else
+        DOCKER_MOUNTS+=(-v "$abs:$external_container_path")
+      fi
+      path="$external_container_path"
+      ;;
+  esac
+  printf -v "$out_var" '%s' "$path"
+}
+
+set_container_handoff_file_path() {
+  local out_var="$1"
+  local abs="$2"
+  local external_container_dir="$3"
+  local parent base path
+
+  case "$abs" in
+    "$RR_DIR"|"$RR_DIR"/*)
+      path="$(container_repo_path "$abs")"
+      ;;
+    *)
+      parent="$(dirname "$abs")"
+      base="$(basename "$abs")"
+      DOCKER_MOUNTS+=(-v "$parent:$external_container_dir:ro")
+      path="$external_container_dir/$base"
+      ;;
+  esac
+  printf -v "$out_var" '%s' "$path"
+}
+
 build_ptc_shim_stub() {
   local qemu_src_abs out_dir_abs artifact generator
 
@@ -287,6 +341,7 @@ build_ptc_shim_stub() {
 
 build_libtinycode_v2() {
   local qemu_src_abs build_dir_abs install_dir_abs scratch_root
+  local replay_payload_abs replay_model_abs replay_summary_abs
   local live_script helper_generator legacy_qemu_dir legacy_header
   local lib_so helper_ir metadata_json sidecar_model sidecar_summary qemu_version
   local -a live_args
@@ -319,13 +374,16 @@ build_libtinycode_v2() {
     --fresh
   )
   if [[ -n "$REPLAY_PAYLOAD" ]]; then
-    live_args+=(--payload-source "$(input_to_path "$REPLAY_PAYLOAD")")
+    replay_payload_abs="$(resolve_existing_file "$REPLAY_PAYLOAD" "replay payload")"
+    live_args+=(--payload-source "$replay_payload_abs")
   fi
   if [[ -n "$REPLAY_MODEL" ]]; then
-    live_args+=(--model-source "$(input_to_path "$REPLAY_MODEL")")
+    replay_model_abs="$(resolve_existing_file "$REPLAY_MODEL" "replay model")"
+    live_args+=(--model-source "$replay_model_abs")
   fi
   if [[ -n "$REPLAY_SUMMARY" ]]; then
-    live_args+=(--summary-source "$(input_to_path "$REPLAY_SUMMARY")")
+    replay_summary_abs="$(resolve_existing_file "$REPLAY_SUMMARY" "replay summary")"
+    live_args+=(--summary-source "$replay_summary_abs")
   fi
 
   echo "repo root       : $RR_DIR"
@@ -390,12 +448,30 @@ metadata = lib.ptc_get_abi_metadata()
 if metadata is None:
     raise SystemExit("ptc_get_abi_metadata returned NULL")
 text = metadata.decode("utf-8", errors="replace")
-for field in ("abi_version=2", "real_translation=true"):
-    if field not in text:
-        raise SystemExit(f"ptc_get_abi_metadata missing {field}: {text}")
-forbidden_marker = "REAL_PTC_TRANSLATION=not-migrated-empty-stub"
-if forbidden_marker in text:
-    raise SystemExit(f"ptc_get_abi_metadata contains forbidden marker {forbidden_marker}: {text}")
+fields = {}
+for raw_line in text.splitlines():
+    line = raw_line.strip()
+    if not line:
+        continue
+    if "=" not in line:
+        raise SystemExit(f"ptc_get_abi_metadata malformed line {raw_line!r}: {text}")
+    key, value = line.split("=", 1)
+    key = key.strip()
+    value = value.strip()
+    if not key:
+        raise SystemExit(f"ptc_get_abi_metadata contains empty key: {text}")
+    if key in fields:
+        raise SystemExit(f"ptc_get_abi_metadata duplicate key {key}: {text}")
+    fields[key] = value
+for key, expected in {"abi_version": "2", "real_translation": "true"}.items():
+    actual = fields.get(key)
+    if actual != expected:
+        raise SystemExit(f"ptc_get_abi_metadata expected {key}={expected}, found {actual!r}: {text}")
+if fields.get("REAL_PTC_TRANSLATION") == "not-migrated-empty-stub":
+    raise SystemExit(
+        "ptc_get_abi_metadata contains forbidden marker REAL_PTC_TRANSLATION=not-migrated-empty-stub: "
+        f"{text}"
+    )
 print(text, end="" if text.endswith("\n") else "\n")
 PY
 
@@ -481,18 +557,20 @@ if [[ "$MODE" == "libtinycode" ]]; then
     die "--jobs must be a positive integer: $JOBS"
   fi
   if [[ "$USE_DOCKER" != "never" ]] && ! is_container; then
+    local_replay_payload_abs=""
+    local_replay_model_abs=""
+    local_replay_summary_abs=""
+    DOCKER_ARGS=()
+    USER_ARGS=()
+    DOCKER_MOUNTS=()
+
     QEMU_SRC_ABS="$(require_qemu_10_2_3_tree "$QEMU_SRC")"
     BUILD_DIR_ABS="$(resolve_output_dir "$BUILD_DIR")"
     INSTALL_DIR_ABS="$(resolve_output_dir "$INSTALL_DIR")"
-    QEMU_SRC_CONTAINER="$(container_repo_path "$QEMU_SRC_ABS")"
-    BUILD_DIR_CONTAINER="$(container_repo_path "$BUILD_DIR_ABS")"
-    INSTALL_DIR_CONTAINER="$(container_repo_path "$INSTALL_DIR_ABS")"
+    set_container_handoff_dir_path QEMU_SRC_CONTAINER "$QEMU_SRC_ABS" "/tmp/runnable-qemu-v2/qemu-src" "ro"
+    set_container_handoff_dir_path BUILD_DIR_CONTAINER "$BUILD_DIR_ABS" "/tmp/runnable-qemu-v2/build-dir"
+    set_container_handoff_dir_path INSTALL_DIR_CONTAINER "$INSTALL_DIR_ABS" "/tmp/runnable-qemu-v2/install-dir"
 
-    if [[ "$BUILD_IMAGE" -eq 1 ]]; then
-      docker build -t "$IMAGE" "$RUNTIME_DIR"
-    fi
-
-    USER_ARGS=()
     if [[ "$(id -u)" != "0" ]]; then
       USER_ARGS=(--user "$(id -u):$(id -g)" -e HOME=/tmp)
     fi
@@ -506,23 +584,31 @@ if [[ "$MODE" == "libtinycode" ]]; then
       --jobs "$JOBS"
     )
     if [[ -n "$REPLAY_PAYLOAD" ]]; then
-      REPLAY_PAYLOAD_ABS="$(input_to_path "$REPLAY_PAYLOAD")"
-      DOCKER_ARGS+=(--replay-payload "$(container_repo_path_for_arg "$REPLAY_PAYLOAD" "--replay-payload" "$REPLAY_PAYLOAD_ABS")")
+      local_replay_payload_abs="$(resolve_existing_file "$REPLAY_PAYLOAD" "replay payload")"
+      set_container_handoff_file_path REPLAY_PAYLOAD_CONTAINER "$local_replay_payload_abs" "/tmp/runnable-qemu-v2/replay-payload"
+      DOCKER_ARGS+=(--replay-payload "$REPLAY_PAYLOAD_CONTAINER")
     fi
     if [[ -n "$REPLAY_MODEL" ]]; then
-      REPLAY_MODEL_ABS="$(input_to_path "$REPLAY_MODEL")"
-      DOCKER_ARGS+=(--replay-model "$(container_repo_path_for_arg "$REPLAY_MODEL" "--replay-model" "$REPLAY_MODEL_ABS")")
+      local_replay_model_abs="$(resolve_existing_file "$REPLAY_MODEL" "replay model")"
+      set_container_handoff_file_path REPLAY_MODEL_CONTAINER "$local_replay_model_abs" "/tmp/runnable-qemu-v2/replay-model"
+      DOCKER_ARGS+=(--replay-model "$REPLAY_MODEL_CONTAINER")
     fi
     if [[ -n "$REPLAY_SUMMARY" ]]; then
-      REPLAY_SUMMARY_ABS="$(input_to_path "$REPLAY_SUMMARY")"
-      DOCKER_ARGS+=(--replay-summary "$(container_repo_path_for_arg "$REPLAY_SUMMARY" "--replay-summary" "$REPLAY_SUMMARY_ABS")")
+      local_replay_summary_abs="$(resolve_existing_file "$REPLAY_SUMMARY" "replay summary")"
+      set_container_handoff_file_path REPLAY_SUMMARY_CONTAINER "$local_replay_summary_abs" "/tmp/runnable-qemu-v2/replay-summary"
+      DOCKER_ARGS+=(--replay-summary "$REPLAY_SUMMARY_CONTAINER")
     fi
     DOCKER_ARGS+=(--no-docker)
+
+    if [[ "$BUILD_IMAGE" -eq 1 ]]; then
+      docker build -t "$IMAGE" "$RUNTIME_DIR"
+    fi
 
     exec docker run --rm \
       "${USER_ARGS[@]}" \
       -e RUNNABLE_QEMU_V2_IN_CONTAINER=1 \
       -v "$RR_DIR":/workspace/Runnable-Rewriting \
+      "${DOCKER_MOUNTS[@]}" \
       -w /workspace/Runnable-Rewriting \
       "$IMAGE" \
       "${DOCKER_ARGS[@]}"

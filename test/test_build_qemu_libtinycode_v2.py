@@ -209,10 +209,8 @@ class BuildQemuLibtinycodeV2Tests(unittest.TestCase):
         self.assertNotIn("not implemented yet", combined)
 
     def test_libtinycode_host_docker_mode_rejects_wrong_qemu_version_before_docker(self) -> None:
-        host_qemu_root = REPO_ROOT / "tmp-test-qemu-host-docker"
-        host_qemu_root.mkdir(exist_ok=True)
-        qemu = make_fake_qemu_source(host_qemu_root, "10.2.2")
-        with tempfile.TemporaryDirectory(dir=REPO_ROOT) as tmp:
+        with tempfile.TemporaryDirectory(dir=REPO_ROOT) as qemu_tmp, tempfile.TemporaryDirectory(dir=REPO_ROOT) as tmp:
+            qemu = make_fake_qemu_source(Path(qemu_tmp), "10.2.2")
             root = Path(tmp)
             docker_dir = root / "bin"
             docker_dir.mkdir()
@@ -235,24 +233,20 @@ class BuildQemuLibtinycodeV2Tests(unittest.TestCase):
                 },
             )
 
-        shutil.rmtree(host_qemu_root)
         self.assertNotEqual(result.returncode, 0)
         combined = result.stdout + result.stderr
         self.assertIn("VERSION=10.2.3", combined)
         self.assertIn("10.2.2", combined)
         self.assertFalse(docker_marker.exists(), "docker should not be invoked for wrong QEMU source")
 
-    def test_libtinycode_host_docker_mode_reports_replay_paths_outside_repo(self) -> None:
-        host_qemu_root = REPO_ROOT / "tmp-test-qemu-replay-host-docker"
-        host_qemu_root.mkdir(exist_ok=True)
-        qemu = make_fake_qemu_10_2_3(host_qemu_root)
-        with tempfile.TemporaryDirectory(dir=REPO_ROOT) as repo_tmp, tempfile.TemporaryDirectory() as external_tmp:
+    def test_libtinycode_host_docker_mode_rejects_missing_replay_payload_before_image_build(self) -> None:
+        with tempfile.TemporaryDirectory() as qemu_tmp, tempfile.TemporaryDirectory(dir=REPO_ROOT) as repo_tmp, tempfile.TemporaryDirectory() as external_tmp:
+            qemu = make_fake_qemu_10_2_3(Path(qemu_tmp))
             repo_root = Path(repo_tmp)
             docker_dir = repo_root / "bin"
             docker_dir.mkdir()
             _, docker_marker = make_fake_docker(docker_dir)
-            external_payload = Path(external_tmp) / "payload.txt"
-            external_payload.write_text("payload\n", encoding="utf-8")
+            missing_payload = Path(external_tmp) / "missing.payload.txt"
 
             result = self.run_script(
                 "--libtinycode",
@@ -263,7 +257,45 @@ class BuildQemuLibtinycodeV2Tests(unittest.TestCase):
                 "--install-dir",
                 str(repo_root / "install"),
                 "--replay-payload",
-                str(external_payload),
+                str(missing_payload),
+                env={
+                    "PATH": f"{docker_dir}:{os.environ['PATH']}",
+                    "RUNNABLE_QEMU_V2_IN_CONTAINER": "0",
+                },
+            )
+
+        self.assertNotEqual(result.returncode, 0)
+        combined = result.stdout + result.stderr
+        self.assertIn("replay payload", combined)
+        self.assertIn("not found", combined)
+        self.assertFalse(docker_marker.exists(), "docker should not be invoked before replay path validation")
+
+    def test_libtinycode_host_docker_mode_accepts_external_qemu_and_replay_mounts(self) -> None:
+        with tempfile.TemporaryDirectory() as external_tmp, tempfile.TemporaryDirectory(dir=REPO_ROOT) as repo_tmp:
+            external_root = Path(external_tmp)
+            qemu = make_fake_qemu_10_2_3(external_root)
+            payload, model, summary = write_replay_fixture(external_root)
+            build_dir = external_root / "build"
+            install_dir = external_root / "install"
+            repo_root = Path(repo_tmp)
+            docker_dir = repo_root / "bin"
+            docker_dir.mkdir()
+            _, docker_marker = make_fake_docker(docker_dir)
+
+            result = self.run_script(
+                "--libtinycode",
+                "--qemu-src",
+                str(qemu),
+                "--build-dir",
+                str(build_dir),
+                "--install-dir",
+                str(install_dir),
+                "--replay-payload",
+                str(payload),
+                "--replay-model",
+                str(model),
+                "--replay-summary",
+                str(summary),
                 "--skip-image-build",
                 env={
                     "PATH": f"{docker_dir}:{os.environ['PATH']}",
@@ -271,12 +303,24 @@ class BuildQemuLibtinycodeV2Tests(unittest.TestCase):
                 },
             )
 
-        shutil.rmtree(host_qemu_root)
-        self.assertNotEqual(result.returncode, 0)
-        combined = result.stdout + result.stderr
-        self.assertIn("--replay-payload", combined)
-        self.assertIn("repository root", combined)
-        self.assertFalse(docker_marker.exists(), "docker should not be invoked for unsupported replay input paths")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            docker_argv = docker_marker.read_text(encoding="utf-8")
+
+        self.assertIn("run --rm", docker_argv)
+        self.assertIn("--libtinycode", docker_argv)
+        self.assertIn("--no-docker", docker_argv)
+        self.assertIn(f"-v {qemu}:/tmp/runnable-qemu-v2/qemu-src:ro", docker_argv)
+        self.assertIn("--qemu-src /tmp/runnable-qemu-v2/qemu-src", docker_argv)
+        self.assertIn(f"-v {build_dir}:/tmp/runnable-qemu-v2/build-dir", docker_argv)
+        self.assertIn("--build-dir /tmp/runnable-qemu-v2/build-dir", docker_argv)
+        self.assertIn(f"-v {install_dir}:/tmp/runnable-qemu-v2/install-dir", docker_argv)
+        self.assertIn("--install-dir /tmp/runnable-qemu-v2/install-dir", docker_argv)
+        self.assertIn(f"-v {payload.parent}:/tmp/runnable-qemu-v2/replay-payload:ro", docker_argv)
+        self.assertIn(f"--replay-payload /tmp/runnable-qemu-v2/replay-payload/{payload.name}", docker_argv)
+        self.assertIn(f"-v {model.parent}:/tmp/runnable-qemu-v2/replay-model:ro", docker_argv)
+        self.assertIn(f"--replay-model /tmp/runnable-qemu-v2/replay-model/{model.name}", docker_argv)
+        self.assertIn(f"-v {summary.parent}:/tmp/runnable-qemu-v2/replay-summary:ro", docker_argv)
+        self.assertIn(f"--replay-summary /tmp/runnable-qemu-v2/replay-summary/{summary.name}", docker_argv)
 
     def test_libtinycode_mode_installs_live_sidecar_artifacts_from_replay_fixture(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -363,6 +407,84 @@ class BuildQemuLibtinycodeV2Tests(unittest.TestCase):
         combined = result.stdout + result.stderr
         self.assertIn("REAL_PTC_TRANSLATION=not-migrated-empty-stub", combined)
         self.assertNotIn("LIBTINYCODE_V2_BUILD_OK=1", combined)
+
+    def test_libtinycode_mode_rejects_metadata_that_only_matches_abi_substring(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            qemu = make_fake_qemu_10_2_3(root)
+            fake_live_sidecar = make_fake_live_sidecar_override(
+                root,
+                "abi_version=20\\nreal_translation=true\\n",
+            )
+            result = self.run_script(
+                "--libtinycode",
+                "--no-docker",
+                "--qemu-src",
+                str(qemu),
+                "--build-dir",
+                str(root / "build"),
+                "--install-dir",
+                str(root / "install"),
+                env={"RUNNABLE_QEMU_V2_LIVE_SIDECAR_SCRIPT_OVERRIDE": str(fake_live_sidecar)},
+            )
+
+        self.assertNotEqual(result.returncode, 0)
+        combined = result.stdout + result.stderr
+        self.assertIn("abi_version", combined)
+        self.assertNotIn("LIBTINYCODE_V2_BUILD_OK=1", combined)
+
+    def test_libtinycode_mode_rejects_metadata_that_only_matches_real_translation_substring(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            qemu = make_fake_qemu_10_2_3(root)
+            fake_live_sidecar = make_fake_live_sidecar_override(
+                root,
+                "abi_version=2\\nnot_real_translation=true\\n",
+            )
+            result = self.run_script(
+                "--libtinycode",
+                "--no-docker",
+                "--qemu-src",
+                str(qemu),
+                "--build-dir",
+                str(root / "build"),
+                "--install-dir",
+                str(root / "install"),
+                env={"RUNNABLE_QEMU_V2_LIVE_SIDECAR_SCRIPT_OVERRIDE": str(fake_live_sidecar)},
+            )
+
+        self.assertNotEqual(result.returncode, 0)
+        combined = result.stdout + result.stderr
+        self.assertIn("real_translation", combined)
+        self.assertNotIn("LIBTINYCODE_V2_BUILD_OK=1", combined)
+
+    def test_libtinycode_mode_rejects_duplicate_metadata_keys(self) -> None:
+        metadata_cases = (
+            "abi_version=2\\nabi_version=2\\nreal_translation=true\\n",
+            "abi_version=2\\nreal_translation=false\\nreal_translation=true\\n",
+        )
+
+        for metadata_text in metadata_cases:
+            with self.subTest(metadata_text=metadata_text), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                qemu = make_fake_qemu_10_2_3(root)
+                fake_live_sidecar = make_fake_live_sidecar_override(root, metadata_text)
+                result = self.run_script(
+                    "--libtinycode",
+                    "--no-docker",
+                    "--qemu-src",
+                    str(qemu),
+                    "--build-dir",
+                    str(root / "build"),
+                    "--install-dir",
+                    str(root / "install"),
+                    env={"RUNNABLE_QEMU_V2_LIVE_SIDECAR_SCRIPT_OVERRIDE": str(fake_live_sidecar)},
+                )
+
+                self.assertNotEqual(result.returncode, 0)
+                combined = result.stdout + result.stderr
+                self.assertIn("duplicate", combined)
+                self.assertNotIn("LIBTINYCODE_V2_BUILD_OK=1", combined)
 
     def test_helper_generator_emits_sentinel_when_helper_defs_missing_or_empty(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
