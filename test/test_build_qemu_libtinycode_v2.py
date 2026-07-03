@@ -1,5 +1,7 @@
+import ctypes
 import json
 import os
+import shutil
 import stat
 import subprocess
 import tempfile
@@ -9,17 +11,44 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = REPO_ROOT / "runnable" / "scripts" / "build_qemu_libtinycode_v2.sh"
+LEGACY_QEMU_ROOT = REPO_ROOT / "archive" / "qemu-legacy-2.4.50"
 
 
-def make_fake_qemu_10_2_3(root: Path) -> Path:
-    qemu = root / "qemu-10.2.3"
+def make_fake_qemu_source(root: Path, version: str) -> Path:
+    qemu = root / f"qemu-{version}"
     qemu.mkdir()
     (qemu / "meson.build").write_text("project('qemu', 'c')\n", encoding="utf-8")
     configure = qemu / "configure"
     configure.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
     configure.chmod(configure.stat().st_mode | stat.S_IXUSR)
-    (qemu / "VERSION").write_text("10.2.3\n", encoding="utf-8")
+    (qemu / "VERSION").write_text(f"{version}\n", encoding="utf-8")
     return qemu
+
+
+def make_fake_qemu_10_2_3(root: Path) -> Path:
+    return make_fake_qemu_source(root, "10.2.3")
+
+
+def make_legacy_poison_qemu_src(root: Path) -> tuple[Path, Path]:
+    poison_root = root / "legacy-poison"
+    (poison_root / "linux-user").mkdir(parents=True)
+    (poison_root / "tcg").mkdir(parents=True)
+    shutil.copy2(LEGACY_QEMU_ROOT / "linux-user" / "ptc.h", poison_root / "linux-user" / "ptc.h")
+    shutil.copy2(LEGACY_QEMU_ROOT / "tcg" / "tcg-opc.h", poison_root / "tcg" / "tcg-opc.h")
+
+    configure = poison_root / "configure"
+    marker = poison_root / "configure-invoked.marker"
+    configure.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        f"printf 'legacy configure invoked\\n' > '{marker}'\n"
+        "exit 99\n",
+        encoding="utf-8",
+    )
+    configure.chmod(configure.stat().st_mode | stat.S_IXUSR)
+    (poison_root / "meson.build").write_text("project('qemu', 'c')\n", encoding="utf-8")
+    (poison_root / "VERSION").write_text("10.2.3\n", encoding="utf-8")
+    return poison_root, marker
 
 
 def write_replay_fixture(root: Path) -> tuple[Path, Path, Path]:
@@ -105,11 +134,33 @@ class BuildQemuLibtinycodeV2Tests(unittest.TestCase):
         self.assertIn("QEMU 10.2.3 source tree", combined)
         self.assertNotIn("not implemented yet", combined)
 
+    def test_libtinycode_mode_rejects_wrong_qemu_version_tree(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            qemu = make_fake_qemu_source(root, "10.2.2")
+            result = self.run_script(
+                "--libtinycode",
+                "--no-docker",
+                "--qemu-src",
+                str(qemu),
+                "--build-dir",
+                str(root / "build"),
+                "--install-dir",
+                str(root / "install"),
+            )
+
+        self.assertNotEqual(result.returncode, 0)
+        combined = result.stdout + result.stderr
+        self.assertIn("QEMU 10.2.3 source tree", combined)
+        self.assertIn("10.2.2", combined)
+        self.assertNotIn("not implemented yet", combined)
+
     def test_libtinycode_mode_installs_live_sidecar_artifacts_from_replay_fixture(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             qemu = make_fake_qemu_10_2_3(root)
             payload, model, summary = write_replay_fixture(root)
+            legacy_src, legacy_marker = make_legacy_poison_qemu_src(root)
             build_dir = root / "build"
             install_dir = root / "install"
 
@@ -130,6 +181,7 @@ class BuildQemuLibtinycodeV2Tests(unittest.TestCase):
                 str(model),
                 "--replay-summary",
                 str(summary),
+                env={"RUNNABLE_QEMU_LEGACY_SRC": str(legacy_src)},
             )
 
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -137,6 +189,7 @@ class BuildQemuLibtinycodeV2Tests(unittest.TestCase):
             self.assertIn("LIBTINYCODE_V2_BUILD_OK=1", combined)
             self.assertIn("real_translation=true", combined)
             self.assertNotIn("REAL_PTC_TRANSLATION=not-migrated-empty-stub", combined)
+            self.assertFalse(legacy_marker.exists(), "legacy configure path was invoked")
 
             libtinycode = install_dir / "lib" / "libtinycode-x86_64.so"
             helpers = install_dir / "lib" / "libtinycode-helpers-x86_64.ll"
@@ -154,3 +207,11 @@ class BuildQemuLibtinycodeV2Tests(unittest.TestCase):
             self.assertEqual(data["abi_version"], "2")
             self.assertEqual(data["real_translation"], "true")
             self.assertNotIn("archive/qemu-legacy-2.4.50", data["implementation_source"])
+
+            lib = ctypes.CDLL(str(libtinycode))
+            lib.ptc_get_abi_metadata.restype = ctypes.c_char_p
+            raw_metadata = lib.ptc_get_abi_metadata()
+            self.assertIsNotNone(raw_metadata)
+            metadata_text = raw_metadata.decode("utf-8")
+            self.assertIn("abi_version=2", metadata_text)
+            self.assertIn("real_translation=true", metadata_text)
