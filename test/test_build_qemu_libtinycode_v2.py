@@ -8,6 +8,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from runnable.scripts.qemu_v2_generate_libtinycode_helpers import load_helper_names, render_helpers
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = REPO_ROOT / "runnable" / "scripts" / "build_qemu_libtinycode_v2.sh"
@@ -215,3 +217,61 @@ class BuildQemuLibtinycodeV2Tests(unittest.TestCase):
             metadata_text = raw_metadata.decode("utf-8")
             self.assertIn("abi_version=2", metadata_text)
             self.assertIn("real_translation=true", metadata_text)
+
+    def test_helper_generator_emits_sentinel_when_helper_defs_missing_or_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            missing_model = root / "missing.model.json"
+            empty_model = root / "empty.model.json"
+            missing_model.write_text(json.dumps({"schema": "qemu-v2"}), encoding="utf-8")
+            empty_model.write_text(json.dumps({"schema": "qemu-v2", "helper_defs": []}), encoding="utf-8")
+
+            for model_path in (missing_model, empty_model):
+                helper_names = load_helper_names(model_path)
+                self.assertEqual(helper_names, [])
+
+                rendered = render_helpers(
+                    helper_names,
+                    qemu_src=Path("/tmp/qemu-10.2.3"),
+                    library_path=Path("/tmp/libtinycode-x86_64.so"),
+                )
+                self.assertIn("; ModuleID = 'qemu-v2-libtinycode-helpers'", rendered)
+                self.assertIn("; provenance = generated-by-qemu_v2_generate_libtinycode_helpers.py", rendered)
+                self.assertIn("define void @__qemu_v2_libtinycode_no_helpers_required()", rendered)
+                self.assertIn("; No helper definitions were required by the captured scalar payload.", rendered)
+
+    def test_helper_generator_strips_prefix_deduplicates_and_sanitizes_symbols(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            model_path = Path(tmp) / "helpers.model.json"
+            model_path.write_text(
+                json.dumps(
+                    {
+                        "helper_defs": [
+                            {"name": "helper_alpha"},
+                            {"name": "helper_alpha"},
+                            {"name": "helper_beta.gamma"},
+                            {"name": "helper_beta-gamma"},
+                            {"name": "literal_helper_name"},
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            helper_names = load_helper_names(model_path)
+            self.assertEqual(helper_names, ["alpha", "beta.gamma", "beta-gamma", "literal_helper_name"])
+
+            rendered = render_helpers(
+                helper_names,
+                qemu_src=Path("/tmp/qemu-10.2.3"),
+                library_path=Path("/tmp/libtinycode-x86_64.so"),
+            )
+
+            self.assertIn("; helper = alpha", rendered)
+            self.assertEqual(rendered.count("declare void @alpha()"), 1)
+            self.assertIn("; helper = beta.gamma", rendered)
+            self.assertIn("declare void @beta_gamma()", rendered)
+            self.assertIn("; helper = beta-gamma", rendered)
+            self.assertIn("declare void @beta_gamma_2()", rendered)
+            self.assertIn("; helper = literal_helper_name", rendered)
+            self.assertIn("declare void @literal_helper_name()", rendered)

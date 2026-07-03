@@ -52,8 +52,15 @@ def render_helpers(helper_names: list[str], *, qemu_src: Path, library_path: Pat
             ]
         )
         return "\n".join(lines)
+    used_symbols: set[str] = set()
     for name in helper_names:
-        safe = "".join(ch if ch.isalnum() or ch == "_" else "_" for ch in name)
+        safe_base = "".join(ch if ch.isalnum() or ch == "_" else "_" for ch in name)
+        safe = safe_base
+        suffix = 2
+        while safe in used_symbols:
+            safe = f"{safe_base}_{suffix}"
+            suffix += 1
+        used_symbols.add(safe)
         lines.extend(
             [
                 f"; helper = {name}",
