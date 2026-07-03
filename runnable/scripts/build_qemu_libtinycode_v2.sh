@@ -31,6 +31,9 @@ JOBS="${RUNNABLE_QEMU_V2_JOBS:-$(nproc)}"
 MODE="libtinycode"
 USE_DOCKER="auto"
 BUILD_IMAGE=1
+REPLAY_PAYLOAD=""
+REPLAY_MODEL=""
+REPLAY_SUMMARY=""
 
 usage() {
   cat <<'EOF'
@@ -45,7 +48,7 @@ Modes:
   --ptc-shim-stub         Build the current minimal PTC shim stub
                           libtinycode-x86_64.so under /tmp and run smoke.
   --libtinycode           Request the libtinycode-specific QEMU V2 build.
-                          This is intentionally not implemented yet.
+                          Builds and installs the live-sidecar libtinycode.
 
 Options:
   --qemu-src DIR          QEMU source tree. Default for --linux-user-only:
@@ -60,14 +63,17 @@ Options:
   --image NAME            Docker image for host-side container handoff.
                           Default: rr_qemu_v2_runtime:latest
   --jobs N                Parallel build jobs. Default: nproc
+  --replay-payload PATH   Test/developer replay payload for --libtinycode.
+  --replay-model PATH     Test/developer replay model JSON for --libtinycode.
+  --replay-summary PATH   Test/developer replay summary JSON for --libtinycode.
   --no-docker             Build in the current environment instead of
                           building/running the runtime image.
   --skip-image-build      In host mode, reuse an existing Docker image.
   -h, --help              Show this help.
 
-When run on the host, --linux-user-only builds the runtime image and re-runs
-the script inside the container. When run inside the container, pass
---no-docker or rely on container auto-detection.
+When run on the host, build modes use the runtime image and re-run the script
+inside the container. When run inside the container, pass --no-docker or rely
+on container auto-detection.
 
 The --ptc-shim-stub mode is a transition artifact only. It does not migrate
 real PTC translation and intentionally prints:
@@ -208,19 +214,6 @@ container_repo_path() {
   fi
 }
 
-not_implemented_libtinycode() {
-  cat >&2 <<'EOF'
-error: libtinycode-specific QEMU V2 build is not implemented yet.
-
-Use --linux-user-only to build vanilla upstream qemu-x86_64 linux-user from an
-existing qemu-v2 source tree, or --ptc-shim-stub to build the current
-transition stub under /tmp. The real QEMU/libtinycode port still needs separate
-configure/build/install wiring for migrated translation, helper IR, and
-non-empty PTCInstructionList output.
-EOF
-  exit 3
-}
-
 build_ptc_shim_stub() {
   local qemu_src_abs out_dir_abs artifact generator
 
@@ -265,6 +258,128 @@ build_ptc_shim_stub() {
   echo "REAL_PTC_TRANSLATION=not-migrated-empty-stub"
 }
 
+build_libtinycode_v2() {
+  local qemu_src_abs build_dir_abs install_dir_abs scratch_root
+  local live_script helper_generator legacy_qemu_dir legacy_header
+  local lib_so helper_ir metadata_json sidecar_model sidecar_summary qemu_version
+  local -a live_args
+
+  live_script="$SCRIPT_DIR/qemu_v2_ptc_live_sidecar_translate_smoke.sh"
+  helper_generator="$SCRIPT_DIR/qemu_v2_generate_libtinycode_helpers.py"
+  legacy_qemu_dir="${RUNNABLE_QEMU_LEGACY_SRC:-$RR_DIR/archive/qemu-legacy-2.4.50}"
+
+  [[ -f "$live_script" ]] || die "live-sidecar builder not found: $live_script"
+  [[ -f "$helper_generator" ]] || die "helper IR generator not found: $helper_generator"
+
+  qemu_src_abs="$(resolve_existing_dir "$QEMU_SRC" "QEMU 10.2.3 source tree")"
+  [[ -f "$qemu_src_abs/meson.build" ]] || die "QEMU 10.2.3 source tree is missing meson.build: $qemu_src_abs"
+  [[ -x "$qemu_src_abs/configure" ]] || die "QEMU 10.2.3 source tree is missing executable configure: $qemu_src_abs"
+  [[ -f "$qemu_src_abs/VERSION" ]] || die "QEMU 10.2.3 source tree is missing VERSION: $qemu_src_abs"
+  qemu_version="$(tr -d '[:space:]' < "$qemu_src_abs/VERSION")"
+  [[ "$qemu_version" == "10.2.3" ]] || \
+    die "QEMU 10.2.3 source tree expected VERSION=10.2.3, found $qemu_version at $qemu_src_abs"
+
+  build_dir_abs="$(resolve_output_dir "$BUILD_DIR")"
+  install_dir_abs="$(resolve_output_dir "$INSTALL_DIR")"
+  scratch_root="$build_dir_abs/libtinycode-live-sidecar"
+  lib_so="$scratch_root/libtinycode-x86_64.so"
+  sidecar_model="$scratch_root/sidecar/sidecar.model.json"
+  sidecar_summary="$scratch_root/sidecar/sidecar.summary.json"
+  helper_ir="$install_dir_abs/lib/libtinycode-helpers-x86_64.ll"
+  metadata_json="$install_dir_abs/share/runnable/qemu-v2-libtinycode.json"
+  legacy_header="$legacy_qemu_dir/linux-user/ptc.h"
+  [[ -f "$legacy_header" ]] || die "legacy ptc.h header not found: $legacy_header"
+
+  live_args=(
+    --scratch-root "$scratch_root"
+    --qemu-src "$qemu_src_abs"
+    --jobs "$JOBS"
+    --fresh
+  )
+  if [[ -n "$REPLAY_PAYLOAD" ]]; then
+    live_args+=(--payload-source "$(input_to_path "$REPLAY_PAYLOAD")")
+  fi
+  if [[ -n "$REPLAY_MODEL" ]]; then
+    live_args+=(--model-source "$(input_to_path "$REPLAY_MODEL")")
+  fi
+  if [[ -n "$REPLAY_SUMMARY" ]]; then
+    live_args+=(--summary-source "$(input_to_path "$REPLAY_SUMMARY")")
+  fi
+
+  echo "repo root       : $RR_DIR"
+  echo "runtime image   : $IMAGE"
+  echo "mode            : $MODE"
+  echo "qemu src        : $qemu_src_abs"
+  echo "build dir       : $build_dir_abs"
+  echo "install dir     : $install_dir_abs"
+  echo "scratch root    : $scratch_root"
+  echo "parallel jobs   : $JOBS"
+
+  bash "$live_script" "${live_args[@]}"
+
+  [[ -f "$lib_so" ]] || die "live-sidecar libtinycode was not produced: $lib_so"
+  [[ -f "$sidecar_model" ]] || die "live-sidecar model was not produced: $sidecar_model"
+  [[ -f "$sidecar_summary" ]] || die "live-sidecar summary was not produced: $sidecar_summary"
+
+  mkdir -p "$install_dir_abs/lib" "$install_dir_abs/include" "$install_dir_abs/share/runnable"
+  cp "$lib_so" "$install_dir_abs/lib/libtinycode-x86_64.so"
+  cp "$legacy_header" "$install_dir_abs/include/ptc.h"
+
+  python3 "$helper_generator" \
+    --model-json "$sidecar_model" \
+    --output "$helper_ir" \
+    --qemu-src "$qemu_src_abs" \
+    --library-path "$install_dir_abs/lib/libtinycode-x86_64.so"
+
+  python3 - "$metadata_json" "$qemu_src_abs" "$qemu_version" "$scratch_root" "$install_dir_abs/lib/libtinycode-x86_64.so" "$helper_ir" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+metadata_path = Path(sys.argv[1])
+data = {
+    "schema": "qemu-v2-libtinycode-build-v1",
+    "qemu_src": sys.argv[2],
+    "qemu_version": sys.argv[3],
+    "implementation_source": "qemu-v2-live-sidecar",
+    "abi_version": "2",
+    "real_translation": "true",
+    "scratch_root": sys.argv[4],
+    "library_path": sys.argv[5],
+    "helpers_path": sys.argv[6],
+}
+metadata_path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+PY
+
+  if command -v nm >/dev/null 2>&1; then
+    nm -D "$install_dir_abs/lib/libtinycode-x86_64.so" | grep -q ' ptc_load$' || \
+      die "installed library does not export ptc_load"
+    nm -D "$install_dir_abs/lib/libtinycode-x86_64.so" | grep -q ' ptc_get_abi_metadata$' || \
+      die "installed library does not export ptc_get_abi_metadata"
+  fi
+
+  python3 - "$install_dir_abs/lib/libtinycode-x86_64.so" <<'PY'
+import ctypes
+import sys
+
+lib = ctypes.CDLL(sys.argv[1])
+lib.ptc_get_abi_metadata.restype = ctypes.c_char_p
+metadata = lib.ptc_get_abi_metadata()
+if metadata is None:
+    raise SystemExit("ptc_get_abi_metadata returned NULL")
+text = metadata.decode("utf-8", errors="replace")
+for field in ("abi_version=2", "real_translation=true"):
+    if field not in text:
+        raise SystemExit(f"ptc_get_abi_metadata missing {field}: {text}")
+print(text, end="" if text.endswith("\n") else "\n")
+PY
+
+  echo "LIBTINYCODE_V2_BUILD_OK=1"
+  echo "LIBTINYCODE=$install_dir_abs/lib/libtinycode-x86_64.so"
+  echo "LIBTINYCODE_HELPERS=$helper_ir"
+  echo "LIBTINYCODE_METADATA=$metadata_json"
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --linux-user-only)
@@ -304,6 +419,18 @@ while [[ $# -gt 0 ]]; do
       JOBS="${2:?missing value for --jobs}"
       shift 2
       ;;
+    --replay-payload)
+      REPLAY_PAYLOAD="${2:?missing value for --replay-payload}"
+      shift 2
+      ;;
+    --replay-model)
+      REPLAY_MODEL="${2:?missing value for --replay-model}"
+      shift 2
+      ;;
+    --replay-summary)
+      REPLAY_SUMMARY="${2:?missing value for --replay-summary}"
+      shift 2
+      ;;
     --no-docker)
       USE_DOCKER="never"
       shift
@@ -325,7 +452,55 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ "$MODE" == "libtinycode" ]]; then
-  not_implemented_libtinycode
+  if ! [[ "$JOBS" =~ ^[0-9]+$ ]] || [[ "$JOBS" -lt 1 ]]; then
+    die "--jobs must be a positive integer: $JOBS"
+  fi
+  if [[ "$USE_DOCKER" != "never" && ! is_container ]]; then
+    QEMU_SRC_ABS="$(resolve_existing_dir "$QEMU_SRC" "QEMU 10.2.3 source tree")"
+    BUILD_DIR_ABS="$(resolve_output_dir "$BUILD_DIR")"
+    INSTALL_DIR_ABS="$(resolve_output_dir "$INSTALL_DIR")"
+    QEMU_SRC_CONTAINER="$(container_repo_path "$QEMU_SRC_ABS")"
+    BUILD_DIR_CONTAINER="$(container_repo_path "$BUILD_DIR_ABS")"
+    INSTALL_DIR_CONTAINER="$(container_repo_path "$INSTALL_DIR_ABS")"
+
+    if [[ "$BUILD_IMAGE" -eq 1 ]]; then
+      docker build -t "$IMAGE" "$RUNTIME_DIR"
+    fi
+
+    USER_ARGS=()
+    if [[ "$(id -u)" != "0" ]]; then
+      USER_ARGS=(--user "$(id -u):$(id -g)" -e HOME=/tmp)
+    fi
+
+    DOCKER_ARGS=(
+      bash runnable/scripts/build_qemu_libtinycode_v2.sh
+      "--$MODE"
+      --qemu-src "$QEMU_SRC_CONTAINER"
+      --build-dir "$BUILD_DIR_CONTAINER"
+      --install-dir "$INSTALL_DIR_CONTAINER"
+      --jobs "$JOBS"
+    )
+    if [[ -n "$REPLAY_PAYLOAD" ]]; then
+      DOCKER_ARGS+=(--replay-payload "$(container_repo_path "$(input_to_path "$REPLAY_PAYLOAD")")")
+    fi
+    if [[ -n "$REPLAY_MODEL" ]]; then
+      DOCKER_ARGS+=(--replay-model "$(container_repo_path "$(input_to_path "$REPLAY_MODEL")")")
+    fi
+    if [[ -n "$REPLAY_SUMMARY" ]]; then
+      DOCKER_ARGS+=(--replay-summary "$(container_repo_path "$(input_to_path "$REPLAY_SUMMARY")")")
+    fi
+    DOCKER_ARGS+=(--no-docker)
+
+    exec docker run --rm \
+      "${USER_ARGS[@]}" \
+      -e RUNNABLE_QEMU_V2_IN_CONTAINER=1 \
+      -v "$RR_DIR":/workspace/Runnable-Rewriting \
+      -w /workspace/Runnable-Rewriting \
+      "$IMAGE" \
+      "${DOCKER_ARGS[@]}"
+  fi
+  build_libtinycode_v2
+  exit 0
 fi
 
 if ! [[ "$JOBS" =~ ^[0-9]+$ ]] || [[ "$JOBS" -lt 1 ]]; then
