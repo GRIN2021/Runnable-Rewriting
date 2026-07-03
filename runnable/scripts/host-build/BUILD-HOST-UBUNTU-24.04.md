@@ -84,19 +84,32 @@ bash runnable/scripts/host-build/build-runnable-lift-host.sh \
 
 A fresh Ubuntu 24.04 host build does not require copying `root/`.
 
-## Runtime artifacts not in git
+## QEMU V2 libtinycode artifacts
 
 `runnable-lift` dlopens `libtinycode-<arch>.so` at runtime (see
 `runnable/tools/runnable-lift/Main.cpp`, function `findFiles`). These files are
-not produced by runnable's CMake build and are not git-tracked:
+not produced by runnable's CMake build and are not git-tracked.
 
-| File | Produced by |
-|---|---|
-| `libtinycode-x86_64.so` | classic QEMU build (`support/components/qemu.mk`, target `x86_64-libtinycode`) |
-| `libtinycode-helpers-x86_64.ll` | classic QEMU build |
-| `early-linked-x86_64.ll` | runnable's CMake build, generated with LLVM's `clang` |
+The preferred Ubuntu 24.04 path is the QEMU V2 wrapper:
 
-You only need to stage the first two before running an actual lift:
+```bash
+bash runnable/scripts/build_qemu_libtinycode_v2.sh \
+  --libtinycode \
+  --no-docker \
+  --qemu-src /tmp/rr-qemu-v2-upstream-probes/qemu-10.2.3 \
+  --build-dir /tmp/rr-qemu-v2-libtinycode-build/build \
+  --install-dir /tmp/rr-qemu-v2-libtinycode-build/root \
+  --jobs 3
+```
+
+This installs:
+
+- `/tmp/rr-qemu-v2-libtinycode-build/root/lib/libtinycode-x86_64.so`
+- `/tmp/rr-qemu-v2-libtinycode-build/root/lib/libtinycode-helpers-x86_64.ll`
+- `/tmp/rr-qemu-v2-libtinycode-build/root/include/ptc.h`
+- `/tmp/rr-qemu-v2-libtinycode-build/root/share/runnable/qemu-v2-libtinycode.json`
+
+For `runnable-lift`, stage the shared object and helpers IR next to the binary:
 
 ```bash
 mkdir -p build-codex-dynamic-current/tools/runnable-lift
@@ -104,9 +117,18 @@ cp <existing>/libtinycode-x86_64.so         build-codex-dynamic-current/tools/ru
 cp <existing>/libtinycode-helpers-x86_64.ll build-codex-dynamic-current/tools/runnable-lift/
 ```
 
+`early-linked-x86_64.ll` still comes from runnable's CMake build, generated
+with LLVM's `clang`.
+
 `runnable-lift --help` works without these. A real lift aborts with
 `Couldn't find libtinycode and the helpers` until they are staged. The smoke
-script checks this up front and prints a clearer message.
+script checks this up front and prints a clearer message. Current fast smoke
+evidence reaches a `real_translation=true` source library, but later lifting
+still blocks at pc-divergence; do not treat that as full libcrypto success.
+
+The legacy QEMU 2.4.50 `x86_64-libtinycode` build
+(`support/components/qemu.mk`) remains available only for archaeology and
+compatibility. It is not the accepted QEMU V2 migration path.
 
 ## Step 1 - install build dependencies
 
