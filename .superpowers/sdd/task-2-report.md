@@ -44,7 +44,7 @@
 
 ### Commit
 
-- `7c121fa1` — `test: cover qemu v2 helper ir generation`
+- `c319651a` — `test: cover qemu v2 helper ir generation`
 
 ### Concerns
 
