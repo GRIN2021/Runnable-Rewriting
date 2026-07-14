@@ -17,7 +17,17 @@ The tarball includes:
 - bundled `libcrypto.so.3` and `libcrypto.gtBlock.pb`
 - the full QEMU V2 `libtinycode-x86_64.so` used by the reference run
 - the matching `libtinycode-helpers-x86_64.ll`
-- a helper script that runs smoke and full libcrypto experiments
+- `build-libtinycode-qemuv2.sh`, an explicit QEMU V2 `libtinycode` build/stage
+  script
+- `run-libcrypto-full-qemuv2.sh`, an explicit full `libcrypto.so` experiment
+  script with precision/recall compare enabled by default
+
+Readable copies of those scripts are also committed at:
+
+```text
+scripts/repro/build-libtinycode-qemuv2.sh
+scripts/repro/run-libcrypto-full-qemuv2.sh
+```
 
 The bundled QEMU V2 runtime hashes are:
 
@@ -51,9 +61,10 @@ cd ~/work/libcrypto-qemuv2-repro/runnable-libcrypto-wsl-repro-2026-07-14
 
 sha256sum -c SHA256SUMS
 chmod +x run-libcrypto-ubuntu2404.sh
+chmod +x build-libtinycode-qemuv2.sh run-libcrypto-full-qemuv2.sh
 
 ./run-libcrypto-ubuntu2404.sh smoke
-./run-libcrypto-ubuntu2404.sh full
+./run-libcrypto-full-qemuv2.sh
 ```
 
 After the full run finishes:
@@ -111,11 +122,19 @@ For smaller WSL machines:
 ```bash
 RUNNABLE_LIBCRYPTO_FULL_MEM_GB=24 \
 RUNNABLE_LIBCRYPTO_FULL_CPUS=12 \
-./run-libcrypto-ubuntu2404.sh full
+./run-libcrypto-full-qemuv2.sh
 ```
 
 To test lift only and skip precision/recall compare:
 
 ```bash
-RUNNABLE_LIBCRYPTO_SKIP_CMP=1 ./run-libcrypto-ubuntu2404.sh full
+RUNNABLE_LIBCRYPTO_SKIP_CMP=1 ./run-libcrypto-full-qemuv2.sh
+```
+
+To rebuild QEMU V2 `libtinycode` from QEMU 10.2.3 instead of staging the
+bundled runtime:
+
+```bash
+./build-libtinycode-qemuv2.sh rebuild
+RUNNABLE_LIBTINYCODE_BUILD_MODE=rebuild ./run-libcrypto-full-qemuv2.sh
 ```

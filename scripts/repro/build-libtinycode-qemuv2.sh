@@ -1,0 +1,138 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+RR_DIR="$ROOT/Runnable-Rewriting"
+RUN_ROOT="${RUNNABLE_LIBCRYPTO_RUN_ROOT:-$ROOT/runs-libcrypto}"
+IMAGE="${RUNNABLE_QEMU_V2_IMAGE:-rr_qemu_v2_runtime:latest}"
+PLATFORM="${RUNNABLE_DOCKER_PLATFORM:-linux/amd64}"
+MODE="${1:-stage-bundled}"
+
+cpu_count() {
+  if command -v nproc >/dev/null 2>&1; then
+    nproc
+  elif command -v sysctl >/dev/null 2>&1; then
+    sysctl -n hw.ncpu
+  elif command -v getconf >/dev/null 2>&1; then
+    getconf _NPROCESSORS_ONLN
+  else
+    echo 1
+  fi
+}
+
+JOBS="${RUNNABLE_QEMU_V2_JOBS:-$(cpu_count)}"
+LIBCRYPTO_BINARY="$ROOT/GroudTruth/groundtruth-gap-analysis-skill/results/libcrypto-artifacts/libcrypto.so.3"
+LIBCRYPTO_SMOKE_ENTRY="${RUNNABLE_LIBCRYPTO_SMOKE_ENTRY:-0x500cf4b0}"
+LIBCRYPTO_GUEST_BASE="${RUNNABLE_LIBCRYPTO_GUEST_BASE:-0x50000000}"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  ./build-libtinycode-qemuv2.sh [stage-bundled|rebuild|build-only]
+
+Modes:
+  stage-bundled  Build Docker image and runnable-lift, then stage the bundled
+                 full QEMU V2 libtinycode assets into the runnable-lift build
+                 tree. This is the fastest reproduction path.
+  rebuild        Build Docker image and runnable-lift, then rebuild QEMU V2
+                 libtinycode from QEMU 10.2.3 using the package scripts.
+  build-only     Build Docker image and runnable-lift only.
+
+Environment overrides:
+  RUNNABLE_QEMU_V2_IMAGE       Docker image tag. Default: rr_qemu_v2_runtime:latest
+  RUNNABLE_DOCKER_PLATFORM     Docker platform. Default: linux/amd64
+  RUNNABLE_QEMU_V2_JOBS        Build parallelism. Default: detected CPU count
+  RUNNABLE_LIBCRYPTO_RUN_ROOT  Output root. Default: ./runs-libcrypto
+EOF
+}
+
+case "$MODE" in
+  -h|--help)
+    usage
+    exit 0
+    ;;
+  stage-bundled|rebuild|build-only)
+    ;;
+  *)
+    echo "error: unknown mode: $MODE" >&2
+    usage >&2
+    exit 2
+    ;;
+esac
+
+if ! command -v docker >/dev/null 2>&1; then
+  echo "error: docker is required" >&2
+  exit 1
+fi
+
+libtinycode_is_real() {
+  local lib="$1"
+  [[ -f "$lib" ]] || return 1
+  strings "$lib" | grep -Fxq "real_translation=false" && return 1
+  strings "$lib" | grep -Fxq "REAL_PTC_TRANSLATION=not-migrated-empty-stub" && return 1
+  if strings "$lib" | grep -Fxq "real_translation=true"; then
+    return 0
+  fi
+  [[ "$(wc -c < "$lib")" -gt 1000000 ]] || return 1
+  strings "$lib" | grep -Fxq "qemu_get_version" || return 1
+}
+
+stage_runtime() {
+  local lib="$1"
+  local helpers="$2"
+
+  libtinycode_is_real "$lib" || {
+    echo "error: libtinycode does not look like a real QEMU V2 runtime: $lib" >&2
+    exit 1
+  }
+  [[ -f "$helpers" ]] || {
+    echo "error: helper IR missing: $helpers" >&2
+    exit 1
+  }
+
+  mkdir -p "$RR_DIR/build-codex-dynamic-current/tools/runnable-lift"
+  cp -a "$lib" "$RR_DIR/build-codex-dynamic-current/tools/runnable-lift/libtinycode-x86_64.so"
+  cp -a "$helpers" "$RR_DIR/build-codex-dynamic-current/tools/runnable-lift/libtinycode-helpers-x86_64.ll"
+}
+
+mkdir -p "$RUN_ROOT"
+
+echo "== Build Ubuntu 24.04 runtime image =="
+docker build --platform "$PLATFORM" -t "$IMAGE" "$RR_DIR/docker/qemu-v2-runtime"
+
+echo "== Build runnable-lift inside the runtime image =="
+RUNNABLE_QEMU_V2_IMAGE="$IMAGE" RUNNABLE_DOCKER_PLATFORM="$PLATFORM" RUNNABLE_QEMU_V2_JOBS="$JOBS" \
+  "$RR_DIR/runnable/scripts/build_runnable_lift_v2.sh" --skip-image-build --verify
+
+if [[ "$MODE" == "build-only" ]]; then
+  echo "BUILD_ONLY_OK=1"
+  exit 0
+fi
+
+if [[ "$MODE" == "rebuild" ]]; then
+  echo "== Rebuild request-aware libcrypto QEMU V2 libtinycode =="
+  install_dir="$RUN_ROOT/shared-install-runnable"
+  RUNNABLE_QEMU_V2_IMAGE="$IMAGE" RUNNABLE_DOCKER_PLATFORM="$PLATFORM" RUNNABLE_QEMU_V2_JOBS="$JOBS" \
+    "$RR_DIR/runnable/scripts/build_qemu_libtinycode_v2.sh" \
+      --libtinycode \
+      --download-qemu \
+      --skip-image-build \
+      --build-dir "$RUN_ROOT/build-qemu-v2-libtinycode" \
+      --install-dir "$install_dir" \
+      --external-binary "$LIBCRYPTO_BINARY" \
+      --external-entry "$LIBCRYPTO_SMOKE_ENTRY" \
+      --external-label "libcrypto" \
+      --external-run-dir "$(dirname "$LIBCRYPTO_BINARY")" \
+      --guest-base "$LIBCRYPTO_GUEST_BASE"
+  stage_runtime "$install_dir/lib/libtinycode-x86_64.so" "$install_dir/lib/libtinycode-helpers-x86_64.ll"
+else
+  echo "== Stage bundled full QEMU V2 libtinycode =="
+  stage_runtime \
+    "$RR_DIR/runnable/tools/runnable-lift/libtinycode-x86_64.so" \
+    "$RR_DIR/runnable/tools/runnable-lift/libtinycode-helpers-x86_64.ll"
+fi
+
+echo "== Staged runtime assets =="
+sha256sum \
+  "$RR_DIR/build-codex-dynamic-current/tools/runnable-lift/libtinycode-x86_64.so" \
+  "$RR_DIR/build-codex-dynamic-current/tools/runnable-lift/libtinycode-helpers-x86_64.ll"
