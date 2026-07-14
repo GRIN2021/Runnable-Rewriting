@@ -45,61 +45,79 @@ if [[ "${RUNNABLE_LIBCRYPTO_NO_DOCKER:-0}" == "1" ]] || ! command -v docker >/de
   use_docker=0
 fi
 
-echo "== Build/stage QEMU V2 libtinycode =="
-RUNNABLE_LIBCRYPTO_RUN_ROOT="$RUN_ROOT" \
-RUNNABLE_QEMU_V2_IMAGE="$IMAGE" \
-RUNNABLE_DOCKER_PLATFORM="$PLATFORM" \
-RUNNABLE_LIBCRYPTO_NO_DOCKER="${RUNNABLE_LIBCRYPTO_NO_DOCKER:-0}" \
-  "$ROOT/build-libtinycode-qemuv2.sh" "$BUILD_MODE"
+if [[ "$use_docker" -eq 1 || "${RUNNABLE_LIBCRYPTO_REBUILD:-0}" == "1" || ! -x "$ROOT/prebuilt/shared-install-runnable/bin/runnable-lift" ]]; then
+  echo "== Build/stage QEMU V2 libtinycode =="
+  RUNNABLE_LIBCRYPTO_RUN_ROOT="$RUN_ROOT" \
+  RUNNABLE_QEMU_V2_IMAGE="$IMAGE" \
+  RUNNABLE_DOCKER_PLATFORM="$PLATFORM" \
+  RUNNABLE_LIBCRYPTO_NO_DOCKER="${RUNNABLE_LIBCRYPTO_NO_DOCKER:-0}" \
+    "$ROOT/build-libtinycode-qemuv2.sh" "$BUILD_MODE"
+fi
+
+if [[ "$use_docker" -eq 0 && "${RUNNABLE_LIBCRYPTO_REBUILD:-0}" != "1" && -x "$ROOT/prebuilt/shared-install-runnable/bin/runnable-lift" ]]; then
+  echo "== Docker unavailable/disabled: use bundled prebuilt runnable-lift =="
+  mkdir -p "$RUN_ROOT"
+  rm -rf "$RUN_ROOT/shared-install-runnable"
+  cp -a "$ROOT/prebuilt/shared-install-runnable" "$RUN_ROOT/shared-install-runnable"
+elif [[ "$use_docker" -eq 0 ]]; then
+  echo "== Build/stage QEMU V2 libtinycode =="
+  RUNNABLE_LIBCRYPTO_NO_DOCKER=1 "$ROOT/build-libtinycode-qemuv2.sh" stage-bundled
+fi
 
 if [[ "$use_docker" -eq 0 ]]; then
-  echo "== Docker unavailable/disabled: run host-native full-library lift =="
-  RUN_DIR="$RUN_ROOT/runs/$RUN_LABEL"
-  RAW_DIR="$RUN_DIR/raw"
-  FRAGMENT_DIR="$RUN_DIR/fragments"
-  EVAL_DIR="$RUN_DIR/eval"
-  FINAL_LL="$RUN_DIR/libcrypto.dynamic.parallel.ll"
-  LIBCRYPTO="$ROOT/GroudTruth/groundtruth-gap-analysis-skill/results/libcrypto-artifacts/libcrypto.so.3"
-  GROUNDTRUTH="$ROOT/GroudTruth/groundtruth-gap-analysis-skill/results/libcrypto-artifacts/libcrypto.gtBlock.pb"
-  BLOCKS_PB2="$ROOT/GroudTruth/protobuf_def/blocks_pb2.py"
+  echo "== Docker unavailable/disabled: run host-native shard orchestrator =="
   B="$RR_DIR/build-codex-dynamic-current"
   LLVM_LIBDIR="$(llvm-config --libdir 2>/dev/null || llvm-config-18 --libdir 2>/dev/null || true)"
 
-  mkdir -p "$RAW_DIR" "$FRAGMENT_DIR" "$EVAL_DIR"
-  export LD_LIBRARY_PATH="$B/lib/StackAnalysis:$B/lib/BasicAnalyses:$B/lib/Support${LLVM_LIBDIR:+:$LLVM_LIBDIR}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-  export PATH="$B/tools/runnable-lift:$PATH"
-
-  echo "== runnable-lift host command =="
-  timeout "${RUNNABLE_LIBCRYPTO_LIFT_TIMEOUT_SEC:-7200}" \
-    "$B/tools/runnable-lift/runnable-lift" \
-      -base=0x50000000 \
-      -entry=0x500cef80 \
-      -dynamic-parallel \
-      "-parallel-workers=${RUNNABLE_LIBCRYPTO_HOST_PARALLEL_WORKERS:-5}" \
-      "-parallel-fragment-dir=$FRAGMENT_DIR" \
-      "$LIBCRYPTO" \
-      "$FINAL_LL" \
-      >"$RUN_DIR/lift.stdout.log" 2>"$RUN_DIR/lift.stderr.log"
-
-  if [[ "${RUNNABLE_LIBCRYPTO_SKIP_CMP:-0}" != "1" ]]; then
-    echo "== host precision/recall compare =="
-    python3 "$RR_DIR/runnable/scripts/validate_libcrypto_ground_truth.py" cmp \
-      --binary "$LIBCRYPTO" \
-      --groundtruth "$GROUNDTRUTH" \
-      --blocks-pb2 "$BLOCKS_PB2" \
-      --ll "$FINAL_LL" \
-      --run-cmp-eval "$RR_DIR/runnable/scripts/run_cmp_eval.py" \
-      --text-start 0xcef80 \
-      --runnable-base 0x50000000 \
-      --out-dir "$EVAL_DIR" \
-      --allow-low-metrics
+  PREBUILT_PREFIX="$RUN_ROOT/shared-install-runnable"
+  if [[ -x "$PREBUILT_PREFIX/bin/runnable-lift" && "${RUNNABLE_LIBCRYPTO_REBUILD:-0}" != "1" ]]; then
+    export LD_LIBRARY_PATH="$PREBUILT_PREFIX/lib:$PREBUILT_PREFIX/lib/runnable/analyses${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    export PATH="$PREBUILT_PREFIX/bin:$PATH"
+    LIFT_PREFIX="$PREBUILT_PREFIX"
+    LIBTINYCODE_PATH="$PREBUILT_PREFIX/bin/libtinycode-x86_64.so"
+    LIBTINYCODE_HELPERS_PATH="$PREBUILT_PREFIX/bin/libtinycode-helpers-x86_64.ll"
+  else
+    export LD_LIBRARY_PATH="$B/lib/StackAnalysis:$B/lib/BasicAnalyses:$B/lib/Support${LLVM_LIBDIR:+:$LLVM_LIBDIR}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    export PATH="$B/tools/runnable-lift:$PATH"
+    LIFT_PREFIX="$B"
+    LIBTINYCODE_PATH="$B/tools/runnable-lift/libtinycode-x86_64.so"
+    LIBTINYCODE_HELPERS_PATH="$B/tools/runnable-lift/libtinycode-helpers-x86_64.ll"
   fi
 
+  HOST_ARGS=(
+    --workspace-root "$ROOT"
+    --repo-root "$RR_DIR"
+    --groudtruth-repo-root "$ROOT/GroudTruth"
+    --hdd-root "$RUN_ROOT"
+    --run-label "$RUN_LABEL"
+    --no-streaming-merge
+    --parallel-workers "${RUNNABLE_LIBCRYPTO_HOST_PARALLEL_WORKERS:-1}"
+    --max-seeds "${RUNNABLE_LIBCRYPTO_MAX_SEEDS:-0}"
+    --max-concurrent-coordinators "${RUNNABLE_LIBCRYPTO_HOST_SHARD_CONCURRENCY:-6}"
+    --shard-concurrency "${RUNNABLE_LIBCRYPTO_HOST_SHARD_CONCURRENCY:-6}"
+    --worker-memory-gb 1
+    --lift-timeout-sec "${RUNNABLE_LIBCRYPTO_LIFT_TIMEOUT_SEC:-1800}"
+    --merge-workers 2
+    --merge-batch-size 2
+    --execution-model host-shards
+    --range-mode "${RUNNABLE_LIBCRYPTO_RANGE_MODE:-seed}"
+    --no-rebuild-lift
+    --all-symbols
+    --libtinycode-path "$LIBTINYCODE_PATH"
+    --libtinycode-helpers-path "$LIBTINYCODE_HELPERS_PATH"
+  )
+  if [[ "${RUNNABLE_LIBCRYPTO_SKIP_CMP:-0}" == "1" ]]; then
+    HOST_ARGS+=(--skip-cmp)
+  fi
+
+  python3 "$RR_DIR/runnable/scripts/libcrypto_dynamic_parallel_lift.py" "${HOST_ARGS[@]}"
+
+  RUN_DIR="$RUN_ROOT/runs/$RUN_LABEL"
   echo "== Run directory =="
   echo "$RUN_DIR"
-  if [[ -f "$EVAL_DIR/cmp.verdict.txt" ]]; then
+  if [[ -f "$RUN_DIR/eval/cmp.verdict.txt" ]]; then
     echo "== Precision/recall verdict =="
-    cat "$EVAL_DIR/cmp.verdict.txt"
+    cat "$RUN_DIR/eval/cmp.verdict.txt"
   fi
   exit 0
 fi

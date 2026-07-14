@@ -69,18 +69,22 @@ fi
 libtinycode_is_real() {
   local lib="$1"
   [[ -f "$lib" ]] || return 1
-  strings "$lib" | grep -Fxq "real_translation=false" && return 1
-  strings "$lib" | grep -Fxq "REAL_PTC_TRANSLATION=not-migrated-empty-stub" && return 1
-  if strings "$lib" | grep -Fxq "real_translation=true"; then
+  grep -aFq "real_translation=false" "$lib" && return 1
+  grep -aFq "REAL_PTC_TRANSLATION=not-migrated-empty-stub" "$lib" && return 1
+  if grep -aFq "real_translation=true" "$lib"; then
     return 0
   fi
   [[ "$(wc -c < "$lib")" -gt 1000000 ]] || return 1
-  strings "$lib" | grep -Fxq "qemu_get_version" || return 1
+  grep -aFq "qemu_get_cpu" "$lib" || return 1
+  grep -aFq "tcg_gen_code" "$lib" || return 1
 }
 
 stage_runtime() {
   local lib="$1"
   local helpers="$2"
+  local build_dir="$RR_DIR/build-codex-dynamic-current"
+  local lift_dir="$build_dir/tools/runnable-lift"
+  local early_linked="$build_dir/early-linked-x86_64.ll"
 
   libtinycode_is_real "$lib" || {
     echo "error: libtinycode does not look like a real QEMU V2 runtime: $lib" >&2
@@ -91,9 +95,20 @@ stage_runtime() {
     exit 1
   }
 
-  mkdir -p "$RR_DIR/build-codex-dynamic-current/tools/runnable-lift"
-  cp -a "$lib" "$RR_DIR/build-codex-dynamic-current/tools/runnable-lift/libtinycode-x86_64.so"
-  cp -a "$helpers" "$RR_DIR/build-codex-dynamic-current/tools/runnable-lift/libtinycode-helpers-x86_64.ll"
+  if [[ ! -f "$early_linked" ]]; then
+    cmake --build "$build_dir" \
+      --target early-linked-module-early-linked-x86_64.ll \
+      -- -j "$JOBS"
+  fi
+  [[ -f "$early_linked" ]] || {
+    echo "error: early-linked IR missing after build: $early_linked" >&2
+    exit 1
+  }
+
+  mkdir -p "$lift_dir"
+  cp -a "$lib" "$lift_dir/libtinycode-x86_64.so"
+  cp -a "$helpers" "$lift_dir/libtinycode-helpers-x86_64.ll"
+  cp -a "$early_linked" "$lift_dir/early-linked-x86_64.ll"
 }
 
 mkdir -p "$RUN_ROOT"
@@ -166,4 +181,5 @@ fi
 echo "== Staged runtime assets =="
 sha256sum \
   "$RR_DIR/build-codex-dynamic-current/tools/runnable-lift/libtinycode-x86_64.so" \
-  "$RR_DIR/build-codex-dynamic-current/tools/runnable-lift/libtinycode-helpers-x86_64.ll"
+  "$RR_DIR/build-codex-dynamic-current/tools/runnable-lift/libtinycode-helpers-x86_64.ll" \
+  "$RR_DIR/build-codex-dynamic-current/tools/runnable-lift/early-linked-x86_64.ll"

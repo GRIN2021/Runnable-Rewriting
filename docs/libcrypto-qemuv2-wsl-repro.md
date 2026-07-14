@@ -17,6 +17,7 @@ The tarball includes:
 - bundled `libcrypto.so.3` and `libcrypto.gtBlock.pb`
 - the full QEMU V2 `libtinycode-x86_64.so` used by the reference run
 - the matching `libtinycode-helpers-x86_64.ll`
+- a bundled prebuilt `runnable-lift` install used by the no-Docker WSL path
 - `build-libtinycode-qemuv2.sh`, an explicit QEMU V2 `libtinycode` build/stage
   script
 - `run-libcrypto-full-qemuv2.sh`, an explicit full `libcrypto.so` experiment
@@ -36,14 +37,24 @@ The bundled QEMU V2 runtime hashes are:
 5977b32dd6710d0459aa9b4fd4290350f69c9333e2aaa53005fcbb554ab27fb2  libtinycode-helpers-x86_64.ll
 ```
 
+The bundled no-Docker `runnable-lift` was checked on the source machine with:
+
+```text
+runnable-lift: 1addc607d7f9d6a06ba61cff01581101973e63b1b5bdc7e166f88e6e244dd839
+```
+
 ## WSL Requirements
 
 - WSL2, preferably Ubuntu 22.04 or 24.04.
-- No Docker is required for the native WSL path.
+- No Docker is required for the native WSL path. The default native path uses
+  the bundled prebuilt `runnable-lift` install so it can reproduce the measured
+  precision/recall without rebuilding the whole toolchain first.
 - Keep the extracted package on the WSL Linux filesystem, for example under
   `~/work`, not under `/mnt/c/...`.
-- Install native build dependencies with the bundled helper script.
-- The reference full run used about 32 GB memory and 30 CPUs.
+- Install runtime dependencies with `apt` as shown below. Install LLVM 18 only
+  if you want to rebuild `runnable-lift`/`libtinycode` locally.
+- The validated no-Docker host run used about 48 GB of output disk and took
+  4313 seconds on the source machine.
 
 ## Full Commands
 
@@ -64,9 +75,11 @@ sha256sum -c SHA256SUMS
 chmod +x run-libcrypto-ubuntu2404.sh
 chmod +x build-libtinycode-qemuv2.sh run-libcrypto-full-qemuv2.sh
 
-sudo bash Runnable-Rewriting/runnable/scripts/host-build/install-host-deps.sh
+sudo apt update
+sudo apt install -y \
+  build-essential cmake ninja-build git rsync python3 python3-pip \
+  protobuf-compiler binutils zlib1g libzstd1 libtinfo6
 
-RUNNABLE_LIBCRYPTO_NO_DOCKER=1 ./build-libtinycode-qemuv2.sh stage-bundled
 RUNNABLE_LIBCRYPTO_NO_DOCKER=1 ./run-libcrypto-full-qemuv2.sh
 ```
 
@@ -102,6 +115,20 @@ The source-machine reference result was:
 precision: 0.987997
 recall: 0.829073
 ok: true
+```
+
+The no-Docker host path in this artifact was validated on the source machine
+before publishing:
+
+```text
+execution_model: host-shards
+range_mode: seed
+seed_count: 5326
+successful_seed_count: 5326
+precision: 0.9881612470784759
+recall: 0.8287800254891053
+ok: true
+end_to_end_wall_time_sec: 4313.401302576065
 ```
 
 The raw `cmp.json` values from that run were:
@@ -142,10 +169,16 @@ If Docker is available and you want the containerized path:
 ./run-libcrypto-full-qemuv2.sh
 ```
 
-To rebuild QEMU V2 `libtinycode` from QEMU 10.2.3 instead of staging the
-bundled runtime, Docker is currently required:
+To rebuild QEMU V2 `libtinycode`/`runnable-lift` locally instead of using the
+bundled prebuilt runtime, install LLVM 18 and run:
 
 ```bash
-./build-libtinycode-qemuv2.sh rebuild
-RUNNABLE_LIBTINYCODE_BUILD_MODE=rebuild ./run-libcrypto-full-qemuv2.sh
+sudo apt install -y clang-18 llvm-18 llvm-18-dev llvm-18-tools lld-18
+RUNNABLE_LIBCRYPTO_NO_DOCKER=1 RUNNABLE_LIBCRYPTO_REBUILD=1 \
+  ./build-libtinycode-qemuv2.sh stage-bundled
+RUNNABLE_LIBCRYPTO_NO_DOCKER=1 RUNNABLE_LIBCRYPTO_REBUILD=1 \
+  ./run-libcrypto-full-qemuv2.sh
 ```
+
+For metric reproduction, use the default prebuilt path above. The rebuild path
+is provided so the QEMU V2 `libtinycode` build can be inspected on WSL.
