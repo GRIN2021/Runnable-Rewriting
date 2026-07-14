@@ -31,18 +31,19 @@ Usage:
   ./build-libtinycode-qemuv2.sh [stage-bundled|rebuild|build-only]
 
 Modes:
-  stage-bundled  Build Docker image and runnable-lift, then stage the bundled
-                 full QEMU V2 libtinycode assets into the runnable-lift build
-                 tree. This is the fastest reproduction path.
+  stage-bundled  Build runnable-lift, then stage the bundled full QEMU V2
+                 libtinycode assets into the runnable-lift build tree. Uses
+                 Docker when available, otherwise builds natively on WSL/host.
   rebuild        Build Docker image and runnable-lift, then rebuild QEMU V2
                  libtinycode from QEMU 10.2.3 using the package scripts.
-  build-only     Build Docker image and runnable-lift only.
+  build-only     Build runnable-lift only.
 
 Environment overrides:
   RUNNABLE_QEMU_V2_IMAGE       Docker image tag. Default: rr_qemu_v2_runtime:latest
   RUNNABLE_DOCKER_PLATFORM     Docker platform. Default: linux/amd64
   RUNNABLE_QEMU_V2_JOBS        Build parallelism. Default: detected CPU count
   RUNNABLE_LIBCRYPTO_RUN_ROOT  Output root. Default: ./runs-libcrypto
+  RUNNABLE_LIBCRYPTO_NO_DOCKER Set to 1 to force native WSL/host build.
 EOF
 }
 
@@ -60,9 +61,9 @@ case "$MODE" in
     ;;
 esac
 
-if ! command -v docker >/dev/null 2>&1; then
-  echo "error: docker is required" >&2
-  exit 1
+use_docker=1
+if [[ "${RUNNABLE_LIBCRYPTO_NO_DOCKER:-0}" == "1" ]] || ! command -v docker >/dev/null 2>&1; then
+  use_docker=0
 fi
 
 libtinycode_is_real() {
@@ -97,12 +98,29 @@ stage_runtime() {
 
 mkdir -p "$RUN_ROOT"
 
-echo "== Build Ubuntu 24.04 runtime image =="
-docker build --platform "$PLATFORM" -t "$IMAGE" "$RR_DIR/docker/qemu-v2-runtime"
+if [[ "$use_docker" -eq 1 ]]; then
+  echo "== Build Ubuntu 24.04 runtime image =="
+  docker build --platform "$PLATFORM" -t "$IMAGE" "$RR_DIR/docker/qemu-v2-runtime"
 
-echo "== Build runnable-lift inside the runtime image =="
-RUNNABLE_QEMU_V2_IMAGE="$IMAGE" RUNNABLE_DOCKER_PLATFORM="$PLATFORM" RUNNABLE_QEMU_V2_JOBS="$JOBS" \
-  "$RR_DIR/runnable/scripts/build_runnable_lift_v2.sh" --skip-image-build --verify
+  echo "== Build runnable-lift inside the runtime image =="
+  RUNNABLE_QEMU_V2_IMAGE="$IMAGE" RUNNABLE_DOCKER_PLATFORM="$PLATFORM" RUNNABLE_QEMU_V2_JOBS="$JOBS" \
+    "$RR_DIR/runnable/scripts/build_runnable_lift_v2.sh" --skip-image-build --verify
+else
+  echo "== Docker unavailable/disabled: build runnable-lift natively on WSL/host =="
+  if ! command -v llvm-config >/dev/null 2>&1 && ! command -v llvm-config-18 >/dev/null 2>&1; then
+    cat >&2 <<EOF
+error: llvm-config not found. Install host dependencies first:
+
+  sudo bash "$RR_DIR/runnable/scripts/host-build/install-host-deps.sh"
+
+Then re-run:
+
+  RUNNABLE_LIBCRYPTO_NO_DOCKER=1 ./build-libtinycode-qemuv2.sh stage-bundled
+EOF
+    exit 1
+  fi
+  bash "$RR_DIR/runnable/scripts/host-build/build-runnable-lift-host.sh" --verify --jobs "$JOBS"
+fi
 
 if [[ "$MODE" == "build-only" ]]; then
   echo "BUILD_ONLY_OK=1"
@@ -110,6 +128,19 @@ if [[ "$MODE" == "build-only" ]]; then
 fi
 
 if [[ "$MODE" == "rebuild" ]]; then
+  if [[ "$use_docker" -eq 0 ]]; then
+    cat >&2 <<EOF
+error: rebuild mode without Docker is intentionally not automated in this
+package. Use the bundled QEMU V2 libtinycode runtime:
+
+  RUNNABLE_LIBCRYPTO_NO_DOCKER=1 ./build-libtinycode-qemuv2.sh stage-bundled
+
+or install Docker and run:
+
+  ./build-libtinycode-qemuv2.sh rebuild
+EOF
+    exit 1
+  fi
   echo "== Rebuild request-aware libcrypto QEMU V2 libtinycode =="
   install_dir="$RUN_ROOT/shared-install-runnable"
   RUNNABLE_QEMU_V2_IMAGE="$IMAGE" RUNNABLE_DOCKER_PLATFORM="$PLATFORM" RUNNABLE_QEMU_V2_JOBS="$JOBS" \

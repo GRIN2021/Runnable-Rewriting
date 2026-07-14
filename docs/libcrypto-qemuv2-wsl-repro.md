@@ -39,10 +39,11 @@ The bundled QEMU V2 runtime hashes are:
 ## WSL Requirements
 
 - WSL2, preferably Ubuntu 22.04 or 24.04.
-- Docker available from inside WSL.
+- No Docker is required for the native WSL path.
 - Keep the extracted package on the WSL Linux filesystem, for example under
   `~/work`, not under `/mnt/c/...`.
-- The reference full run used a 32 GB Docker memory limit and 30 CPU limit.
+- Install native build dependencies with the bundled helper script.
+- The reference full run used about 32 GB memory and 30 CPUs.
 
 ## Full Commands
 
@@ -63,8 +64,10 @@ sha256sum -c SHA256SUMS
 chmod +x run-libcrypto-ubuntu2404.sh
 chmod +x build-libtinycode-qemuv2.sh run-libcrypto-full-qemuv2.sh
 
-./run-libcrypto-ubuntu2404.sh smoke
-./run-libcrypto-full-qemuv2.sh
+sudo bash Runnable-Rewriting/runnable/scripts/host-build/install-host-deps.sh
+
+RUNNABLE_LIBCRYPTO_NO_DOCKER=1 ./build-libtinycode-qemuv2.sh stage-bundled
+RUNNABLE_LIBCRYPTO_NO_DOCKER=1 ./run-libcrypto-full-qemuv2.sh
 ```
 
 After the full run finishes:
@@ -120,6 +123,7 @@ false_positive: 6844
 For smaller WSL machines:
 
 ```bash
+RUNNABLE_LIBCRYPTO_NO_DOCKER=1 \
 RUNNABLE_LIBCRYPTO_FULL_MEM_GB=24 \
 RUNNABLE_LIBCRYPTO_FULL_CPUS=12 \
 ./run-libcrypto-full-qemuv2.sh
@@ -131,8 +135,15 @@ To test lift only and skip precision/recall compare:
 RUNNABLE_LIBCRYPTO_SKIP_CMP=1 ./run-libcrypto-full-qemuv2.sh
 ```
 
+If Docker is available and you want the containerized path:
+
+```bash
+./run-libcrypto-ubuntu2404.sh smoke
+./run-libcrypto-full-qemuv2.sh
+```
+
 To rebuild QEMU V2 `libtinycode` from QEMU 10.2.3 instead of staging the
-bundled runtime:
+bundled runtime, Docker is currently required:
 
 ```bash
 ./build-libtinycode-qemuv2.sh rebuild
