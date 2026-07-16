@@ -191,11 +191,11 @@ static bool defineQEMURecheckingSingleStepHelper(Module &M) {
     return false;
 
   Type *EnvType = SingleStepTy->getParamType(0);
-#if LLVM_VERSION_MAJOR >= 18
   StructType *CPUStateType =
+#if LLVM_VERSION_MAJOR >= 18
     StructType::getTypeByName(M.getContext(), "struct.CPUX86State");
 #else
-  StructType *CPUStateType = M.getTypeByName("struct.CPUX86State");
+    M.getTypeByName("struct.CPUX86State");
 #endif
 #if LLVM_VERSION_MAJOR < 15
   if (CPUStateType == nullptr) {
@@ -2626,6 +2626,7 @@ static bool extractQEMUV2DirectCallReturnPC(const PTCInstructionList *Instructio
 }
 
 static size_t translatePTCBlock(uint64_t VirtualAddress,
+                                const BinaryFile &Binary,
                                 PTCInstructionList *Instructions,
                                 uint64_t *DynamicVirtualAddress) {
   const bool Serialize = shouldSerializePTCTranslate();
@@ -2647,10 +2648,25 @@ static size_t translatePTCBlock(uint64_t VirtualAddress,
 
     if (!isEmptyPTCInstructionList(ConsumedSize, Instructions)) {
       uint64_t FirstDebugPC = 0;
+      uint64_t CanonicalFirstDebugPC = 0;
+      const bool HasFirstDebugPC = findFirstDebugPC(Instructions, FirstDebugPC);
+      if (HasFirstDebugPC)
+        CanonicalFirstDebugPC = canonicalizePTCDebugPC(FirstDebugPC, Binary);
+
       if (!Serialize
-          || !findFirstDebugPC(Instructions, FirstDebugPC)
-          || FirstDebugPC == VirtualAddress)
+          || !HasFirstDebugPC
+          || CanonicalFirstDebugPC == VirtualAddress) {
+        if (Serialize && FirstDebugPC != 0
+            && CanonicalFirstDebugPC != FirstDebugPC) {
+          errs() << "runnable-lift: accepted QEMU v2 PTC relocated debug pc"
+                 << " requested_pc=0x" << Twine::utohexstr(VirtualAddress)
+                 << " first_debug_pc=0x" << Twine::utohexstr(FirstDebugPC)
+                 << " canonical_first_debug_pc=0x"
+                 << Twine::utohexstr(CanonicalFirstDebugPC)
+                 << "\n";
+        }
         return ConsumedSize;
+      }
 
       errs() << "runnable-lift: rejected QEMU v2 PTC returned-pc divergence"
              << " requested_pc=0x" << Twine::utohexstr(VirtualAddress)
@@ -2750,7 +2766,11 @@ static unsigned redirectQEMUV2ConstantDispatcherBranches(
     if (!JumpTargets.isTranslatedBB(&BB))
       continue;
 
-    auto *Branch = dyn_cast<BranchInst>(BB.getTerminator());
+    Instruction *Terminator = BB.getTerminator();
+    if (Terminator == nullptr)
+      continue;
+
+    auto *Branch = dyn_cast<BranchInst>(Terminator);
     if (Branch == nullptr || !Branch->isUnconditional()
         || Branch->getSuccessor(0) != Dispatcher)
       continue;
@@ -3882,6 +3902,7 @@ void CodeGenerator::translate(uint64_t VirtualAddress) {
       runnable_log(TranslatePCLog,
                    "Translating bb." << JumpTargets.nameForAddress(VirtualAddress));
       ConsumedSize = translatePTCBlock(VirtualAddress,
+                                       Binary,
                                        InstructionList.get(),
                                        &DynamicVirtualAddress);
       TranslatedThisBlock = true;
@@ -4259,6 +4280,8 @@ void CodeGenerator::translate(uint64_t VirtualAddress) {
       }
       if (ParallelConfig.WorkerMode)
         JumpTargets.BranchTargets.clear();
+      if (ptc_compat::isPTCAbiV2())
+        JumpTargets.BranchTargets.clear();
       *ptc.isCall = 0;
     }
 
@@ -4433,12 +4456,13 @@ void CodeGenerator::translate(uint64_t VirtualAddress) {
 		                                     Translator.branchsize(),
 		                                     branchLabeledcontent);
 	                } else if (Translator.branchsize() > 1) {
-                  runnable_log(TranslatePCLog,
-                               "Skipping QEMU v2 static conditional branch"
-                               " frontier from block=0x" << hexValue(tmpVA)
-                               << " concrete-next=0x"
-                               << hexValue(VirtualAddress) << DoLog);
-                }
+	                  runnable_log(TranslatePCLog,
+	                               "Skipping QEMU v2 static conditional branch"
+	                               " frontier from block=0x" << hexValue(tmpVA)
+	                               << " concrete-next=0x"
+	                               << hexValue(VirtualAddress) << DoLog);
+	                  JumpTargets.BranchTargets.clear();
+	                }
 	                if (ParallelConfig.WorkerMode)
 	                  JumpTargets.BranchTargets.clear();
 		      }

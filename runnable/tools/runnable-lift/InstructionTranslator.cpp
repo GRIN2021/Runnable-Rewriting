@@ -18,9 +18,6 @@
 #include "llvm/ADT/Optional.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Config/llvm-config.h"
-#if LLVM_VERSION_MAJOR >= 18
-#include <optional>
-#endif
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/CFG.h"
 #include "llvm/IR/DataLayout.h"
@@ -47,10 +44,6 @@
 using namespace llvm;
 
 using IT = InstructionTranslator;
-
-#if LLVM_VERSION_MAJOR >= 18
-static constexpr std::nullopt_t None = std::nullopt;
-#endif
 
 static unsigned getCallArgCount(CallInst *Call) {
 #if LLVM_VERSION_MAJOR >= 14
@@ -1301,8 +1294,7 @@ IT::newInstruction(PTCInstruction *Instr,
   }
 
   std::stringstream OriginalStringStream;
-  if (!ptc_compat::isPTCAbiV2())
-    disassemble(OriginalStringStream, PC, DisassembleMaxBytes, 4096, &Binary);
+  disassemble(OriginalStringStream, PC, DisassembleMaxBytes, 4096, &Binary);
   std::string OriginalString =
     formatCompareAssemblyMarker(PC, OriginalStringStream.str());
 
@@ -1532,14 +1524,12 @@ static Type *getPointerElementTypeForSync(Type *Ty) {
   if (PtrTy == nullptr)
     return nullptr;
 
-#if LLVM_VERSION_MAJOR >= 15
 #if LLVM_VERSION_MAJOR >= 18
   return nullptr;
-#else
+#elif LLVM_VERSION_MAJOR >= 15
   if (PtrTy->isOpaque())
     return nullptr;
   return PtrTy->getNonOpaquePointerElementType();
-#endif
 #else
   return PtrTy->getElementType();
 #endif

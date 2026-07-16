@@ -16,6 +16,7 @@
 // LLVM includes
 #include "llvm/ADT/Optional.h"
 #include "llvm/ADT/SmallSet.h"
+#include "llvm/Config/llvm-config.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Type.h"
@@ -52,6 +53,25 @@ static auto FixAccessLog = Logger<>("cpustate-fix-access");
 static uint64_t NumUnknown = 0;
 static std::map<std::string, uint64_t> FunToNumUnknown;
 static std::map<std::string, std::set<std::string>> FunToUnknowns;
+
+static void moveInstructionsAfterToBlockEnd(Instruction *Anchor,
+                                            BasicBlock *Destination) {
+  BasicBlock *Source = Anchor->getParent();
+  auto AnchorIt = Anchor->getIterator();
+  runnable_assert(AnchorIt != Source->end());
+  runnable_assert(std::next(AnchorIt) != Source->end());
+#if LLVM_VERSION_MAJOR >= 18
+  while (std::next(AnchorIt) != Source->end()) {
+    Instruction &ToMove = *std::next(AnchorIt);
+    ToMove.moveBefore(*Destination, Destination->end());
+  }
+#else
+  Destination->getInstList().splice(Destination->end(),
+                                    Source->getInstList(),
+                                    std::next(AnchorIt),
+                                    Source->end());
+#endif
+}
 
 void writeToLog(Logger<true> &L, const CSVOffsets &O, int /*Ignore*/) {
   L << "Kind: " << CSVOffsets::toString(O.OffsetKind);
@@ -2464,17 +2484,7 @@ CPUStateAccessAnalysis::setupOutEnvAccess(Instruction *AccessToFix) {
   // the access
   BasicBlock *NextBB = BasicBlock::Create(Context, "AfterAccess", F);
   AccessToFixBB->replaceSuccessorsPhiUsesWith(NextBB);
-#if LLVM_VERSION_MAJOR >= 18
-  NextBB->splice(NextBB->end(),
-                 AccessToFixBB,
-                 std::next(InstrIt),
-                 AccessToFixBB->end());
-#else
-  NextBB->getInstList().splice(NextBB->end(),
-                               AccessToFixBB->getInstList(),
-                               std::next(InstrIt),
-                               AccessToFixBB->end());
-#endif
+  moveInstructionsAfterToBlockEnd(AccessToFix, NextBB);
   runnable_assert(not NextBB->empty());
 
   // Create a new block OutAccessBB only for accesses outside env, and
@@ -2786,17 +2796,7 @@ void CPUStateAccessAnalysis::correctCPUStateAccesses() {
       runnable_assert(std::next(InstrIt) != AccessToFixBB->end());
       BasicBlock *NextBB = BasicBlock::Create(Context, "AfterInAccess", F);
       AccessToFixBB->replaceSuccessorsPhiUsesWith(NextBB);
-#if LLVM_VERSION_MAJOR >= 18
-      NextBB->splice(NextBB->end(),
-                     AccessToFixBB,
-                     std::next(InstrIt),
-                     AccessToFixBB->end());
-#else
-      NextBB->getInstList().splice(NextBB->end(),
-                                   AccessToFixBB->getInstList(),
-                                   std::next(InstrIt),
-                                   AccessToFixBB->end());
-#endif
+      moveInstructionsAfterToBlockEnd(AccessToFix, NextBB);
       runnable_assert(not NextBB->empty());
       runnable_assert(std::next(InstrIt) == AccessToFixBB->end());
       // If we're processing loads, add a PHI in NextBB if necessary
