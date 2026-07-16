@@ -59,9 +59,6 @@ if [[ "$use_docker" -eq 0 && "${RUNNABLE_LIBCRYPTO_REBUILD:-0}" != "1" && -x "$R
   mkdir -p "$RUN_ROOT"
   rm -rf "$RUN_ROOT/shared-install-runnable"
   cp -a "$ROOT/prebuilt/shared-install-runnable" "$RUN_ROOT/shared-install-runnable"
-elif [[ "$use_docker" -eq 0 ]]; then
-  echo "== Build/stage QEMU V2 libtinycode =="
-  RUNNABLE_LIBCRYPTO_NO_DOCKER=1 "$ROOT/build-libtinycode-qemuv2.sh" stage-bundled
 fi
 
 if [[ "$use_docker" -eq 0 ]]; then

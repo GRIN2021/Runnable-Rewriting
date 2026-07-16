@@ -17,15 +17,18 @@ The tarball includes:
 - bundled `libcrypto.so.3` and `libcrypto.gtBlock.pb`
 - the full QEMU V2 `libtinycode-x86_64.so` used by the reference run
 - the matching `libtinycode-helpers-x86_64.ll`
-- a bundled prebuilt `runnable-lift` install used by the no-Docker WSL path
+- host-build helpers for compiling `runnable-lift` natively on WSL/Ubuntu
 - `build-libtinycode-qemuv2.sh`, an explicit QEMU V2 `libtinycode` build/stage
   script
 - `run-libcrypto-full-qemuv2.sh`, an explicit full `libcrypto.so` experiment
   script with precision/recall compare enabled by default
+- `run-libcrypto-ubuntu2404.sh`, a compatibility entrypoint whose `full` mode
+  dispatches to the no-Docker host path when Docker is unavailable
 
 Readable copies of those scripts are also committed at:
 
 ```text
+scripts/repro/run-libcrypto-ubuntu2404.sh
 scripts/repro/build-libtinycode-qemuv2.sh
 scripts/repro/run-libcrypto-full-qemuv2.sh
 ```
@@ -37,22 +40,17 @@ The bundled QEMU V2 runtime hashes are:
 5977b32dd6710d0459aa9b4fd4290350f69c9333e2aaa53005fcbb554ab27fb2  libtinycode-helpers-x86_64.ll
 ```
 
-The bundled no-Docker `runnable-lift` was checked on the source machine with:
-
-```text
-runnable-lift: 1addc607d7f9d6a06ba61cff01581101973e63b1b5bdc7e166f88e6e244dd839
-```
-
 ## WSL Requirements
 
 - WSL2, preferably Ubuntu 22.04 or 24.04.
-- No Docker is required for the native WSL path. The default native path uses
-  the bundled prebuilt `runnable-lift` install so it can reproduce the measured
-  precision/recall without rebuilding the whole toolchain first.
+- No Docker is required for the native WSL path. The package builds
+  `runnable-lift` natively on WSL/Ubuntu and stages the bundled full QEMU V2
+  `libtinycode` runtime.
 - Keep the extracted package on the WSL Linux filesystem, for example under
   `~/work`, not under `/mnt/c/...`.
-- Install runtime dependencies with `apt` as shown below. Install LLVM 18 only
-  if you want to rebuild `runnable-lift`/`libtinycode` locally.
+- Install host dependencies with the bundled
+  `Runnable-Rewriting/runnable/scripts/host-build/install-host-deps.sh` helper
+  before running without Docker.
 - The validated no-Docker host run used about 48 GB of output disk and took
   4313 seconds on the source machine.
 
@@ -75,12 +73,9 @@ sha256sum -c SHA256SUMS
 chmod +x run-libcrypto-ubuntu2404.sh
 chmod +x build-libtinycode-qemuv2.sh run-libcrypto-full-qemuv2.sh
 
-sudo apt update
-sudo apt install -y \
-  build-essential cmake ninja-build git rsync python3 python3-pip \
-  protobuf-compiler binutils zlib1g libzstd1 libtinfo6
+sudo bash Runnable-Rewriting/runnable/scripts/host-build/install-host-deps.sh
 
-RUNNABLE_LIBCRYPTO_NO_DOCKER=1 ./run-libcrypto-full-qemuv2.sh
+RUNNABLE_LIBCRYPTO_NO_DOCKER=1 ./run-libcrypto-ubuntu2404.sh full
 ```
 
 After the full run finishes:
@@ -153,13 +148,13 @@ For smaller WSL machines:
 RUNNABLE_LIBCRYPTO_NO_DOCKER=1 \
 RUNNABLE_LIBCRYPTO_FULL_MEM_GB=24 \
 RUNNABLE_LIBCRYPTO_FULL_CPUS=12 \
-./run-libcrypto-full-qemuv2.sh
+./run-libcrypto-ubuntu2404.sh full
 ```
 
 To test lift only and skip precision/recall compare:
 
 ```bash
-RUNNABLE_LIBCRYPTO_SKIP_CMP=1 ./run-libcrypto-full-qemuv2.sh
+RUNNABLE_LIBCRYPTO_SKIP_CMP=1 ./run-libcrypto-ubuntu2404.sh full
 ```
 
 If Docker is available and you want the containerized path:
@@ -169,16 +164,16 @@ If Docker is available and you want the containerized path:
 ./run-libcrypto-full-qemuv2.sh
 ```
 
-To rebuild QEMU V2 `libtinycode`/`runnable-lift` locally instead of using the
-bundled prebuilt runtime, install LLVM 18 and run:
+To force a local rebuild path, run:
 
 ```bash
-sudo apt install -y clang-18 llvm-18 llvm-18-dev llvm-18-tools lld-18
+sudo bash Runnable-Rewriting/runnable/scripts/host-build/install-host-deps.sh
 RUNNABLE_LIBCRYPTO_NO_DOCKER=1 RUNNABLE_LIBCRYPTO_REBUILD=1 \
   ./build-libtinycode-qemuv2.sh stage-bundled
 RUNNABLE_LIBCRYPTO_NO_DOCKER=1 RUNNABLE_LIBCRYPTO_REBUILD=1 \
   ./run-libcrypto-full-qemuv2.sh
 ```
 
-For metric reproduction, use the default prebuilt path above. The rebuild path
-is provided so the QEMU V2 `libtinycode` build can be inspected on WSL.
+For metric reproduction, use the default bundled QEMU V2 `libtinycode` path
+above. The rebuild path is provided so the native build can be inspected on
+WSL.
