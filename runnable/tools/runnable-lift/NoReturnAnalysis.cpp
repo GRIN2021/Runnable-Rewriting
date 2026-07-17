@@ -7,8 +7,10 @@
 
 // LLVM includes
 #include "llvm/Analysis/LoopInfo.h"
+#include "llvm/Config/llvm-config.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/Function.h"
+#include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Module.h"
 
@@ -24,6 +26,20 @@ using namespace llvm;
 
 Logger<> NRALog("nra");
 
+namespace {
+
+static LoadInst *createLoad(Type *LoadedType, Value *Pointer, const Twine &Name,
+                            Instruction *InsertBefore) {
+#if LLVM_VERSION_MAJOR >= 15
+  return new LoadInst(LoadedType, Pointer, Name, InsertBefore);
+#else
+  (void) LoadedType;
+  return new LoadInst(Pointer, Name, InsertBefore);
+#endif
+}
+
+} // namespace
+
 void NoReturnAnalysis::registerSyscalls(llvm::Function *F) {
   // Look for calls to the syscall helper
   Module *M = F->getParent();
@@ -32,15 +48,18 @@ void NoReturnAnalysis::registerSyscalls(llvm::Function *F) {
     return;
 
   StringRef RegisterName = SourceArchitecture.syscallNumberRegister();
-  Value *SyscallNumberRegister = M->getGlobalVariable(RegisterName);
+  GlobalVariable *SyscallNumberRegister = M->getGlobalVariable(RegisterName);
   if (SyscallNumberRegister == nullptr)
     return;
 
   // Lazily create the "nodce" function
   if (NoDCE == nullptr) {
     Type *VoidTy = Type::getVoidTy(M->getContext());
-    Type *SNRTy = SyscallNumberRegister->getType()->getPointerElementType();
-    auto *FunctionC = M->getOrInsertFunction("nodce", VoidTy, SNRTy);
+    Type *SNRTy = SyscallNumberRegister->getValueType();
+    auto *FunctionC = runnable_llvm::getOrInsertFunction(*M,
+                                                         "nodce",
+                                                         VoidTy,
+                                                         SNRTy);
     NoDCE = cast<Function>(FunctionC);
   }
 
@@ -54,7 +73,10 @@ void NoReturnAnalysis::registerSyscalls(llvm::Function *F) {
       // the register of the syscall number. The load is also used as a
       // parameter to a "nodce" function to prevent the DCE from removing it.
       if (RegisteredSyscalls.count(Call) == 0) {
-        auto *DeadLoad = new LoadInst(SyscallNumberRegister, "", Call);
+        auto *DeadLoad = createLoad(SyscallNumberRegister->getValueType(),
+                                    SyscallNumberRegister,
+                                    "",
+                                    Call);
         CallInst::Create(NoDCE, { DeadLoad }, "", Call);
         SyscallRegisterReads.push_back(DeadLoad);
         RegisteredSyscalls.insert(Call);
@@ -234,8 +256,12 @@ void NoReturnAnalysis::computeKillerSet(PredecessorsMap &CallPredecessors) {
     TerminatorInst *Terminator = P.second;
     KillerBB->getTerminator()->eraseFromParent();
     if (KillerBB->empty()) {
+#if LLVM_VERSION_MAJOR >= 15
+      Terminator->insertInto(KillerBB, KillerBB->begin());
+#else
       auto &List = KillerBB->getInstList();
       List.insert(List.begin(), Terminator);
+#endif
     } else {
       Terminator->insertAfter(&KillerBB->back());
     }

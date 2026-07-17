@@ -34,6 +34,7 @@ class Module;
 
 class JumpTargetManager;
 class VariableManager;
+class BinaryFile;
 
 /// \brief Expands a PTC instruction to LLVM IR
 class InstructionTranslator {
@@ -51,6 +52,7 @@ public:
   /// \param TargetArchitecture the output architecture.
   InstructionTranslator(llvm::IRBuilder<> &Builder,
                         VariableManager &Variables,
+                        const BinaryFile &Binary,
                         JumpTargetManager &JumpTargets,
                         std::vector<llvm::BasicBlock *> Blocks,
                         const Architecture &SourceArchitecture,
@@ -102,17 +104,25 @@ public:
   TranslationResult
   translate(PTCInstruction *Instr, uint64_t PC, uint64_t NextPC);
 
+  /// \brief Validate that \p Instr uses the legacy scalar opcode schema that
+  ///        runnable-lift can currently translate.
+  TranslationResult validateOpcode(PTCInstruction *Instr, bool Report = true);
+
   /// \brief Translate a call to an helper
   ///
   /// \param Instr the PTCInstruction of the call to the helper.
   ///
   /// \return see InstructionTranslator::TranslationResult.
-  TranslationResult translateCall(PTCInstruction *Instr);
+  TranslationResult translateCall(PTCInstruction *Instr, uint64_t PC);
 
   /// \brief Handle calls to `newPC` marker and emit coverage information
   ///
   /// \param CoveragePath path where the coverage information should be stored.
-  void finalizeNewPCMarkers(std::string &CoveragePath);
+  void finalizeNewPCMarkers(std::string &CoveragePath,
+                            bool RemoveRuntimeMarkers = false);
+
+  /// \brief Materialize unresolved PTC label blocks before leaving a TB.
+  unsigned finalizePendingLabelBlocks();
 
   /// \brief Notifies InstructionTranslator about a new PTC translation
   void reset() { LabeledBasicBlocks.clear(); }
@@ -139,6 +149,7 @@ private:
 private:
   llvm::IRBuilder<> &Builder;
   VariableManager &Variables;
+  const BinaryFile &Binary;
   JumpTargetManager &JumpTargets;
   std::map<std::string, llvm::BasicBlock *> LabeledBasicBlocks;
   std::vector<llvm::BasicBlock *> Blocks;

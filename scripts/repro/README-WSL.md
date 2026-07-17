@@ -80,6 +80,9 @@ Small differences are possible if the bundled source or system toolchain is
 changed, but this package includes the same ground truth binary and QEMU V2
 `libtinycode` runtime used by the reference run.
 
+The restored no-Docker archive was revalidated from a fresh HDD extract on
+2026-07-17 with `precision: 0.987791`, `recall: 0.828729`, and `ok: true`.
+
 ## Useful Overrides
 
 Use a different output location:

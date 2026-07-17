@@ -11,12 +11,14 @@
 
 // Standard includes
 #include <iterator>
+#include <stack>
 
 // LLVM includes
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instruction.h"
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/Module.h"
+#include "llvm/Support/SwapByteOrder.h"
 
 // Local libraries includes
 #include "runnable/Support/Debug.h"
@@ -377,11 +379,11 @@ OperationsStack::materialize(Constant *NewOperand, bool HandleSymbols) {
 
       Type *T = NewOperand->getType();
       if (T->isIntegerTy(16))
-        Value = ByteSwap_16(Value);
+        Value = sys::getSwappedBytes(static_cast<uint16_t>(Value));
       else if (T->isIntegerTy(32))
-        Value = ByteSwap_32(Value);
+        Value = sys::getSwappedBytes(static_cast<uint32_t>(Value));
       else if (T->isIntegerTy(64))
-        Value = ByteSwap_64(Value);
+        Value = sys::getSwappedBytes(static_cast<uint64_t>(Value));
       else
         runnable_unreachable("Unexpected type");
 

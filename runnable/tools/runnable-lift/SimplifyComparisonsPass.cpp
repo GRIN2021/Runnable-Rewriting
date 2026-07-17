@@ -6,6 +6,7 @@
 //
 
 // Standard includes
+#include <bitset>
 #include <queue>
 #include <tuple>
 

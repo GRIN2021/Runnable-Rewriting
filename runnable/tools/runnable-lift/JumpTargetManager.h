@@ -17,8 +17,13 @@
 #include <boost/type_traits/is_same.hpp>
 
 // LLVM includes
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/Optional.h"
+#include "llvm/Config/llvm-config.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/Support/Endian.h"
+#include "llvm/Support/raw_ostream.h"
 
 // Local libraries includes
 #include "runnable/Support/IRHelpers.h"
@@ -41,6 +46,12 @@ class SwitchInst;
 class StoreInst;
 class Value;
 } // namespace llvm
+
+#if LLVM_VERSION_MAJOR >= 15
+using RunnableEndianness = llvm::endianness;
+#else
+using RunnableEndianness = llvm::support::endianness;
+#endif
 
 class JumpTargetManager;
 
@@ -183,6 +194,9 @@ public:
   std::vector<std::tuple<uint64_t, llvm::BasicBlock *, uint64_t>> BranchTargets;  
 
   void harvestCallBasicBlock(llvm::BasicBlock *thisBlock, uint64_t thisAddr);
+  void harvestCallBasicBlock(llvm::BasicBlock *thisBlock,
+                             uint64_t thisAddr,
+                             uint64_t ReturnPC);
   void harvestBTBasicBlock(llvm::BasicBlock *thisBlock, uint64_t thisAddr, uint64_t destAddr);
 
   enum LastAssignmentResult{
@@ -232,6 +246,7 @@ public:
   using StaticAddrsMap = std::map<uint64_t, uint32_t>;  
   StaticAddrsMap StaticAddrs;
   StaticAddrsMap UnexploreStaticAddr;
+  void rememberStaticAddr(uint64_t PC, uint32_t Flag);
   void harvestStaticAddr(llvm::BasicBlock *thisBlock);
 
   StaticAddrsMap EmbeddedDataAddrs;
@@ -248,6 +263,7 @@ public:
 
   std::vector<uint64_t> IllegalStaticAddrs;
   bool isIllegalStaticAddr(uint64_t pc);
+  bool isOutOfAddrRange(uint64_t pc);
 
   void TestSuspectDataRegion(std::string path);
   StaticAddrsMap SuspectDataRegion;
@@ -466,6 +482,13 @@ public:
   /// \brief Save the PC-Instruction association for future use
   void registerInstruction(uint64_t PC, llvm::Instruction *Instruction);
 
+  /// \brief Save the byte extent of an original instruction.
+  void registerInstructionExtent(uint64_t PC, uint64_t Size);
+
+  /// \brief Return true when \p PC is inside a known translated instruction,
+  ///        but not at that instruction's start address.
+  bool isInsideKnownInstruction(uint64_t PC) const;
+
   /// \brief Return the most recent instruction writing the program counter
   ///
   /// Note that the search is performed only in the current basic block.  The
@@ -532,10 +555,23 @@ public:
 
   /// \brief Return true if \p PC is in an executable segment
   bool isExecutableAddress(uint64_t PC) const {
-//    for (std::pair<uint64_t, uint64_t> Range : ExecutableRanges)
-      if (CodeSegmStartAddr <= PC && PC < ro_StartAddr)
-        return true;
-    return false;
+    bool InExecutableSegment = false;
+    for (std::pair<uint64_t, uint64_t> Range : ExecutableRanges) {
+      if (Range.first <= PC && PC < Range.second) {
+        InExecutableSegment = true;
+        break;
+      }
+    }
+    if (!InExecutableSegment)
+      return false;
+
+    if (CodeSegmStartAddr != 0 && PC < CodeSegmStartAddr)
+      return false;
+
+    if (ro_StartAddr != 0 && PC >= ro_StartAddr)
+      return false;
+
+    return true;
   }
 
   /// \brief Get the basic block associated to the original address \p PC
@@ -559,6 +595,11 @@ public:
   llvm::BasicBlock *registerJT(uint64_t PC, JTReason::Values Reason);
 
   bool hasJT(uint64_t PC) { return JumpTargets.count(PC) != 0; }
+
+  llvm::Optional<uint64_t>
+  resolveConstantPCStoreValue(llvm::Value *StoredValue);
+
+  bool pinConstantDirectBranches();
 
   std::map<uint64_t, JumpTarget>::const_iterator begin() const {
     return JumpTargets.begin();
@@ -649,6 +690,12 @@ public:
   /// \brief Increment the counter of emitted branches since the last reset
   void newBranch() { NewBranches++; }
 
+  /// \brief Resolve currently visible direct exitTB jumps.
+  ///
+  /// This can register additional executable jump targets. Callers that are
+  /// still in the lifting phase must drain the worklist again afterwards.
+  bool translateDirectJumpTargets();
+
   /// \brief Finalizes information about the jump targets
   ///
   /// Call this function once no more jump targets can be discovered.  It will
@@ -659,6 +706,7 @@ public:
   /// This function also fixes the "anypc" and "unexpectedpc" basic blocks to
   /// their proper behavior.
   void finalizeJumpTargets() {
+    translateDirectJumpTargets();
     translateIndirectJumps();
 
     unsigned ReadSize = Binary.architecture().pointerSize() / 8;
@@ -696,8 +744,14 @@ public:
     for (auto &P : JumpTargets) {
       JumpTarget &JT = P.second;
       TerminatorInst *T = JT.head()->getTerminator();
-     // errs()<<(JT.head()->getName())<<"\n";
-     // errs()<<JT.head()->empty()<<"      terminator\n";
+      if (T == nullptr) {
+        errs() << "runnable-lift: warning: materializing empty jump target"
+               << " pc=0x";
+        errs().write_hex(P.first);
+        errs() << " block=" << JT.head()->getName() << "\n";
+        new UnreachableInst(Context, JT.head());
+        T = JT.head()->getTerminator();
+      }
       runnable_assert(T != nullptr);
 
       std::vector<Metadata *> Reasons;
@@ -720,7 +774,7 @@ public:
 
   // TODO: can we drop this in favor of GeneratedCodeBasicInfo::isJump?
   bool isJump(llvm::TerminatorInst *T) const {
-    for (llvm::BasicBlock *Successor : T->successors()) {
+    for (llvm::BasicBlock *Successor : runnable_llvm::successors(T)) {
       if (!(Successor == Dispatcher || Successor == DispatcherFail
             || isJumpTarget(getBasicBlockPC(Successor))))
         return false;
@@ -783,8 +837,10 @@ private:
     runnable_assert(I->use_empty());
 
     uint64_t PC = getPCFromNewPCCall(I);
-    if (PC != 0)
+    if (PC != 0) {
       OriginalInstructionAddresses.erase(PC);
+      OriginalInstructionSizes.erase(PC);
+    }
     I->eraseFromParent();
   }
 
@@ -806,7 +862,7 @@ private:
   void
   createDispatcher(llvm::Function *OutputFunction, llvm::Value *SwitchOnPtr);
 
-  template<typename value_type, unsigned endian>
+  template<typename value_type, RunnableEndianness endian>
   void findCodePointers(uint64_t StartVirtualAddress,
                         const unsigned char *Start,
                         const unsigned char *End);
@@ -816,6 +872,8 @@ private:
   void handleSumJump(llvm::Instruction *SumJump);
 
 private:
+  llvm::Optional<uint64_t> resolveCachedConstantIntegerStore(llvm::Value *Pointer);
+
   using BlockMap = std::map<uint64_t, JumpTarget>;
   using InstructionMap = std::map<uint64_t, llvm::Instruction *>;
 
@@ -825,6 +883,8 @@ private:
   /// Holds the association between a PC and the last generated instruction for
   /// the previous instruction.
   InstructionMap OriginalInstructionAddresses;
+  /// Holds the byte size for every original instruction we have translated.
+  std::map<uint64_t, uint64_t> OriginalInstructionSizes;
   /// Holds the association between a PC and a BasicBlock.
   BlockMap JumpTargets;
   /// Queue of program counters we still have to translate.
@@ -850,6 +910,8 @@ private:
   CFGForm::Values CurrentCFGForm;
   std::set<llvm::BasicBlock *> ToPurge;
   std::set<uint64_t> SimpleLiterals;
+  llvm::DenseMap<const llvm::Value *, uint64_t> ConstantIntegerStoreCache;
+  llvm::DenseSet<const llvm::Value *> NonConstantIntegerStoreCache;
 };
 
 template<>

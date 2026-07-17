@@ -140,6 +140,15 @@ false_negative: 116146
 false_positive: 6844
 ```
 
+The restored no-Docker archive was revalidated from a fresh extract on HDD on
+2026-07-17 with all 5326 seeds successful:
+
+```text
+precision: 0.9877913156962282
+recall: 0.8287285174818176
+ok: true
+```
+
 ## Resource Overrides
 
 For smaller WSL machines:

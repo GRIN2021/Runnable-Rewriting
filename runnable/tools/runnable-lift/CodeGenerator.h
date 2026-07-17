@@ -8,7 +8,9 @@
 // Standard includes
 #include <cstdint>
 #include <memory>
+#include <set>
 #include <string>
+#include <vector>
 
 // LLVM includes
 #include "llvm/ADT/ArrayRef.h"
@@ -18,6 +20,7 @@
 
 // Local includes
 #include "BinaryFile.h"
+#include "ParallelOptions.h"
 
 // Forward declarations
 namespace llvm {
@@ -38,6 +41,14 @@ class ObjectFile;
 
 class DebugHelper;
 
+struct ParallelWorkerState {
+  int Pid = -1;
+  uint64_t SeedPC = 0;
+  std::string OutputPath;
+  int ExitCode = -1;
+  bool Finished = false;
+};
+
 /// Translator from binary code to LLVM IR.
 class CodeGenerator {
 public:
@@ -54,7 +65,8 @@ public:
                 llvm::LLVMContext &TheContext,
                 std::string Output,
                 std::string Helpers,
-                std::string EarlyLinked);
+                std::string EarlyLinked,
+                const ParallelOptions &Options);
 
   ~CodeGenerator();
 
@@ -97,12 +109,25 @@ private:
   /// \param Name name of the imported function
   llvm::Function *importHelperFunctionDeclaration(llvm::StringRef Name);
 
+  std::string workerOutputPath(uint64_t SeedPC) const;
+  void configureOutputArtifacts(const std::string &Output);
+  void switchToWorkerOutput(uint64_t SeedPC);
+  int runFreshBranchWorker(uint64_t SeedPC);
+  void pollFinishedForkWorkers(bool Block);
+  bool trySpawnBranchWorker(uint64_t SeedPC,
+                            std::vector<std::tuple<uint64_t, llvm::BasicBlock *, uint64_t>> &BranchTargets);
+  void activateBranchFrontierState();
+  void waitForForkWorkers();
+  void mergeForkWorkerFragments();
+
 private:
   Architecture TargetArchitecture;
   llvm::LLVMContext &Context;
   std::unique_ptr<llvm::Module> TheModule;
   std::unique_ptr<llvm::Module> HelpersModule;
   std::unique_ptr<llvm::Module> EarlyLinkedModule;
+  std::string HelpersPath;
+  std::string EarlyLinkedPath;
   std::string OutputPath;
   std::unique_ptr<DebugHelper> Debug;
   BinaryFile &Binary;
@@ -112,6 +137,19 @@ private:
   unsigned DbgMDKind;
 
   std::string FunctionListPath;
+  ParallelOptions ParallelConfig;
+  std::vector<ParallelWorkerState> ParallelWorkers;
+  std::set<uint64_t> ParallelSpawnedSeeds;
+  uint64_t ParallelFrontierCandidates = 0;
+  uint64_t PendingWorkerStateDrops = 0;
+  // Register file snapshot taken right before forking a branch worker; the
+  // forked child reads it (COW-inherited) and hands it to the fresh worker so
+  // the seed block decodes with the coordinator's concrete register context.
+  bool SeedRegsSnapshotValid = false;
+  uint64_t SeedRegsSnapshot[16] = { 0 };
+  uint64_t ParallelWorkersSpawned = 0;
+  uint64_t ParallelWorkersSucceeded = 0;
+  uint64_t ParallelWorkersFailed = 0;
 };
 
 #endif // CODEGENERATOR_H

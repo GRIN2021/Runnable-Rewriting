@@ -31,9 +31,6 @@
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/Verifier.h"
 #include "llvm/Config/llvm-config.h"
-#if LLVM_VERSION_MAJOR >= 18
-#include <optional>
-#endif
 #include "llvm/Support/Endian.h"
 #include "llvm/Transforms/Scalar.h"
 #include "llvm/Transforms/Utils/Cloning.h"
@@ -54,10 +51,6 @@
 #include "SubGraph.h"
 
 using namespace llvm;
-
-#if LLVM_VERSION_MAJOR >= 18
-static constexpr std::nullopt_t None = std::nullopt;
-#endif
 
 namespace {
 

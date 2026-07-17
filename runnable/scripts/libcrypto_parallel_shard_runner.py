@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import threading
 import time
@@ -101,6 +102,37 @@ def append_jsonl(path: Path, payload: Dict[str, object], *, lock: threading.Lock
             handle.write(line + "\n")
 
 
+def merge_seed_output(
+    *,
+    raw_ll: Path,
+    merged_ll: Path,
+    fragment_dir: Path,
+    merge_summary: Path,
+    entry_pc: int,
+) -> List[Path]:
+    worker_inputs = sorted(fragment_dir.glob("worker_*.ll"))
+    ensure_dir(merged_ll.parent)
+    if worker_inputs:
+        run_cmd(
+            [
+                "python3",
+                str(Path(__file__).resolve().parent / "merge_dynamic_runnable_fragments.py"),
+                "--output",
+                str(merged_ll),
+                "--entry-pc",
+                hex(entry_pc),
+                "--summary-out",
+                str(merge_summary),
+                str(raw_ll),
+                *(str(path) for path in worker_inputs),
+            ],
+            capture_output=False,
+        )
+    else:
+        shutil.copy2(raw_ll, merged_ll)
+    return worker_inputs
+
+
 def run_seed(
     *,
     args: argparse.Namespace,
@@ -158,7 +190,15 @@ mkdir -p {shlex.quote(str(fragment_dir))}
     started = time.time()
     result = run_cmd(["bash", "-lc", shell_script], check=False, capture_output=False)
     rc = result.returncode
-    worker_inputs = sorted(fragment_dir.glob("worker_*.ll"))
+    worker_inputs: List[Path] = []
+    if rc == 0 and raw_ll.exists():
+        worker_inputs = merge_seed_output(
+            raw_ll=raw_ll,
+            merged_ll=merged_ll,
+            fragment_dir=fragment_dir,
+            merge_summary=merge_summary,
+            entry_pc=args.runnable_base + start,
+        )
     if rc == 0 and not args.preserve_success_seed_logs:
         try:
             stdout_log.unlink()
@@ -175,7 +215,7 @@ mkdir -p {shlex.quote(str(fragment_dir))}
         "start": start,
         "entry_pc": args.runnable_base + start,
         "size": int(seed["size"]),
-        "status": "ok" if rc == 0 and raw_ll.exists() else "failed",
+        "status": "ok" if rc == 0 and merged_ll.exists() else "failed",
         "rc": rc,
         "elapsed_sec": time.time() - started,
         "workers_spawned": len(worker_inputs),

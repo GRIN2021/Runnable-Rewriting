@@ -13,7 +13,17 @@
 // LLVM includes
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/StringRef.h"
+#if defined(__has_include)
+#if __has_include("llvm/ADT/Triple.h")
 #include "llvm/ADT/Triple.h"
+#elif __has_include("llvm/TargetParser/Triple.h")
+#include "llvm/TargetParser/Triple.h"
+#else
+#error "Cannot find an LLVM Triple.h header"
+#endif
+#else
+#include "llvm/ADT/Triple.h"
+#endif
 
 // Local libraries includes
 #include "runnable/ReachingDefinitions/ReachingDefinitionsPass.h"
@@ -25,7 +35,9 @@ class CallInst;
 class Instruction;
 class LoadInst;
 class StoreInst;
+#if LLVM_VERSION_MAJOR < 8
 class TerminatorInst;
+#endif
 } // namespace llvm
 
 class NoReturnAnalysis {

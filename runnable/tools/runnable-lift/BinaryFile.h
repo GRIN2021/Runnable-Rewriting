@@ -15,8 +15,10 @@
 
 // LLVM includes
 #include "llvm/ADT/Optional.h"
+#include "llvm/Config/llvm-config.h"
 #include "llvm/Object/Binary.h"
 #include "llvm/Object/ELFTypes.h"
+#include "llvm/Support/Endian.h"
 
 // Local libraries includes
 #include "runnable/Support/runnable.h"
@@ -370,7 +372,11 @@ template<typename T>
 struct Endianess<T, llvm::object::ELF32LE> {
   static uint64_t read(const uint8_t *Buf) {
     using namespace llvm::support;
+#if LLVM_VERSION_MAJOR >= 15
+    return endian::read<T, llvm::endianness::little, unaligned>(Buf);
+#else
     return endian::read<T, little, unaligned>(Buf);
+#endif
   }
 };
 
@@ -378,7 +384,11 @@ template<typename T>
 struct Endianess<T, llvm::object::ELF64LE> {
   static uint64_t read(const uint8_t *Buf) {
     using namespace llvm::support;
+#if LLVM_VERSION_MAJOR >= 15
+    return endian::read<T, llvm::endianness::little, unaligned>(Buf);
+#else
     return endian::read<T, little, unaligned>(Buf);
+#endif
   }
 };
 
@@ -386,7 +396,11 @@ template<typename T>
 struct Endianess<T, llvm::object::ELF32BE> {
   static uint64_t read(const uint8_t *Buf) {
     using namespace llvm::support;
+#if LLVM_VERSION_MAJOR >= 15
+    return endian::read<T, llvm::endianness::big, unaligned>(Buf);
+#else
     return endian::read<T, big, unaligned>(Buf);
+#endif
   }
 };
 
@@ -394,7 +408,11 @@ template<typename T>
 struct Endianess<T, llvm::object::ELF64BE> {
   static uint64_t read(const uint8_t *Buf) {
     using namespace llvm::support;
+#if LLVM_VERSION_MAJOR >= 15
+    return endian::read<T, llvm::endianness::big, unaligned>(Buf);
+#else
     return endian::read<T, big, unaligned>(Buf);
+#endif
   }
 };
 
@@ -487,6 +505,9 @@ public:
   const std::vector<std::string> &neededLibraryNames() const {
     return NeededLibraryNames;
   }
+
+  const std::string &inputPath() const { return FilePath; }
+  uint64_t baseAddress() const { return BaseAddress; }
 
   const std::map<llvm::StringRef, uint64_t> &canonicalValues() const {
     return CanonicalValues;
@@ -608,6 +629,7 @@ private:
   }
 
 private:
+  std::string FilePath;
   llvm::object::OwningBinary<llvm::object::Binary> BinaryHandle;
   Architecture TheArchitecture;
   std::vector<SegmentInfo> Segments;

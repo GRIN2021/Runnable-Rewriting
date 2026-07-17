@@ -7,17 +7,29 @@
 
 // Standard includes
 #include "runnable/Support/Assert.h"
+#include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/StringRef.h"
+#include "llvm/Support/raw_ostream.h"
+#include <cctype>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <sstream>
 
 // Local includes
+#include "BinaryFile.h"
 #include "PTCDump.h"
 #include "PTCInterface.h"
 
 static const int MAX_TEMP_NAME_LENGTH = 128;
+
+static unsigned getPTCLabelId(PTCInstructionArg EncodedLabel) {
+  if (ptc.get_arg_label_id != nullptr)
+    return ptc.get_arg_label_id(EncodedLabel);
+  return static_cast<unsigned>(EncodedLabel);
+}
 
 static void getTemporaryName(char *Buffer,
                              size_t BufferSize,
@@ -153,7 +165,8 @@ int dumpInstruction(std::ostream &Result,
     case PTC_INSTRUCTION_op_movcond_i64: {
       PTCInstructionArg Arg = ptc_instruction_const_arg(&ptc, &Instruction, 0);
       PTCCondition ConditionId = static_cast<PTCCondition>(Arg);
-      const char *ConditionName = ptc.get_condition_name(ConditionId);
+      const char *ConditionName = ptc_compat::getConditionName(ptc,
+                                                               ConditionId);
 
       if (ConditionName != nullptr)
         Result << "," << ConditionName;
@@ -171,7 +184,7 @@ int dumpInstruction(std::ostream &Result,
     case PTC_INSTRUCTION_op_qemu_st_i64: {
       PTCInstructionArg Arg = ptc_instruction_const_arg(&ptc, &Instruction, 0);
       PTCLoadStoreArg LoadStoreArg = {};
-      LoadStoreArg = ptc.parse_load_store_arg(Arg);
+      LoadStoreArg = ptc_compat::parseLoadStoreArg(ptc, Arg);
 
       if (LoadStoreArg.access_type == PTC_MEMORY_ACCESS_UNKNOWN)
         Result << ","
@@ -179,7 +192,7 @@ int dumpInstruction(std::ostream &Result,
       else {
         const char *Alignment = nullptr;
         const char *LoadStoreName = nullptr;
-        LoadStoreName = ptc.get_load_store_name(LoadStoreArg.type);
+        LoadStoreName = ptc_compat::getLoadStoreName(ptc, LoadStoreArg.type);
 
         switch (LoadStoreArg.access_type) {
         case PTC_MEMORY_ACCESS_NORMAL:
@@ -219,7 +232,7 @@ int dumpInstruction(std::ostream &Result,
     case PTC_INSTRUCTION_op_brcond2_i32: {
       PTCInstructionArg Arg = ptc_instruction_const_arg(&ptc, &Instruction, i);
       Result << ","
-             << "$L" << ptc.get_arg_label_id(Arg);
+             << "$L" << getPTCLabelId(Arg);
 
       /* Consume one more argument */
       i++;
@@ -243,10 +256,111 @@ int dumpInstruction(std::ostream &Result,
   return EXIT_SUCCESS;
 }
 
+static bool tryObjdumpDisassemble(std::ostream &Result,
+                                  uint64_t PC,
+                                  uint32_t MaxBytes,
+                                  const BinaryFile &Binary) {
+  auto AddressData = Binary.getAddressData(PC);
+  if (!AddressData || AddressData->empty())
+    return false;
+
+  const uint64_t Base = Binary.baseAddress();
+  const uint64_t FileVA = (Base != 0 && PC >= Base) ? (PC - Base) : PC;
+  const uint64_t RequestedWindow = MaxBytes == 0 ? 16 : MaxBytes;
+  const uint64_t Window =
+    std::min<uint64_t>(RequestedWindow, AddressData->size());
+
+  std::ostringstream Command;
+  Command << "objdump -d --start-address=0x" << std::hex << FileVA
+          << " --stop-address=0x" << (FileVA + Window)
+          << " '" << Binary.inputPath() << "'";
+
+  FILE *Pipe = popen(Command.str().c_str(), "r");
+  if (Pipe == nullptr)
+    return false;
+
+  char Buffer[4096];
+  bool Success = false;
+  while (fgets(Buffer, sizeof(Buffer), Pipe) != nullptr) {
+    llvm::StringRef Line(Buffer);
+    Line = Line.trim();
+    if (Line.empty())
+      continue;
+
+    size_t ColonPos = Line.find(':');
+    if (ColonPos == llvm::StringRef::npos)
+      continue;
+
+    llvm::StringRef AddressToken = Line.take_front(ColonPos).trim();
+    char *End = nullptr;
+    uint64_t Address = std::strtoull(AddressToken.str().c_str(), &End, 16);
+    if (End == nullptr || *End != '\0' || Address != FileVA)
+      continue;
+
+    llvm::StringRef Rest = Line.drop_front(ColonPos + 1).ltrim();
+    while (!Rest.empty()) {
+      llvm::StringRef Token;
+      std::tie(Token, Rest) = Rest.split(' ');
+      Token = Token.trim();
+      Rest = Rest.ltrim();
+
+      if (Token.empty())
+        continue;
+
+      if (Token.size() == 2
+          && std::isxdigit(static_cast<unsigned char>(Token[0]))
+          && std::isxdigit(static_cast<unsigned char>(Token[1]))) {
+        continue;
+      }
+
+      Rest = Token;
+      break;
+    }
+
+    std::string Assembly = Rest.trim().str();
+    if (Assembly.empty())
+      continue;
+
+    Result << Assembly;
+    Success = true;
+    break;
+  }
+  pclose(Pipe);
+  return Success;
+}
+
 void disassemble(std::ostream &Result,
                  uint64_t PC,
                  uint32_t MaxBytes,
-                 uint32_t InstructionCount) {
+                 uint32_t InstructionCount,
+                 const BinaryFile *Binary) {
+  if (ptc.disassemble == nullptr) {
+    if (Binary != nullptr && tryObjdumpDisassemble(Result, PC, MaxBytes, *Binary))
+      return;
+
+    Result << "<disassemble unavailable>";
+    llvm::errs() << "runnable-lift: failed to disassemble instruction"
+                 << " pc=0x" << llvm::Twine::utohexstr(PC)
+                 << " max_bytes=" << MaxBytes
+                 << " instruction_count=" << InstructionCount;
+    if (Binary == nullptr) {
+      llvm::errs() << " reason=no-binary";
+    } else if (auto AddressData = Binary->getAddressData(PC)) {
+      llvm::errs() << " binary=" << Binary->inputPath()
+                   << " file_va=0x"
+                   << llvm::Twine::utohexstr(
+                        (Binary->baseAddress() != 0 && PC >= Binary->baseAddress())
+                          ? (PC - Binary->baseAddress())
+                          : PC)
+                   << " readable_bytes=" << AddressData->size();
+    } else {
+      llvm::errs() << " binary=" << Binary->inputPath()
+                   << " reason=no-readable-segment";
+    }
+    llvm::errs() << "\n";
+    return;
+  }
+
   char *BufferPtr = nullptr;
   size_t BufferLenPtr = 0;
   FILE *MemoryStream = open_memstream(&BufferPtr, &BufferLenPtr);

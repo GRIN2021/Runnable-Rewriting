@@ -10,7 +10,17 @@
 #include <string>
 
 // LLVM includes
+#if defined(__has_include)
+#if __has_include("llvm/ADT/Triple.h")
 #include "llvm/ADT/Triple.h"
+#elif __has_include("llvm/TargetParser/Triple.h")
+#include "llvm/TargetParser/Triple.h"
+#else
+#error "Cannot find an LLVM Triple.h header"
+#endif
+#else
+#include "llvm/ADT/Triple.h"
+#endif
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
@@ -20,6 +30,7 @@
 
 // Local libraries includes
 #include "runnable/Support/Debug.h"
+#include "runnable/Support/LLVMCompat.h"
 
 // Local includes
 #include "BinaryFile.h"
@@ -46,14 +57,16 @@ BasicBlock *ExternalJumpsHandler::createReturnFromExternal() {
   IRBuilder<> Builder(ReturnFromExternal);
 
   // Identify the global variables to be serialized
-  Constant *SavedRegistersPtr = TheModule.getGlobalVariable("saved_registers");
-  LoadInst *SavedRegisters = Builder.CreateLoad(SavedRegistersPtr);
+  auto *SavedRegistersPtr = TheModule.getGlobalVariable("saved_registers");
+  LoadInst *SavedRegisters = Builder.CreateLoad(SavedRegistersPtr->getValueType(),
+                                                SavedRegistersPtr);
 
   {
     // Deserialize the PC
-    Value *GEP = Builder.CreateGEP(SavedRegisters,
+    Value *GEP = Builder.CreateGEP(RegisterType,
+                                   SavedRegisters,
                                    Builder.getInt32(Arch.pcMContextIndex()));
-    LoadInst *RegisterValue = Builder.CreateLoad(GEP);
+    LoadInst *RegisterValue = Builder.CreateLoad(RegisterType, GEP);
     Builder.CreateStore(RegisterValue, JumpTargets.pcReg());
   }
 
@@ -66,13 +79,14 @@ BasicBlock *ExternalJumpsHandler::createReturnFromExternal() {
       if (Register.inMContext()) {
 
         Constant *RegisterIndex = Builder.getInt32(Register.mcontextIndex());
-        Value *GEP = Builder.CreateGEP(SavedRegisters, RegisterIndex);
-        LoadInst *RegisterValue = Builder.CreateLoad(GEP);
+        Value *GEP = Builder.CreateGEP(RegisterType, SavedRegisters,
+                                       RegisterIndex);
+        LoadInst *RegisterValue = Builder.CreateLoad(RegisterType, GEP);
         Builder.CreateStore(RegisterValue, CSV);
 
       } else {
 
-        std::string AsmString = Arch.readRegisterAsm();
+        std::string AsmString = Arch.readRegisterAsm().str();
         replace(AsmString, "REGISTER", Register.name());
         std::stringstream ConstraintStringStream;
         ConstraintStringStream << "*m,~{},~{dirflag},~{fpsr},~{flags}";
@@ -103,7 +117,7 @@ ExternalJumpsHandler::ExternalJumpsHandler(BinaryFile &TheBinary,
   TheBinary(TheBinary),
   Arch(TheBinary.architecture()),
   JumpTargets(JumpTargets),
-  RegisterType(JumpTargets.pcReg()->getType()->getPointerElementType()) {
+  RegisterType(cast<GlobalVariable>(JumpTargets.pcReg())->getValueType()) {
 
   AsmFunctionType = FunctionType::get(Type::getVoidTy(Context),
                                       { RegisterType->getPointerTo() },
@@ -125,7 +139,7 @@ BasicBlock *ExternalJumpsHandler::createSerializeAndJumpOut() {
     if (CSV == nullptr)
       continue;
 
-    string AsmString = Arch.writeRegisterAsm();
+    string AsmString = Arch.writeRegisterAsm().str();
     replace(AsmString, "REGISTER", Register.name());
     std::stringstream ConstraintStringStream;
     ConstraintStringStream << "*m,~{" << Register.name().data()
@@ -163,11 +177,11 @@ llvm::BasicBlock *ExternalJumpsHandler::createSetjmp(BasicBlock *FirstReturn,
   IRBuilder<> Builder(SetjmpBB);
 
   // Call setjmp
-  llvm::Constant *SetjmpFunction = TheModule.getFunction("setjmp");
-  auto *SetJmpTy = SetjmpFunction->getType()->getPointerElementType();
+  auto *SetjmpFunction = TheModule.getFunction("setjmp");
+  auto *SetJmpTy = SetjmpFunction->getFunctionType();
   auto *JmpBuf = CE::getPointerCast(TheModule.getGlobalVariable("jmp_buffer"),
-                                    SetJmpTy->getFunctionParamType(0));
-  Value *SetjmpRes = Builder.CreateCall(SetjmpFunction, { JmpBuf });
+                                    SetJmpTy->getParamType(0));
+  Value *SetjmpRes = Builder.CreateCall(SetJmpTy, SetjmpFunction, { JmpBuf });
 
   // Check if it's the first or second return
   auto *Zero = CI::get(cast<FunctionType>(SetJmpTy)->getReturnType(), 0);
@@ -224,13 +238,14 @@ ExternalJumpsHandler::createExternalDispatcher(BasicBlock *IsExecutable,
                                                BasicBlock *IsNotExecutable) {
   buildExecutableSegmentsList();
 
-  Constant *IsExecutableFunction = TheModule.getFunction("is_executable");
+  auto *IsExecutableFunction = TheModule.getFunction("is_executable");
   BasicBlock *ExternalJumpHandler = BasicBlock::Create(Context,
                                                        "dispatcher.external",
                                                        &TheFunction);
   IRBuilder<> Builder(ExternalJumpHandler);
-  Value *PC = Builder.CreateLoad(JumpTargets.pcReg());
-  Value *IsExecutableResult = Builder.CreateCall(IsExecutableFunction, { PC });
+  Value *PC = Builder.CreateLoad(RegisterType, JumpTargets.pcReg());
+  Value *IsExecutableResult = Builder.CreateCall(
+    IsExecutableFunction->getFunctionType(), IsExecutableFunction, { PC });
 
   // If is_executable returns true go to default, otherwise setjmp
   TerminatorInst *T = Builder.CreateCondBr(IsExecutableResult,

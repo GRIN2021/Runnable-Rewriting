@@ -9,6 +9,9 @@ ARCHIVE = REPO_ROOT / "archive" / "runnable-libcrypto-wsl-repro-2026-07-14.tar.g
 PREFIX = "runnable-libcrypto-wsl-repro-2026-07-14"
 EXPECTED_LIBTINYCODE_SHA256 = "35c658bb35b838c40da4e0c6e94794d7a0ff3f9034affce755c3f17525f441ec"
 EXPECTED_HELPERS_SHA256 = "5977b32dd6710d0459aa9b4fd4290350f69c9333e2aaa53005fcbb554ab27fb2"
+EXPECTED_PREBUILT_RUNNABLE_LIFT_SHA256 = (
+    "1addc607d7f9d6a06ba61cff01581101973e63b1b5bdc7e166f88e6e244dd839"
+)
 
 
 class WslReproArchiveContractTests(unittest.TestCase):
@@ -34,6 +37,11 @@ class WslReproArchiveContractTests(unittest.TestCase):
             )
             self.assertIsNotNone(shard_runner)
             shard_runner_text = shard_runner.read().decode("utf-8")
+            main_cpp = archive.extractfile(
+                f"{PREFIX}/Runnable-Rewriting/runnable/tools/runnable-lift/Main.cpp"
+            )
+            self.assertIsNotNone(main_cpp)
+            main_cpp_text = main_cpp.read().decode("utf-8")
             libtinycode = archive.extractfile(
                 f"{PREFIX}/Runnable-Rewriting/runnable/tools/runnable-lift/libtinycode-x86_64.so"
             )
@@ -44,6 +52,11 @@ class WslReproArchiveContractTests(unittest.TestCase):
             )
             self.assertIsNotNone(helpers)
             helpers_sha256 = hashlib.sha256(helpers.read()).hexdigest()
+            prebuilt_lift = archive.extractfile(
+                f"{PREFIX}/prebuilt/shared-install-runnable/bin/runnable-lift"
+            )
+            self.assertIsNotNone(prebuilt_lift)
+            prebuilt_lift_sha256 = hashlib.sha256(prebuilt_lift.read()).hexdigest()
 
         self.assertIn("RUNNABLE_LIBCRYPTO_NO_DOCKER", text)
         self.assertIn("run-libcrypto-full-qemuv2.sh", text)
@@ -53,8 +66,31 @@ class WslReproArchiveContractTests(unittest.TestCase):
         self.assertIn('"host-shards"', orchestrator_text)
         self.assertIn("--range-mode", orchestrator_text)
         self.assertIn("--range-mode", shard_runner_text)
+        self.assertIn(
+            f"{PREFIX}/Runnable-Rewriting/runnable/tools/runnable-lift/ParallelOptions.h",
+            names,
+        )
+        self.assertIn(
+            f"{PREFIX}/Runnable-Rewriting/runnable/scripts/merge_dynamic_runnable_fragments.py",
+            names,
+        )
+        self.assertIn(
+            f"{PREFIX}/Runnable-Rewriting/runnable/scripts/_merge_dynamic_fragments_lib.py",
+            names,
+        )
+        self.assertIn('DynamicParallel("dynamic-parallel"', main_cpp_text)
+        self.assertIn("ParallelOptions", main_cpp_text)
+        self.assertIn(
+            f"{PREFIX}/prebuilt/shared-install-runnable/bin/runnable-lift",
+            names,
+        )
+        self.assertIn(
+            f"{PREFIX}/prebuilt/shared-install-runnable/bin/libtinycode-x86_64.so",
+            names,
+        )
         self.assertEqual(EXPECTED_LIBTINYCODE_SHA256, libtinycode_sha256)
         self.assertEqual(EXPECTED_HELPERS_SHA256, helpers_sha256)
+        self.assertEqual(EXPECTED_PREBUILT_RUNNABLE_LIFT_SHA256, prebuilt_lift_sha256)
 
 
 if __name__ == "__main__":

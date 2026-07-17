@@ -1176,7 +1176,8 @@ void OSRA::handleBranch(Instruction *I) {
           // In case of load we don't need to propagate
           break;
         default:
-          runnable_assert(isa<TerminatorInst>(I), "Unexpected instruction");
+          runnable_assert(runnable_llvm::isaTerminator(I),
+                          "Unexpected instruction");
           AffectedSet.insert(I->getParent());
           for (const auto *Successor : filtered_successors(I->getParent()))
             AffectedSet.insert(Successor);
@@ -1798,8 +1799,8 @@ Constant *OSR::solveEquation(Constant *KnownTerm,
   Constant *SignedRemainder = nullptr;
   Constant *SignedDivision = nullptr;
   if (IsSigned or not HasSignedness) {
-    SignedRemainder = CE::getSRem(Numerator, Denominator);
-    SignedDivision = CE::getSDiv(Numerator, Denominator);
+    SignedRemainder = CE::get(Instruction::SRem, Numerator, Denominator);
+    SignedDivision = CE::get(Instruction::SDiv, Numerator, Denominator);
     Remainder = SignedRemainder;
     Division = SignedDivision;
   }
@@ -1807,8 +1808,8 @@ Constant *OSR::solveEquation(Constant *KnownTerm,
   Constant *UnsignedRemainder = nullptr;
   Constant *UnsignedDivision = nullptr;
   if (not IsSigned or not HasSignedness) {
-    UnsignedRemainder = CE::getURem(Numerator, Denominator);
-    UnsignedDivision = CE::getUDiv(Numerator, Denominator);
+    UnsignedRemainder = CE::get(Instruction::URem, Numerator, Denominator);
+    UnsignedDivision = CE::get(Instruction::UDiv, Numerator, Denominator);
     Remainder = UnsignedRemainder;
     Division = UnsignedDivision;
   }
